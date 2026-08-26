@@ -163,6 +163,7 @@ describe('parseProtocolContent', () => {
     { msg_type: 'device_status_request', request_id: 'request-1' },
     JSON.stringify({ msg_type: 'device_status_request', request_id: 'request-1' }),
     { content: JSON.stringify({ msg_type: 'device_status_request', request_id: 'request-1' }) },
+    JSON.stringify({ content: JSON.stringify({ msg_type: 'device_status_request', request_id: 'request-1' }) }),
   ])('recognizes direct and nested protocol content', (content) => {
     expect(parseProtocolContent(content)).toEqual({
       kind: 'protocol',
@@ -217,6 +218,36 @@ describe('parseProtocolContent', () => {
       .toEqual({ kind: 'invalid', code: 'invalid_content' });
     expect(parseProtocolContent({ msg_type: 'device_control', command: 'status', action: 'restart' }))
       .toEqual({ kind: 'invalid', code: 'conflicting_alias' });
+  });
+
+  it('enforces required legacy chatroom and response correlation fields', () => {
+    expect(parseProtocolContent({ msg_type: 'chatroom_invite' }))
+      .toEqual({ kind: 'invalid', code: 'invalid_content' });
+    expect(parseProtocolContent({ msg_type: 'chatroom_message', chatroom_id: 'room-1', content: '' }))
+      .toEqual({ kind: 'invalid', code: 'invalid_content' });
+    expect(parseProtocolContent({ msg_type: 'chatroom_message', content: 'hello' }))
+      .toEqual({ kind: 'invalid', code: 'invalid_content' });
+    for (const msg_type of ['device_status_report', 'device_control_result', 'command_result']) {
+      expect(parseProtocolContent({ msg_type, content: 'result' }))
+        .toEqual({ kind: 'invalid', code: 'invalid_content' });
+    }
+  });
+
+  it('rejects oversized complete CardKit envelopes before specialized validation', () => {
+    expect(parseProtocolContent({
+      msg_type: 'card_message',
+      schema: '1.0.0',
+      card: { padding: 'x'.repeat(10 * 1024) },
+      timestamp: 1,
+    })).toEqual({ kind: 'invalid', code: 'content_too_large' });
+    expect(parseProtocolContent({
+      msg_type: 'command_result',
+      status: 'success',
+      code: 200,
+      message: 'ok',
+      data: { card_state: { padding: 'x'.repeat(10 * 1024) } },
+      timestamp: 1,
+    })).toEqual({ kind: 'invalid', code: 'content_too_large' });
   });
 
   it('ignores unknown and server-only message types instead of turning them into prompts', () => {
@@ -318,5 +349,11 @@ describe('slash commands and legacy builders', () => {
       destination_im_id: 'user-1',
       timestamp: 124,
     });
+
+    expect(() => buildLegacyEnvelope({
+      msgType: 'device_status_report',
+      content: { status: 'success' },
+      timestamp: 125,
+    })).toThrow(/request/i);
   });
 });

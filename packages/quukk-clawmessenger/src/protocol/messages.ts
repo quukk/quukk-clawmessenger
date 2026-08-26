@@ -106,6 +106,8 @@ const v2AndCardTypes = new Set<string>([
   'discussion_model_catalog_response',
   'discussion_wire_chunk',
 ]);
+const cardEnvelopeTypes = new Set<string>(['card_message', 'card_update', 'command_result']);
+const maxCardEnvelopeBytes = 10 * 1024;
 const controlCharacters = /[\p{Cc}\p{Cf}]/u;
 const dangerousObjectKeys = new Set(['__proto__', 'prototype', 'constructor']);
 const rawContentKeys = new Set([
@@ -386,6 +388,7 @@ function unwrapProtocolValue(input: unknown): { value?: Record<string, unknown>;
     if (!own(value, 'content')) return null;
     value = value.content;
   }
+  if (record(value) && typeof value.msg_type === 'string') return { value };
   return null;
 }
 
@@ -418,6 +421,23 @@ function canonicalLegacy(value: Record<string, unknown>): Record<string, unknown
   return result;
 }
 
+function validLegacySemantics(msgType: ExternalMessageType, value: Record<string, unknown>): boolean {
+  if (msgType === 'chatroom_invite') return typeof value.chatroom_id === 'string';
+  if (msgType === 'chatroom_message') {
+    return typeof value.chatroom_id === 'string'
+      && typeof value.content === 'string'
+      && value.content.length > 0;
+  }
+  if (msgType === 'device_status_report' || msgType === 'device_control_result') {
+    return typeof value.request_id === 'string';
+  }
+  if (msgType === 'command_result') {
+    const cardState = record(value.data) && record(value.data.card_state);
+    return cardState || typeof value.request_id === 'string';
+  }
+  return true;
+}
+
 export function parseProtocolContent(input: unknown): ProtocolContentResult {
   const bytes = serializedBytes(input);
   if (bytes === null) return { kind: 'invalid', code: 'invalid_content' };
@@ -432,6 +452,11 @@ export function parseProtocolContent(input: unknown): ProtocolContentResult {
   if (typeof msgType !== 'string' || !externalTypes.has(msgType)) {
     return { kind: 'ignored', code: 'unknown_message_type' };
   }
+  const protocolBytes = serializedBytes(value);
+  if (protocolBytes === null) return { kind: 'invalid', code: 'invalid_content' };
+  if (cardEnvelopeTypes.has(msgType) && protocolBytes > maxCardEnvelopeBytes) {
+    return { kind: 'invalid', code: 'content_too_large' };
+  }
   if (v2AndCardTypes.has(msgType)) {
     return { kind: 'protocol', msgType: msgType as ExternalMessageType, value };
   }
@@ -439,6 +464,9 @@ export function parseProtocolContent(input: unknown): ProtocolContentResult {
   if (!canonical) return { kind: 'invalid', code: 'conflicting_alias' };
   if (msgType === 'device_control'
     && (typeof canonical.command !== 'string' || !deviceControlCommands.has(canonical.command))) {
+    return { kind: 'invalid', code: 'invalid_content' };
+  }
+  if (!validLegacySemantics(msgType as ExternalMessageType, canonical)) {
     return { kind: 'invalid', code: 'invalid_content' };
   }
   return { kind: 'protocol', msgType: msgType as ExternalMessageType, value: canonical };
@@ -480,6 +508,10 @@ export function buildLegacyEnvelope(input: LegacyEnvelopeInput): Record<string, 
     || (input.destinationImId !== undefined && !destinationImId)
     || !Number.isSafeInteger(input.timestamp) || input.timestamp < 0) {
     throw new TypeError('invalid legacy envelope');
+  }
+  if ((input.msgType === 'device_status_report' || input.msgType === 'device_control_result')
+    && requestId === undefined) {
+    throw new TypeError('legacy response requires request_id');
   }
   const content = typeof input.content === 'string' ? input.content : JSON.stringify(input.content);
   if (content === undefined) throw new TypeError('invalid legacy content');
