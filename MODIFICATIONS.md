@@ -13,7 +13,12 @@
 - `apps/bridge`: private React/Vite workspace that builds local Bridge UI assets into the entry package.
 - `server/internal/daemon/bridge*.go`: injected, bounded discovery for local OpenCode, OpenClaw, Codex, and Hermes runtimes, kept separate from the existing daemon lifecycle.
 - Synchronous agent probe output shares a 64 KiB cap so noisy version and catalog commands safely fail instead of growing daemon memory without bound; Task 14/CI must watch for real catalog output above that limit.
-- RongCloud, task execution, registration transport, and Bridge HTTP endpoints remain intentionally unimplemented at this stage.
+- RongCloud workers, Node-side registration transport, session persistence, and the local Bridge UI remain intentionally unimplemented at this stage.
+
+## Authenticated Bridge transport
+
+- `server/internal/daemon/bridge_http.go` and `server/internal/daemon/bridge_http_test.go` add the loopback-only, per-process bearer-authenticated Bridge JSON/SSE API, bounded request decoding, runtime refresh, task streaming/cancellation, health reporting, and graceful shutdown.
+- `server/cmd/multica/cmd_bridge.go` and `server/cmd/multica/cmd_bridge_test.go` add the hidden `multica daemon bridge` entrypoint with bounded strict stdin, fixed ephemeral IPv4 loopback binding, process identity generation, and a single post-refresh readiness record.
 
 ## External service prerequisite
 
