@@ -63,7 +63,7 @@ function record(value: unknown): value is Record<string, unknown> {
 
 function exactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
   const allowed = new Set([...required, ...optional]);
-  const keys = Object.keys(value);
+  const keys = Object.getOwnPropertyNames(value);
   return required.every((key) => keys.includes(key))
     && keys.every((key) => {
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
@@ -102,6 +102,18 @@ function plainArray(value: unknown, maximum: number): value is unknown[] {
     if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) return false;
   }
   return true;
+}
+
+function copyPlainArray(value: unknown[]): unknown[] {
+  const output: unknown[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+      throw new TypeError('active array element');
+    }
+    output.push(descriptor.value);
+  }
+  return output;
 }
 
 function metadata(value: Record<string, unknown>): IntentMetadata | null {
@@ -175,10 +187,10 @@ export function routeCardAction(value: unknown): CardActionRoute {
     }
     if (actionType === 'answer') {
       if (!exactKeys(cardAction, ['type', 'questionId', 'value'])
-        || !identifier(cardAction.questionId)
-        || !plainArray(cardAction.value, 50)
-        || !cardAction.value.every((item) => text(item))) return invalidAction(meta);
-      return { ok: true, kind: 'answer', ...meta, questionId: cardAction.questionId, value: [...cardAction.value] };
+        || !identifier(cardAction.questionId)) return invalidAction(meta);
+      const answers = plainArray(cardAction.value, 50) ? copyPlainArray(cardAction.value) : null;
+      if (!answers || !answers.every((item) => text(item))) return invalidAction(meta);
+      return { ok: true, kind: 'answer', ...meta, questionId: cardAction.questionId, value: answers as string[] };
     }
     if (actionType === 'command') {
       if (!exactKeys(cardAction, ['type', 'name']) || typeof cardAction.name !== 'string') return invalidAction(meta);

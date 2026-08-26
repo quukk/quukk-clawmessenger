@@ -100,6 +100,27 @@ function plainArray(value: unknown, maximum: number): value is unknown[] {
   }
 }
 
+function mapPlain<T>(value: unknown[], mapper: (item: unknown, index: number) => T): T[] {
+  const output: T[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+      throw new TypeError('active array element');
+    }
+    output.push(mapper(descriptor.value, index));
+  }
+  return output;
+}
+
+function everyPlain(value: unknown[], predicate: (item: unknown, index: number) => boolean): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')
+      || !predicate(descriptor.value, index)) return false;
+  }
+  return true;
+}
+
 function cloneJson(
   value: unknown,
   budget: JsonBudget,
@@ -173,8 +194,8 @@ function sanitizeAction(value: unknown): CardAction | null {
     const selected = read(value, 'value');
     return identifier(questionId)
       && plainArray(selected, 50)
-      && selected.every((item) => allowedText(item, 1_000))
-      ? { type, questionId, value: [...selected] }
+      && everyPlain(selected, (item) => allowedText(item, 1_000))
+      ? { type, questionId, value: mapPlain(selected, (item) => item as string) }
       : null;
   }
   if (type === 'command') {
@@ -268,7 +289,7 @@ function sanitizeSection(value: unknown): CardSection | null {
     const layout = read(value, 'layout');
     if (!boundedArray(buttons, 10) || buttons.length < 1
       || (layout !== undefined && (typeof layout !== 'string' || !buttonLayouts.has(layout)))) return null;
-    const clean = buttons.map(sanitizeButton);
+    const clean = mapPlain(buttons, sanitizeButton);
     return clean.every((button): button is CardButton => button !== null)
       ? { kind, buttons: clean, ...(layout === undefined ? {} : { layout: layout as 'inline' | 'flow' | 'stack' }) }
       : null;
@@ -276,7 +297,7 @@ function sanitizeSection(value: unknown): CardSection | null {
   if (kind === 'keyValue') {
     const items = read(value, 'items');
     if (!boundedArray(items, 50)) return null;
-    const clean = items.map((item) => {
+    const clean = mapPlain(items, (item) => {
       if (!record(item)) return null;
       const label = read(item, 'label');
       const itemValue = read(item, 'value');
@@ -294,7 +315,7 @@ function sanitizeSection(value: unknown): CardSection | null {
     const options = read(value, 'options');
     const action = sanitizeAction(read(value, 'action'));
     if (!allowedText(placeholder, 1_000) || !boundedArray(options, 50) || !action) return null;
-    const clean = options.map((option) => stringItem(option, ['label', 'value']));
+    const clean = mapPlain(options, (option) => stringItem(option, ['label', 'value']));
     return clean.every((option): option is NonNullable<typeof option> => option !== null)
       ? { kind, placeholder, options: clean as Array<{ label: string; value: string }>, action }
       : null;
@@ -330,7 +351,7 @@ function sanitizeSection(value: unknown): CardSection | null {
     const columns = read(value, 'columns');
     const rows = read(value, 'rows');
     if (!boundedArray(columns, 16) || columns.length < 1 || !boundedArray(rows, 10)) return null;
-    const cleanColumns = columns.map((column) => {
+    const cleanColumns = mapPlain(columns, (column) => {
       if (!record(column)) return null;
       const key = read(column, 'key');
       const label = read(column, 'label');
@@ -340,7 +361,7 @@ function sanitizeSection(value: unknown): CardSection | null {
       return { key, label, ...(width === undefined ? {} : { width }) };
     });
     if (!cleanColumns.every((column): column is NonNullable<typeof column> => column !== null)) return null;
-    const cleanRows = rows.map((row) => {
+    const cleanRows = mapPlain(rows, (row) => {
       if (!record(row)) return null;
       const output: Record<string, string> = {};
       for (const { key } of cleanColumns) {
@@ -362,11 +383,18 @@ function sanitizeSection(value: unknown): CardSection | null {
     const patterns = read(value, 'patterns');
     const rawButtons = read(value, 'buttons');
     if (!identifier(permissionId) || !identifier(permission, 256) || !allowedText(title, 1_000)
-      || !boundedArray(patterns, 50) || !patterns.every((pattern) => allowedText(pattern, 1_000, true))
+      || !boundedArray(patterns, 50) || !everyPlain(patterns, (pattern) => allowedText(pattern, 1_000, true))
       || (rawButtons !== undefined && !boundedArray(rawButtons, 10))) return null;
-    const buttons = rawButtons === undefined ? undefined : rawButtons.map(sanitizeButton);
+    const buttons = rawButtons === undefined ? undefined : mapPlain(rawButtons, sanitizeButton);
     if (buttons && !buttons.every((button): button is CardButton => button !== null)) return null;
-    return { kind, permissionId, permission, title, patterns: [...patterns], ...(buttons === undefined ? {} : { buttons }) };
+    return {
+      kind,
+      permissionId,
+      permission,
+      title,
+      patterns: mapPlain(patterns, (pattern) => pattern as string),
+      ...(buttons === undefined ? {} : { buttons }),
+    };
   }
   if (kind === 'question') {
     const questionId = read(value, 'questionId');
@@ -379,7 +407,7 @@ function sanitizeSection(value: unknown): CardSection | null {
       || !boundedArray(options, 50)
       || (multiple !== undefined && !safeBoolean(multiple))
       || (custom !== undefined && !safeBoolean(custom))) return null;
-    const clean = options.map((option) => {
+    const clean = mapPlain(options, (option) => {
       if (!record(option)) return null;
       const label = read(option, 'label');
       const description = read(option, 'description');
@@ -399,7 +427,7 @@ function sanitizeSection(value: unknown): CardSection | null {
       || (thinking !== undefined && !allowedText(thinking, 10_000, true))
       || (elapsedMs !== undefined && !safeInteger(elapsedMs))
       || (done !== undefined && !safeBoolean(done))) return null;
-    const tools = rawTools === undefined ? undefined : rawTools.map((tool) => {
+    const tools = rawTools === undefined ? undefined : mapPlain(rawTools, (tool) => {
       if (!record(tool)) return null;
       const name = read(tool, 'name');
       const status = read(tool, 'status');
@@ -423,7 +451,9 @@ function sanitizeSection(value: unknown): CardSection | null {
     if ((branch !== undefined && !allowedText(branch, 1_000, true))
       || (commit !== undefined && !allowedText(commit, 256, true))
       || (rawFiles !== undefined && !boundedArray(rawFiles, 50))) return null;
-    const files = rawFiles === undefined ? undefined : rawFiles.map((file) => stringItem(file, ['path', 'status']));
+    const files = rawFiles === undefined
+      ? undefined
+      : mapPlain(rawFiles, (file) => stringItem(file, ['path', 'status']));
     if (files && !files.every((file): file is NonNullable<typeof file> => file !== null)) return null;
     return { kind, ...(branch === undefined ? {} : { branch }), ...(commit === undefined ? {} : { commit }), ...(files === undefined ? {} : { files: files as Array<{ path: string; status: string }> }) };
   }
@@ -431,7 +461,7 @@ function sanitizeSection(value: unknown): CardSection | null {
     const currentSessionId = read(value, 'currentSessionId');
     const sessions = read(value, 'sessions');
     if ((currentSessionId !== undefined && !identifier(currentSessionId)) || !boundedArray(sessions, 20)) return null;
-    const clean = sessions.map((session) => {
+    const clean = mapPlain(sessions, (session) => {
       if (!record(session)) return null;
       const id = read(session, 'id');
       const title = read(session, 'title');
@@ -451,7 +481,7 @@ function sanitizeSection(value: unknown): CardSection | null {
       || (commands === undefined) === (groups === undefined)) return null;
     if (commands !== undefined) {
       if (!boundedArray(commands, 20)) return null;
-      const clean = commands.map((command) => {
+      const clean = mapPlain(commands, (command) => {
         if (!record(command)) return null;
         const name = read(command, 'name');
         const description = read(command, 'description');
@@ -464,7 +494,7 @@ function sanitizeSection(value: unknown): CardSection | null {
     }
     if (!boundedArray(groups, 20)) return null;
     let total = 0;
-    const cleanGroups = groups.map((group) => {
+    const cleanGroups = mapPlain(groups, (group) => {
       if (!record(group)) return null;
       const label = read(group, 'label');
       const collapsed = read(group, 'collapsed');
@@ -473,7 +503,7 @@ function sanitizeSection(value: unknown): CardSection | null {
         || !boundedArray(items, 20)) return null;
       total += items.length;
       if (total > 20) return null;
-      const cleanItems = items.map((command) => {
+      const cleanItems = mapPlain(items, (command) => {
         if (!record(command)) return null;
         const name = read(command, 'name');
         const description = read(command, 'description');
@@ -512,7 +542,7 @@ export function validateCard(value: unknown): CardValidationResult {
       || (icon !== undefined && !allowedText(icon, 256))
       || (color !== undefined && (typeof color !== 'string' || !colors.has(color)))
       || (subtitle !== undefined && !allowedText(subtitle, 2_000, true))) return invalidCard('invalid card header');
-    const sections = rawSections.map(sanitizeSection);
+    const sections = mapPlain(rawSections, sanitizeSection);
     if (!sections.every((section): section is CardSection => section !== null)) {
       return invalidCard('invalid card section');
     }

@@ -173,6 +173,20 @@ describe('CardKit fresh-object validation', () => {
     expect(validateCard(new Proxy(completeCard(), {})))
       .toMatchObject({ ok: false, code: 'invalid_card' });
 
+    let sectionMapCalls = 0;
+    const activeSections: CardSection[] = [];
+    Object.defineProperty(activeSections, 'map', {
+      value: () => {
+        sectionMapCalls += 1;
+        return [{ kind: 'markdown', content: 'injected', unexpected: 'survives' }];
+      },
+    });
+    const activeArrayResult = validateCard({
+      schema: '1.0.0', id: 'active-array', header: { title: 'Safe' }, sections: activeSections,
+    });
+    expect(activeArrayResult).toMatchObject({ ok: true, value: { sections: [] } });
+    expect(sectionMapCalls).toBe(0);
+
     for (const src of ['javascript:alert(1)', 'data:text/plain,x', 'file:///tmp/x', '//example.test/x', 'http://example.test/x', 'https://user:pass@example.test/x']) {
       expect(validateCard(card('bad-url', 'Bad', [{ kind: 'image', src }])))
         .toMatchObject({ ok: false, code: 'invalid_card' });
@@ -375,6 +389,30 @@ describe('CardKit pure action routing', () => {
       action: { type: 'answer', questionId: 'question-1', value: accessorAnswers },
     })).toMatchObject({ ok: false, code: 'invalid_action' });
     expect(answerReads).toBe(0);
+
+    let hiddenReads = 0;
+    const hiddenAccessor = { ...baseAction, action: { type: 'none' } } as Record<string, unknown>;
+    Object.defineProperty(hiddenAccessor, 'request_id', {
+      enumerable: false,
+      get: () => {
+        hiddenReads += 1;
+        return 'hidden-request';
+      },
+    });
+    expect(routeCardAction(hiddenAccessor)).toMatchObject({ ok: false, code: 'invalid_action' });
+    expect(hiddenReads).toBe(0);
+
+    let answerMethodCalls = 0;
+    const activeAnswers = ['A'];
+    Object.defineProperties(activeAnswers, {
+      every: { value: () => { answerMethodCalls += 1; return true; } },
+      [Symbol.iterator]: { value: function* injectedAnswers() { answerMethodCalls += 1; yield 'injected'; } },
+    });
+    expect(routeCardAction({
+      ...baseAction,
+      action: { type: 'answer', questionId: 'question-1', value: activeAnswers },
+    })).toMatchObject({ ok: true, kind: 'answer', value: ['A'] });
+    expect(answerMethodCalls).toBe(0);
   });
 
   it('bounds custom JSON by bytes, depth, keys and prototype safety', () => {
