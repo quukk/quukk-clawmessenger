@@ -228,6 +228,38 @@ describe('parent-to-child IPC', () => {
       content: 'x'.repeat(65 * 1024),
     }));
   });
+
+  it('applies the 10 KiB wire cap only to CardKit and discussion wire content', () => {
+    const body = 'x'.repeat(12 * 1024);
+    for (const messageType of ['command', 'command_result', 'chatroom_invite']) {
+      expect(api().parseWorkerCommand({
+        type: 'send',
+        requestId,
+        conversationType: 1,
+        targetId: 'target-1',
+        messageType,
+        content: { msg_type: messageType, content: body },
+      })).toMatchObject({ ok: true });
+    }
+    for (const messageType of ['card_message', 'card_update', 'card_action']) {
+      expectRejected(api().parseWorkerCommand({
+        type: 'send',
+        requestId,
+        conversationType: 1,
+        targetId: 'target-1',
+        messageType,
+        content: { msg_type: messageType, content: body },
+      }));
+    }
+    expectRejected(api().parseWorkerCommand({
+      type: 'send',
+      requestId,
+      conversationType: 1,
+      targetId: 'target-1',
+      messageType: 'command',
+      content: { msg_type: 'discussion_wire_chunk', content: body },
+    }));
+  });
 });
 
 describe('child-to-parent IPC', () => {

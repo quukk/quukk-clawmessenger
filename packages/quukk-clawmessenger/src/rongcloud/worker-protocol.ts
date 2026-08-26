@@ -41,6 +41,8 @@ export const WORKER_ERROR_CODES = [
   'worker_exited',
   'protocol_error',
   'missing_message_uid',
+  'duplicate_message_uid',
+  'timer_failed',
   'internal_error',
 ] as const;
 
@@ -248,6 +250,12 @@ const structuredSendSchema = z.strictObject({
   messageType: structuredMessageTypeSchema,
   content: jsonObject,
 }).superRefine((value, context) => {
+  const msgType = value.content.msg_type;
+  const usesWireLimit = value.messageType === 'card_message'
+    || value.messageType === 'card_update'
+    || value.messageType === 'card_action'
+    || (typeof msgType === 'string' && msgType.startsWith('discussion_'));
+  if (!usesWireLimit) return;
   const bytes = Buffer.byteLength(JSON.stringify(value.content), 'utf8');
   if (bytes > MAX_STRUCTURED_MESSAGE_BYTES) {
     context.addIssue({ code: 'custom', path: ['content'], message: 'structured_content_too_large' });
