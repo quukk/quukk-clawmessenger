@@ -112,6 +112,7 @@ class FakeSdk {
   sendSequence = 0;
 
   connectImpl: (token: string) => Promise<SdkResult> = async () => ({ code: 0 });
+  disconnectImpl: () => Promise<void> = async () => undefined;
   sendImpl: () => Promise<SdkResult> = async () => ({
     code: 0,
     data: { messageUId: `sent-${++this.sendSequence}` },
@@ -166,6 +167,7 @@ class FakeSdk {
   async disconnect(): Promise<void> {
     this.callLog.push('disconnect');
     this.disconnectCalls += 1;
+    return this.disconnectImpl();
   }
 
   async destroy(): Promise<void> {
@@ -373,6 +375,36 @@ describe('RongCloudClient lifecycle', () => {
     await expect(client.send(send(1))).rejects.toMatchObject({ code: 'not_connected' });
   });
 
+  it('compensates a late SDK connect and drops inbound messages after disconnect', async () => {
+    const pending = deferred<SdkResult>();
+    const sdk = new FakeSdk();
+    sdk.connectImpl = () => pending.promise;
+    const delivered: NormalizedMessage[] = [];
+    const { client } = createClient({
+      sdk,
+      onMessage: (value: NormalizedMessage) => delivered.push(value),
+    });
+    client.init({ appKey: 'app-key', token: 'token' });
+    const connecting = client.connect();
+    await flush();
+
+    await client.disconnect();
+    const inbound = {
+      messageUId: 'late-inbound', senderUserId: 'sender-1', targetId: 'opencode-node-1',
+      conversationType: 1, messageType: 'command', content: { content: '/status' },
+    };
+    sdk.emit('MESSAGES', { messages: [inbound] });
+    expect(delivered).toEqual([]);
+    expect(sdk.disconnectCalls).toBe(1);
+
+    pending.resolve({ code: 0 });
+    await expect(connecting).rejects.toMatchObject({ code: 'disconnected' });
+    await flush();
+    expect(sdk.disconnectCalls).toBe(2);
+    sdk.emit('MESSAGES', { messages: [inbound] });
+    expect(delivered).toEqual([]);
+  });
+
   it('maps only fixed connection states from SDK events', async () => {
     const { client, sdk, connections } = createClient();
     await initialize(client);
@@ -552,6 +584,51 @@ describe('RongCloudClient receives and compatibility operations', () => {
     });
     expect(delivered[0]).not.toBe(raw);
     expect(delivered[0]).not.toHaveProperty('providerSecret');
+  });
+
+  it('snapshots inbound array descriptors without invoking accessors or proxy traps', async () => {
+    const delivered: NormalizedMessage[] = [];
+    const { client, sdk } = createClient({ onMessage: (value: NormalizedMessage) => delivered.push(value) });
+    await initialize(client);
+    const safe = {
+      messageUId: 'safe-sibling', senderUserId: 'sender-1', targetId: 'opencode-node-1',
+      conversationType: 1, messageType: 'command', content: { content: '/status' },
+    };
+    let getterCalls = 0;
+    const hostile: unknown[] = new Array(2);
+    Object.defineProperty(hostile, '0', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error('must_not_execute_array_getter');
+      },
+    });
+    Object.defineProperty(hostile, '1', { configurable: true, enumerable: true, value: safe });
+
+    expect(() => sdk.emit('MESSAGES', { messages: hostile })).not.toThrow();
+    expect(getterCalls).toBe(0);
+    expect(delivered.map(({ messageUid }) => messageUid)).toEqual(['safe-sibling']);
+
+    let proxyTraps = 0;
+    const proxy = new Proxy([safe], {
+      get() { proxyTraps += 1; throw new Error('must_not_execute_proxy_get'); },
+      ownKeys() { proxyTraps += 1; throw new Error('must_not_execute_proxy_keys'); },
+      getOwnPropertyDescriptor() { proxyTraps += 1; throw new Error('must_not_execute_proxy_descriptor'); },
+    });
+    expect(() => sdk.emit('MESSAGES', { messages: proxy })).not.toThrow();
+    expect(proxyTraps).toBe(0);
+    expect(delivered.map(({ messageUid }) => messageUid)).toEqual(['safe-sibling']);
+
+    const revoked = Proxy.revocable([safe], {});
+    revoked.revoke();
+    expect(() => sdk.emit('MESSAGES', { messages: revoked.proxy })).not.toThrow();
+    expect(delivered.map(({ messageUid }) => messageUid)).toEqual(['safe-sibling']);
+
+    const oversizedSparse: unknown[] = new Array(100_001);
+    Object.defineProperty(oversizedSparse, '0', { configurable: true, enumerable: true, value: safe });
+    expect(() => sdk.emit('MESSAGES', { messages: oversizedSparse })).not.toThrow();
+    expect(delivered.map(({ messageUid }) => messageUid)).toEqual(['safe-sibling']);
   });
 
   it('skips receipts for missing, local, self-sent, and sent-cache messages', async () => {

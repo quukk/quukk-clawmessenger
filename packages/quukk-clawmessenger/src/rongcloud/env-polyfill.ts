@@ -1,20 +1,226 @@
 import { Buffer } from 'node:buffer';
+import { randomBytes } from 'node:crypto';
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import type { ClientRequest, IncomingHttpHeaders, IncomingMessage } from 'node:http';
 import { request as requestHttp } from 'node:http';
 import { request as requestHttps } from 'node:https';
+import { isAbsolute, join, parse, resolve } from 'node:path';
 
 import * as fakeIndexedDb from 'fake-indexeddb';
 import { JSDOM } from 'jsdom';
 import WebSocket from 'ws';
 
 export const MAX_XHR_RESPONSE_BYTES = 1024 * 1024;
+export const MAX_STORAGE_BYTES = 1024 * 1024;
 
 const MAX_XHR_REQUEST_BYTES = 1024 * 1024;
+const MAX_STORAGE_ENTRIES = 4_096;
+const STORAGE_FILE_NAME = 'local-storage.json';
 const DEFAULT_XHR_TIMEOUT_MS = 30_000;
 const MAX_XHR_TIMEOUT_MS = 60_000;
 const activeRequests = new Set<NodeXMLHttpRequest>();
 
 type ReadyStateHandler = (() => void) | null;
+
+function storageFailure(code: 'worker_storage_invalid' | 'worker_storage_write_failed'): Error {
+  return new Error(code);
+}
+
+function isMissingFile(error: unknown): boolean {
+  return error !== null && typeof error === 'object'
+    && Object.getOwnPropertyDescriptor(error, 'code')?.value === 'ENOENT';
+}
+
+function serializedStorage(items: ReadonlyMap<string, string>): string {
+  if (items.size > MAX_STORAGE_ENTRIES) {
+    throw new DOMException('storage_quota_exceeded', 'QuotaExceededError');
+  }
+  let rawBytes = 2;
+  for (const [key, value] of items) {
+    rawBytes += Buffer.byteLength(key, 'utf8') + Buffer.byteLength(value, 'utf8') + 4;
+    if (rawBytes > MAX_STORAGE_BYTES) {
+      throw new DOMException('storage_quota_exceeded', 'QuotaExceededError');
+    }
+  }
+  const serialized = JSON.stringify(Object.fromEntries(items));
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_STORAGE_BYTES) {
+    throw new DOMException('storage_quota_exceeded', 'QuotaExceededError');
+  }
+  return serialized;
+}
+
+function loadStorageFile(storageDir: string): Map<string, string> {
+  const filePath = join(storageDir, STORAGE_FILE_NAME);
+  let fileStat;
+  try {
+    fileStat = lstatSync(filePath);
+  } catch (error) {
+    if (isMissingFile(error)) return new Map();
+    throw storageFailure('worker_storage_invalid');
+  }
+  if (!fileStat.isFile() || fileStat.isSymbolicLink() || fileStat.size > MAX_STORAGE_BYTES) {
+    throw storageFailure('worker_storage_invalid');
+  }
+  let descriptor: number | undefined;
+  try {
+    const openFlags = constants.O_RDONLY | (process.platform === 'win32' ? 0 : constants.O_NOFOLLOW);
+    descriptor = openSync(filePath, openFlags);
+    const openedStat = fstatSync(descriptor);
+    if (!openedStat.isFile() || openedStat.size > MAX_STORAGE_BYTES) {
+      throw storageFailure('worker_storage_invalid');
+    }
+    fchmodSync(descriptor, 0o600);
+    const contents = Buffer.alloc(MAX_STORAGE_BYTES + 1);
+    const bytesRead = readSync(descriptor, contents, 0, contents.byteLength, 0);
+    closeSync(descriptor);
+    descriptor = undefined;
+    if (bytesRead > MAX_STORAGE_BYTES) throw storageFailure('worker_storage_invalid');
+    const parsed: unknown = JSON.parse(contents.subarray(0, bytesRead).toString('utf8'));
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw storageFailure('worker_storage_invalid');
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(parsed);
+    const items = new Map<string, string>();
+    for (const [key, descriptor] of Object.entries(descriptors)) {
+      if (!Object.prototype.hasOwnProperty.call(descriptor, 'value') || typeof descriptor.value !== 'string') {
+        throw storageFailure('worker_storage_invalid');
+      }
+      items.set(key, descriptor.value);
+    }
+    serializedStorage(items);
+    return items;
+  } catch (error) {
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch { /* fixed failure below */ }
+    }
+    if (error instanceof DOMException && error.name === 'QuotaExceededError') throw error;
+    if (error instanceof Error && error.message === 'worker_storage_invalid') throw error;
+    throw storageFailure('worker_storage_invalid');
+  }
+}
+
+function persistStorageFile(storageDir: string, items: ReadonlyMap<string, string>): void {
+  const filePath = join(storageDir, STORAGE_FILE_NAME);
+  const temporaryPath = join(storageDir, `.local-storage.${randomBytes(16).toString('hex')}.tmp`);
+  const serialized = serializedStorage(items);
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(
+      temporaryPath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
+      0o600,
+    );
+    fchmodSync(descriptor, 0o600);
+    writeFileSync(descriptor, serialized, 'utf8');
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    renameSync(temporaryPath, filePath);
+    try {
+      const directoryDescriptor = openSync(storageDir, constants.O_RDONLY);
+      try {
+        fsyncSync(directoryDescriptor);
+      } finally {
+        closeSync(directoryDescriptor);
+      }
+    } catch {
+      // Windows cannot fsync directory handles; the file itself was fsynced before rename.
+    }
+  } catch (error) {
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch { /* fixed failure below */ }
+    }
+    try { rmSync(temporaryPath, { force: true }); } catch { /* fixed failure below */ }
+    if (error instanceof DOMException && error.name === 'QuotaExceededError') throw error;
+    throw storageFailure('worker_storage_write_failed');
+  }
+}
+
+class BoundedStorage implements Storage {
+  #items: Map<string, string>;
+  readonly #commit: (items: ReadonlyMap<string, string>) => void;
+
+  constructor(
+    initial: ReadonlyMap<string, string> = new Map(),
+    commit: (items: ReadonlyMap<string, string>) => void = (items) => { serializedStorage(items); },
+  ) {
+    this.#items = new Map(initial);
+    this.#commit = commit;
+  }
+
+  get length(): number { return this.#items.size; }
+
+  clear(): void {
+    if (this.#items.size === 0) return;
+    this.#replace(new Map());
+  }
+
+  getItem(key: string): string | null {
+    return this.#items.get(String(key)) ?? null;
+  }
+
+  key(index: number): string | null {
+    if (!Number.isInteger(index) || index < 0) return null;
+    return [...this.#items.keys()][index] ?? null;
+  }
+
+  removeItem(key: string): void {
+    const normalized = String(key);
+    if (!this.#items.has(normalized)) return;
+    const next = new Map(this.#items);
+    next.delete(normalized);
+    this.#replace(next);
+  }
+
+  setItem(key: string, value: string): void {
+    const next = new Map(this.#items);
+    next.set(String(key), String(value));
+    this.#replace(next);
+  }
+
+  #replace(next: Map<string, string>): void {
+    this.#commit(next);
+    this.#items = next;
+  }
+}
+
+function workerStorage(storageDir: string): { localStorage: Storage; sessionStorage: Storage } {
+  if (!isAbsolute(storageDir) || storageDir.includes('\0')) throw storageFailure('worker_storage_invalid');
+  const normalizedStorageDir = resolve(storageDir);
+  if (normalizedStorageDir === parse(normalizedStorageDir).root) {
+    throw storageFailure('worker_storage_invalid');
+  }
+  try {
+    mkdirSync(normalizedStorageDir, { recursive: true, mode: 0o700 });
+    const directoryStat = lstatSync(normalizedStorageDir);
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+      throw storageFailure('worker_storage_invalid');
+    }
+    chmodSync(normalizedStorageDir, 0o700);
+  } catch (error) {
+    if (error instanceof Error && error.message === 'worker_storage_invalid') throw error;
+    throw storageFailure('worker_storage_invalid');
+  }
+  const initial = loadStorageFile(normalizedStorageDir);
+  return {
+    localStorage: new BoundedStorage(initial, (items) => persistStorageFile(normalizedStorageDir, items)),
+    sessionStorage: new BoundedStorage(),
+  };
+}
 
 function normalizedHeaders(headers: IncomingHttpHeaders): Map<string, string> {
   const result = new Map<string, string>();
@@ -272,7 +478,8 @@ function defineValue(target: MutableGlobal, key: PropertyKey, value: unknown): v
   });
 }
 
-export function installWorkerPolyfills(): () => void {
+export function installWorkerPolyfills(storageDir: string): () => void {
+  const storage = workerStorage(storageDir);
   const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'https://localhost/' });
   const globalObject = globalThis as unknown as MutableGlobal;
   const windowObject = dom.window as unknown as MutableGlobal;
@@ -286,13 +493,17 @@ export function installWorkerPolyfills(): () => void {
   installGlobal('document', dom.window.document);
   installGlobal('navigator', dom.window.navigator);
   installGlobal('location', dom.window.location);
-  installGlobal('localStorage', dom.window.localStorage);
-  installGlobal('sessionStorage', dom.window.sessionStorage);
+  installGlobal('localStorage', storage.localStorage);
+  installGlobal('sessionStorage', storage.sessionStorage);
+  defineValue(windowObject, 'localStorage', storage.localStorage);
+  defineValue(windowObject, 'sessionStorage', storage.sessionStorage);
 
+  const indexedDB = new fakeIndexedDb.IDBFactory();
   for (const [key, value] of Object.entries(fakeIndexedDb)) {
     if (!key.startsWith('IDB') && key !== 'indexedDB') continue;
-    installGlobal(key, value);
-    defineValue(windowObject, key, value);
+    const installed = key === 'indexedDB' ? indexedDB : value;
+    installGlobal(key, installed);
+    defineValue(windowObject, key, installed);
   }
 
   installGlobal('WebSocket', RestrictedWebSocket);

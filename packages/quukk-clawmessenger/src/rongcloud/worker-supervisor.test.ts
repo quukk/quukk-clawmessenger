@@ -489,6 +489,37 @@ describe('RongCloud worker supervisor', () => {
     expect((await controlled.outcome).ok).toBe(true);
   });
 
+  it('bounds silent ready and online phases per generation without touching a healthy sibling', async () => {
+    const readyTimeoutMs = 11;
+    const onlineTimeoutMs = 13;
+    const fixture = createFixture({ readyTimeoutMs, onlineTimeoutMs });
+    const silent = binding(0);
+    const sibling = binding(1);
+    await fixture.supervisor.reconcile([silent, sibling]);
+    const silentChild = fixture.spawn.calls[0]!.child;
+    const siblingChild = fixture.spawn.calls[1]!.child;
+    await activate(siblingChild);
+
+    fixture.timers.advance(readyTimeoutMs);
+    await flush();
+    expect(silentChild.alive).toBe(false);
+    expect(siblingChild.alive).toBe(true);
+    expect(fixture.supervisor.snapshots()).toContainEqual(expect.objectContaining({
+      runtimeId: silent.runtimeId, state: 'backoff', restartCount: 1,
+    }));
+
+    fixture.timers.advance(restartBaseMs);
+    await flush();
+    const readyOnlyChild = fixture.spawn.calls[2]!.child;
+    const readyOnlyInstance = workerInstance(readyOnlyChild);
+    readyOnlyChild.emitMessage({ type: 'ready', runtimeId: silent.runtimeId, instanceId: readyOnlyInstance });
+    fixture.timers.advance(onlineTimeoutMs);
+    await flush();
+    expect(readyOnlyChild.alive).toBe(false);
+    expect(siblingChild.alive).toBe(true);
+    expect(fixture.spawn.calls).toHaveLength(3);
+  });
+
   it('fences wrong identities, duplicate ready, malformed IPC, and stale-generation handlers to one worker', async () => {
     const fixture = createFixture();
     const first = binding(0);
@@ -744,8 +775,13 @@ describe('RongCloud worker supervisor', () => {
     expect(() => timerFailure.spawn.calls[0]!.child.crash()).not.toThrow();
     expect(timerFailure.supervisor.snapshots()[0]).toMatchObject({ state: 'backoff' });
 
+    let lifecycleSchedules = 0;
     const lifecycleTimerFailure = createFixture({
-      setTimeout: () => { throw new Error('PHASE_D_TIMER_FAILURE_SENTINEL'); },
+      setTimeout: () => {
+        lifecycleSchedules += 1;
+        if (lifecycleSchedules <= 2) return 90_000 + lifecycleSchedules;
+        throw new Error('PHASE_D_TIMER_FAILURE_SENTINEL');
+      },
     });
     await lifecycleTimerFailure.supervisor.reconcile([timerBinding]);
     const lifecycleChild = lifecycleTimerFailure.spawn.calls[0]!.child;
@@ -906,15 +942,23 @@ describe('RongCloud worker supervisor', () => {
     expect(fixture.timers.pendingDelays()).toEqual([20]);
     fixture.timers.advance(20);
     await flush();
-    expect(await stopped.outcome).toEqual({ ok: true, value: undefined });
+    expect(await stopped.outcome).toMatchObject({ ok: false, error: { code: 'worker_exited' } });
     expect(fixture.supervisor.snapshots()[0]).toMatchObject({ state: 'stopped' });
     expect(fixture.timers.pendingDelays()).toEqual([]);
+    await expect(fixture.supervisor.restart(identity(value))).rejects.toMatchObject({ code: 'worker_exited' });
     child.reap();
+    await fixture.supervisor.restart(identity(value));
+    expect(fixture.spawn.calls).toHaveLength(2);
 
+    let timerSchedules = 0;
     const timerFailure = createFixture({
       terminateGraceMs: 10,
       killGraceMs: 20,
-      setTimeout: () => { throw new Error('PHASE_E_REAP_TIMER_SENTINEL'); },
+      setTimeout: () => {
+        timerSchedules += 1;
+        if (timerSchedules === 1) return 99_999;
+        throw new Error('PHASE_E_REAP_TIMER_SENTINEL');
+      },
     });
     const timerBinding = binding(8);
     await timerFailure.supervisor.reconcile([timerBinding]);
@@ -922,7 +966,7 @@ describe('RongCloud worker supervisor', () => {
     timerChild.exitOnSigterm = false;
     timerChild.exitOnSigkill = false;
     const timerOutcome = await track(timerFailure.supervisor.stop(identity(timerBinding))).outcome;
-    expect(timerOutcome).toEqual({ ok: true, value: undefined });
+    expect(timerOutcome).toMatchObject({ ok: false, error: { code: 'worker_exited' } });
     expect(timerChild.killSignals).toEqual(['SIGTERM', 'SIGKILL']);
     expect(timerFailure.supervisor.snapshots()[0]).toMatchObject({ state: 'stopped' });
     expect(JSON.stringify(timerOutcome)).not.toContain('PHASE_E_REAP_TIMER_SENTINEL');
@@ -943,10 +987,12 @@ describe('RongCloud worker supervisor', () => {
     await flush();
     fixture.timers.advance(20);
     await flush();
-    expect(await disposed.outcome).toEqual({ ok: true, value: undefined });
+    expect(await disposed.outcome).toMatchObject({ ok: false, error: { code: 'worker_exited' } });
     expect(fixture.supervisor.snapshots()).toEqual([]);
     expect(fixture.timers.pendingDelays()).toEqual([]);
+    expect(child.listeners.get('exit')?.size).toBe(1);
     child.reap();
+    expect(child.listeners.get('exit')?.size ?? 0).toBe(0);
     fixture.timers.advance(restartMaxMs * 10);
     await flush();
     expect(fixture.spawn.calls).toHaveLength(1);
@@ -1018,7 +1064,7 @@ describe('RongCloud worker supervisor', () => {
     await flush();
     expect(child.killCalls).toBeLessThanOrEqual(1);
     expect(fixture.timers.pendingDelays()).toEqual([restartBaseMs]);
-    expect(fixture.timers.scheduled).toEqual([restartBaseMs]);
+    expect(fixture.timers.scheduled).toEqual([20_000, restartBaseMs]);
     expect(fixture.supervisor.snapshots()[0]).toMatchObject({ state: 'backoff', restartCount: 1 });
   });
 

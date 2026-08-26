@@ -18,6 +18,8 @@ export const SUPERVISOR_RESTART_MAX_MS = 30_000;
 export const SUPERVISOR_STABLE_WINDOW_MS = 60_000;
 export const SUPERVISOR_TERMINATE_GRACE_MS = 2_000;
 export const SUPERVISOR_KILL_GRACE_MS = 1_000;
+export const SUPERVISOR_READY_TIMEOUT_MS = 20_000;
+export const SUPERVISOR_ONLINE_TIMEOUT_MS = 20_000;
 
 export interface WorkerIdentity {
   runtimeId: string;
@@ -89,6 +91,8 @@ export interface RongCloudWorkerSupervisorOptions {
   stableWindowMs?: number;
   terminateGraceMs?: number;
   killGraceMs?: number;
+  readyTimeoutMs?: number;
+  onlineTimeoutMs?: number;
   maxPendingRequests?: number;
   maxBufferedCommands?: number;
 }
@@ -152,6 +156,8 @@ interface WorkerRecord {
   restartCount: number;
   restartTimer?: unknown;
   stableTimer?: unknown;
+  readyTimer?: unknown;
+  onlineTimer?: unknown;
   pending: Map<string, PendingRequest>;
   buffer: PendingRequest[];
   refreshRequestId?: string;
@@ -250,6 +256,8 @@ export class RongCloudWorkerSupervisor {
   readonly #stableWindowMs: number;
   readonly #terminateGraceMs: number;
   readonly #killGraceMs: number;
+  readonly #readyTimeoutMs: number;
+  readonly #onlineTimeoutMs: number;
   readonly #maxPendingRequests: number;
   readonly #maxBufferedCommands: number;
   readonly #records = new Map<string, WorkerRecord>();
@@ -297,6 +305,16 @@ export class RongCloudWorkerSupervisor {
       30_000,
     );
     this.#killGraceMs = boundedInteger(options.killGraceMs, SUPERVISOR_KILL_GRACE_MS, 30_000);
+    this.#readyTimeoutMs = boundedInteger(
+      options.readyTimeoutMs,
+      SUPERVISOR_READY_TIMEOUT_MS,
+      5 * 60_000,
+    );
+    this.#onlineTimeoutMs = boundedInteger(
+      options.onlineTimeoutMs,
+      SUPERVISOR_ONLINE_TIMEOUT_MS,
+      5 * 60_000,
+    );
     this.#maxPendingRequests = boundedInteger(
       options.maxPendingRequests,
       SUPERVISOR_MAX_PENDING_REQUESTS,
@@ -398,11 +416,12 @@ export class RongCloudWorkerSupervisor {
     record.removeWhenReaped = false;
     this.#cancelLifecycleTimers(record);
     this.#rejectPending(record, 'worker_exited');
-    await this.#terminate(record);
+    const reaped = await this.#terminate(record);
     record.state = 'stopped';
     record.instanceId = null;
     record.readySeen = false;
     record.routable = false;
+    if (!reaped) throw failure('worker_exited');
   }
 
   async restart(identity: WorkerIdentity): Promise<void> {
@@ -432,11 +451,18 @@ export class RongCloudWorkerSupervisor {
     const records = [...this.#records.values()];
     const attempt = Promise.all(records.map(async (record) => {
       record.desired = false;
+      record.removeWhenReaped = true;
       this.#cancelLifecycleTimers(record);
       this.#rejectPending(record, 'worker_exited');
-      await this.#terminate(record);
-    })).then(() => {
-      this.#records.clear();
+      record.state = 'stopped';
+      record.instanceId = null;
+      record.readySeen = false;
+      record.routable = false;
+      const reaped = await this.#terminate(record);
+      if (reaped && this.#records.get(record.key) === record) this.#records.delete(record.key);
+      return reaped;
+    })).then((results) => {
+      if (results.some((reaped) => !reaped)) throw failure('worker_exited');
     });
     this.#disposeAttempt = attempt;
     return attempt;
@@ -504,6 +530,7 @@ export class RongCloudWorkerSupervisor {
     record.child = child;
     this.#trackChild(record, child, generation);
     this.#attach(record, child, generation);
+    if (!this.#armWatchdog(record, child, generation, 'ready')) return;
 
     let credential: SupervisorCredential;
     try {
@@ -610,6 +637,9 @@ export class RongCloudWorkerSupervisor {
       }
       record.readySeen = true;
       record.instanceId = event.instanceId;
+      if (record.readyTimer !== undefined) this.#clearTimeout(record.readyTimer);
+      record.readyTimer = undefined;
+      if (!this.#armWatchdog(record, child, generation, 'online')) return;
       this.#emit(record, event);
       return;
     }
@@ -638,6 +668,8 @@ export class RongCloudWorkerSupervisor {
     event: Extract<WorkerEvent, { type: 'connection' }>,
   ): void {
     if (event.state === 'online') {
+      if (record.onlineTimer !== undefined) this.#clearTimeout(record.onlineTimer);
+      record.onlineTimer = undefined;
       record.state = 'online';
       record.routable = true;
       record.onlineAt = this.#now();
@@ -847,6 +879,7 @@ export class RongCloudWorkerSupervisor {
     if (this.#disposed || this.#records.get(record.key) !== record || !record.desired
       || record.generation !== generation || record.failedGeneration === generation) return;
     record.failedGeneration = generation;
+    this.#cancelStartupTimers(record);
     if (record.stableTimer !== undefined) this.#clearTimeout(record.stableTimer);
     record.stableTimer = undefined;
     this.#rejectPending(record, 'worker_exited');
@@ -959,8 +992,37 @@ export class RongCloudWorkerSupervisor {
   #cancelLifecycleTimers(record: WorkerRecord): void {
     if (record.restartTimer !== undefined) this.#clearTimeout(record.restartTimer);
     if (record.stableTimer !== undefined) this.#clearTimeout(record.stableTimer);
+    this.#cancelStartupTimers(record);
     record.restartTimer = undefined;
     record.stableTimer = undefined;
+  }
+
+  #cancelStartupTimers(record: WorkerRecord): void {
+    if (record.readyTimer !== undefined) this.#clearTimeout(record.readyTimer);
+    if (record.onlineTimer !== undefined) this.#clearTimeout(record.onlineTimer);
+    record.readyTimer = undefined;
+    record.onlineTimer = undefined;
+  }
+
+  #armWatchdog(
+    record: WorkerRecord,
+    child: WorkerChild,
+    generation: number,
+    phase: 'ready' | 'online',
+  ): boolean {
+    const scheduled = this.#schedule(() => {
+      if (!this.#isCurrent(record, child, generation)) return;
+      if (phase === 'ready') record.readyTimer = undefined;
+      else record.onlineTimer = undefined;
+      this.#failRecord(record, generation);
+    }, phase === 'ready' ? this.#readyTimeoutMs : this.#onlineTimeoutMs);
+    if (!scheduled.ok) {
+      this.#failRecord(record, generation);
+      return false;
+    }
+    if (phase === 'ready') record.readyTimer = scheduled.timer;
+    else record.onlineTimer = scheduled.timer;
+    return true;
   }
 
   async #removeRecord(record: WorkerRecord): Promise<void> {

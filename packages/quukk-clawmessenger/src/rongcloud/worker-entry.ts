@@ -18,6 +18,7 @@ import {
 
 export const WORKER_INIT_TIMEOUT_MS = 15_000;
 export const WORKER_REQUEST_TIMEOUT_MS = 30_000;
+export const WORKER_CLEANUP_TIMEOUT_MS = 3_000;
 
 interface WorkerPort {
   on(event: 'message' | 'disconnect', listener: (value?: unknown) => void): void;
@@ -32,7 +33,8 @@ interface RuntimeTimers {
 
 interface WorkerRuntimeOptions extends Partial<RuntimeTimers> {
   port: WorkerPort;
-  sdk: RongCloudSdkFacade;
+  sdk?: RongCloudSdkFacade;
+  loadDependencies?: (storageDir: string) => Promise<LoadedWorkerDependencies>;
   instanceId?: string;
   exit?: (code: number) => void;
 }
@@ -53,8 +55,13 @@ export interface WorkerRuntime {
 }
 
 type PolyfillModule = {
-  installWorkerPolyfills(): () => void;
+  installWorkerPolyfills(storageDir: string): () => void;
 };
+
+interface LoadedWorkerDependencies {
+  sdk: unknown;
+  disposePolyfills(): void;
+}
 
 interface WorkerDependencyLoaders {
   loadPolyfills?: () => Promise<PolyfillModule>;
@@ -62,10 +69,11 @@ interface WorkerDependencyLoaders {
 }
 
 export async function loadWorkerDependencies(
+  storageDir: string,
   loaders: WorkerDependencyLoaders = {},
-): Promise<{ sdk: unknown; disposePolyfills(): void }> {
+): Promise<LoadedWorkerDependencies> {
   const polyfillModule = await (loaders.loadPolyfills?.() ?? import('./env-polyfill.js'));
-  const disposePolyfills = polyfillModule.installWorkerPolyfills();
+  const disposePolyfills = polyfillModule.installWorkerPolyfills(storageDir);
   try {
     const sdk = await (loaders.loadSdk?.() ?? import('@rongcloud/imlib-next'));
     return { sdk, disposePolyfills };
@@ -77,7 +85,8 @@ export async function loadWorkerDependencies(
 
 class Runtime implements WorkerRuntime {
   readonly #port: WorkerPort;
-  readonly #sdk: RongCloudSdkFacade;
+  #sdk?: RongCloudSdkFacade;
+  readonly #loadDependencies: (storageDir: string) => Promise<LoadedWorkerDependencies>;
   readonly #instanceId: string;
   readonly #setTimeout: RuntimeTimers['setTimeout'];
   readonly #clearTimeout: RuntimeTimers['clearTimeout'];
@@ -94,14 +103,21 @@ class Runtime implements WorkerRuntime {
   #initializing = false;
   #active = false;
   #closingStarted = false;
+  #closeGeneration = 0;
+  #disposePolyfills?: () => void;
   #closing?: Promise<void>;
 
   constructor(options: WorkerRuntimeOptions) {
     this.#port = options.port;
     this.#sdk = options.sdk;
+    this.#loadDependencies = options.loadDependencies ?? loadWorkerDependencies;
     this.#instanceId = options.instanceId ?? `rcw_${randomBytes(16).toString('hex')}`;
     this.#setTimeout = options.setTimeout ?? ((callback, milliseconds) => setTimeout(callback, milliseconds));
-    this.#clearTimeout = options.clearTimeout ?? ((timer) => clearTimeout(timer as ReturnType<typeof setTimeout>));
+    const clearTimer = options.clearTimeout
+      ?? ((timer: unknown) => clearTimeout(timer as ReturnType<typeof setTimeout>));
+    this.#clearTimeout = (timer) => {
+      try { clearTimer(timer); } catch { /* Cleanup deadlines remain fixed. */ }
+    };
     this.#exit = options.exit ?? (() => undefined);
   }
 
@@ -149,8 +165,25 @@ class Runtime implements WorkerRuntime {
   async #initialize(command: Extract<WorkerCommand, { type: 'init' }>): Promise<void> {
     this.#initializing = true;
     this.#runtimeId = command.binding.runtimeId;
+    let sdk = this.#sdk;
+    if (!sdk) {
+      let loaded: LoadedWorkerDependencies;
+      try {
+        loaded = await this.#loadDependencies(command.binding.storageDir);
+      } catch {
+        if (!this.#closingStarted) await this.#close(1, true);
+        return;
+      }
+      if (this.#closingStarted) {
+        try { loaded.disposePolyfills(); } catch { /* Cleanup remains fixed and local. */ }
+        return;
+      }
+      sdk = loaded.sdk as RongCloudSdkFacade;
+      this.#sdk = sdk;
+      this.#disposePolyfills = loaded.disposePolyfills;
+    }
     const client = new RongCloudClient({
-      sdk: this.#sdk,
+      sdk,
       nodeId: command.binding.nodeId,
       refreshToken: () => this.#requestRefresh(),
       onConnection: (state) => {
@@ -311,6 +344,7 @@ class Runtime implements WorkerRuntime {
   #close(exitCode: number | undefined, callExit: boolean): Promise<void> {
     if (this.#closing) return this.#closing;
     this.#closingStarted = true;
+    const closeGeneration = ++this.#closeGeneration;
     const closing = Promise.resolve().then(async () => {
       this.#active = false;
       this.#initializing = false;
@@ -330,17 +364,56 @@ class Runtime implements WorkerRuntime {
         pending.controller.abort();
         this.#pendingRequests.delete(requestId);
       }
-      try {
-        await this.#client?.dispose();
-      } catch {
-        // Cleanup errors are never forwarded across IPC.
-      }
+      const client = this.#client;
       this.#client = undefined;
       this.#runtimeId = undefined;
-      if (callExit && exitCode !== undefined) this.#exit(exitCode);
+      await this.#boundedCleanup(async () => {
+        try {
+          await client?.dispose();
+        } catch {
+          // Cleanup errors are never forwarded across IPC.
+        }
+      });
+      const disposePolyfills = this.#disposePolyfills;
+      this.#disposePolyfills = undefined;
+      try { disposePolyfills?.(); } catch { /* Cleanup remains fixed and local. */ }
+      this.#sdk = undefined;
+      if (callExit && exitCode !== undefined && closeGeneration === this.#closeGeneration) {
+        try { this.#exit(exitCode); } catch { /* The process boundary remains closed. */ }
+      }
     });
     this.#closing = closing;
     return closing;
+  }
+
+  #boundedCleanup(cleanup: () => Promise<void>): Promise<void> {
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer: unknown;
+      let timerInstalled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        if (timerInstalled) this.#clearTimeout(timer);
+        resolve();
+      };
+      let cleanupAttempt: Promise<void>;
+      try {
+        cleanupAttempt = cleanup();
+      } catch {
+        finish();
+        return;
+      }
+      void cleanupAttempt.then(finish, finish);
+      if (settled) return;
+      try {
+        timer = this.#setTimeout(finish, WORKER_CLEANUP_TIMEOUT_MS);
+        timerInstalled = true;
+        if (settled) this.#clearTimeout(timer);
+      } catch {
+        finish();
+      }
+    });
   }
 
   #clearInitTimer(): void {
@@ -385,23 +458,17 @@ function processPort(): WorkerPort {
 }
 
 async function startChild(): Promise<void> {
-  let disposePolyfills: (() => void) | undefined;
   try {
-    const loaded = await loadWorkerDependencies();
-    disposePolyfills = loaded.disposePolyfills;
     const runtime = createWorkerRuntime({
       port: processPort(),
-      sdk: loaded.sdk as RongCloudSdkFacade,
+      loadDependencies: loadWorkerDependencies,
       exit: (code) => {
-        disposePolyfills?.();
-        disposePolyfills = undefined;
         process.exitCode = code;
         if (process.connected) process.disconnect?.();
       },
     });
     runtime.start();
   } catch {
-    disposePolyfills?.();
     process.exitCode = 1;
     if (process.connected) process.disconnect?.();
   }

@@ -2,10 +2,10 @@
 
 import { fork, type ChildProcess, type ForkOptions } from 'node:child_process';
 import { once } from 'node:events';
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, extname, join, parse, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import * as ts from 'typescript';
@@ -26,6 +26,7 @@ type WorkerRuntime = {
 
 type WorkerModule = {
   WORKER_INIT_TIMEOUT_MS: number;
+  WORKER_CLEANUP_TIMEOUT_MS: number;
   WORKER_REQUEST_TIMEOUT_MS: number;
   isDirectIpcEntry(
     argv?: readonly string[],
@@ -34,7 +35,7 @@ type WorkerModule = {
     moduleUrl?: string,
   ): boolean;
   createWorkerRuntime(options: Record<string, unknown>): WorkerRuntime;
-  loadWorkerDependencies(loaders?: Record<string, unknown>): Promise<{
+  loadWorkerDependencies(storageDir: string, loaders?: Record<string, unknown>): Promise<{
     sdk: unknown;
     disposePolyfills(): void;
   }>;
@@ -59,9 +60,10 @@ type XMLHttpRequestLike = {
 };
 
 type PolyfillModule = {
+  MAX_STORAGE_BYTES: number;
   MAX_XHR_RESPONSE_BYTES: number;
   NodeXMLHttpRequest: new () => XMLHttpRequestLike;
-  installWorkerPolyfills(): () => void;
+  installWorkerPolyfills(storageDir: string): () => void;
 };
 
 let workerModule: WorkerModule | undefined;
@@ -153,6 +155,7 @@ class FakeSdk {
   destroyCalls = 0;
   sendImpl: () => Promise<SdkResult> = async () => ({ code: 0, data: { messageUId: 'sent-1' } });
   connectImpl: (token: string) => Promise<SdkResult> = async () => ({ code: 0 });
+  disconnectImpl: () => Promise<void> = async () => undefined;
 
   readonly TextMessage = class {
     constructor(readonly content: Record<string, unknown>) {}
@@ -188,6 +191,7 @@ class FakeSdk {
 
   async disconnect(): Promise<void> {
     this.disconnectCalls += 1;
+    return this.disconnectImpl();
   }
 
   async destroy(): Promise<void> {
@@ -378,10 +382,11 @@ describe('worker-only dependency loading', () => {
     const order: string[] = [];
     const dispose = () => order.push('dispose');
     const sdk = { marker: 'sdk' };
-    const loaded = await workerApi().loadWorkerDependencies({
+    const storageDir = 'D:\\worker-storage\\binding-one';
+    const loaded = await workerApi().loadWorkerDependencies(storageDir, {
       loadPolyfills: async () => ({
-        installWorkerPolyfills: () => {
-          order.push('polyfills');
+        installWorkerPolyfills: (received: string) => {
+          order.push(`polyfills:${received}`);
           return dispose;
         },
       }),
@@ -391,21 +396,24 @@ describe('worker-only dependency loading', () => {
       },
     });
 
-    expect(order).toEqual(['polyfills', 'sdk']);
+    expect(order).toEqual([`polyfills:${storageDir}`, 'sdk']);
     expect(loaded.sdk).toBe(sdk);
     loaded.disposePolyfills();
-    expect(order).toEqual(['polyfills', 'sdk', 'dispose']);
+    expect(order).toEqual([`polyfills:${storageDir}`, 'sdk', 'dispose']);
   });
 });
 
 describe('worker browser polyfills', () => {
-  it('installs child-local browser/indexedDB/socket globals and restores the process exactly', () => {
+  it('installs child-local browser/indexedDB/socket globals and restores the process exactly', async () => {
     const before = new Map(['window', 'document', 'navigator', 'location', 'localStorage', 'sessionStorage',
       'indexedDB', 'IDBKeyRange', 'WebSocket', 'XMLHttpRequest'].map((key) => [
       key,
       Object.getOwnPropertyDescriptor(globalThis, key),
     ]));
-    const dispose = polyfillsApi().installWorkerPolyfills();
+    const configuredTemp = process.env.TEMP ?? process.env.TMP;
+    if (!configuredTemp) throw new Error('task_temp_required');
+    const storageDir = await mkdtemp(join(resolve(configuredTemp), 'quukk-task9-polyfills-'));
+    const dispose = polyfillsApi().installWorkerPolyfills(storageDir);
     try {
       expect(globalThis).toHaveProperty('window');
       expect(globalThis).toHaveProperty('document');
@@ -418,10 +426,59 @@ describe('worker browser polyfills', () => {
       expect(() => new Socket('data:text/plain,no')).toThrow();
     } finally {
       dispose();
+      await rm(storageDir, { recursive: true, force: true });
     }
     for (const [key, descriptor] of before) {
       expect(Object.getOwnPropertyDescriptor(globalThis, key)).toEqual(descriptor);
     }
+  });
+
+  it('persists bounded localStorage per directory while isolating sessions and IndexedDB factories', async () => {
+    const configuredTemp = process.env.TEMP ?? process.env.TMP;
+    if (!configuredTemp) throw new Error('task_temp_required');
+    const root = await mkdtemp(join(resolve(configuredTemp), 'quukk-task9-storage-'));
+    const firstDir = join(root, 'first');
+    const secondDir = join(root, 'second');
+    const storageFile = join(firstDir, 'local-storage.json');
+    let firstIndexedDb: unknown;
+    try {
+      let dispose = polyfillsApi().installWorkerPolyfills(firstDir);
+      localStorage.setItem('sdk-state', 'durable');
+      sessionStorage.setItem('session-state', 'ephemeral');
+      expect((globalThis as unknown as { window: Window }).window.localStorage).toBe(localStorage);
+      expect((globalThis as unknown as { window: Window }).window.sessionStorage).toBe(sessionStorage);
+      firstIndexedDb = globalThis.indexedDB;
+      expect(() => localStorage.setItem('oversized', 'x'.repeat(polyfillsApi().MAX_STORAGE_BYTES + 1)))
+        .toThrow();
+      dispose();
+
+      expect(JSON.parse(await readFile(storageFile, 'utf8'))).toEqual({ 'sdk-state': 'durable' });
+      expect((await stat(storageFile)).size).toBeLessThanOrEqual(polyfillsApi().MAX_STORAGE_BYTES);
+      if (process.platform !== 'win32') {
+        expect((await stat(firstDir)).mode & 0o777).toBe(0o700);
+        expect((await stat(storageFile)).mode & 0o777).toBe(0o600);
+      }
+
+      dispose = polyfillsApi().installWorkerPolyfills(firstDir);
+      expect(localStorage.getItem('sdk-state')).toBe('durable');
+      expect(localStorage.getItem('oversized')).toBeNull();
+      expect(sessionStorage.getItem('session-state')).toBeNull();
+      expect(globalThis.indexedDB).not.toBe(firstIndexedDb);
+      dispose();
+
+      dispose = polyfillsApi().installWorkerPolyfills(secondDir);
+      expect(localStorage.getItem('sdk-state')).toBeNull();
+      expect(globalThis.indexedDB).not.toBe(firstIndexedDb);
+      dispose();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a filesystem root before installing storage polyfills', () => {
+    const filesystemRoot = parse(resolve(process.env.TEMP ?? process.env.TMP ?? process.cwd())).root;
+    expect(() => polyfillsApi().installWorkerPolyfills(filesystemRoot))
+      .toThrowError('worker_storage_invalid');
   });
 
   it('implements bounded HTTP-only XMLHttpRequest with normalized headers and abort cleanup', async () => {
@@ -520,7 +577,10 @@ describe('worker browser polyfills', () => {
     const timeoutServer = createServer(() => undefined);
     const redirectPort = await listen(redirectServer);
     const timeoutPort = await listen(timeoutServer);
-    const dispose = installWorkerPolyfills();
+    const configuredTemp = process.env.TEMP ?? process.env.TMP;
+    if (!configuredTemp) throw new Error('task_temp_required');
+    const storageDir = await mkdtemp(join(resolve(configuredTemp), 'quukk-task9-xhr-'));
+    const dispose = installWorkerPolyfills(storageDir);
     try {
       const redirect = await xhrRequest(Xhr, `http://127.0.0.1:${redirectPort}/redirect`);
       expect(redirect.status).toBe(302);
@@ -543,11 +603,45 @@ describe('worker browser polyfills', () => {
     } finally {
       dispose();
       await Promise.all([close(redirectServer), close(redirectTarget), close(timeoutServer)]);
+      await rm(storageDir, { recursive: true, force: true });
     }
   });
 });
 
 describe('injected worker runtime', () => {
+  it('does not load worker dependencies until init supplies the binding storage directory', async () => {
+    const port = new FakePort();
+    const sdk = new FakeSdk();
+    const timers = new ManualTimers();
+    const order: string[] = [];
+    const exits: number[] = [];
+    const runtime = workerApi().createWorkerRuntime({
+      port,
+      instanceId,
+      setTimeout: timers.setTimeout,
+      clearTimeout: timers.clearTimeout,
+      exit: (code: number) => exits.push(code),
+      loadDependencies: async (storageDir: string) => {
+        order.push(`load:${storageDir}`);
+        return {
+          sdk,
+          disposePolyfills: () => order.push('dispose-polyfills'),
+        };
+      },
+    });
+    runtime.start();
+    expect(order).toEqual([]);
+
+    port.emit('message', init());
+    await flush();
+    expect(order).toEqual(['load:D:\\worker-storage']);
+    expect(port.sent).toContainEqual({ type: 'ready', runtimeId, instanceId });
+    await runtime.dispose();
+    expect(order).toEqual(['load:D:\\worker-storage', 'dispose-polyfills']);
+    expect(exits).toEqual([]);
+    expect(timers.pending.size).toBe(0);
+  });
+
   it('rejects actions before init and exits cleanly without emitting an invalid event', async () => {
     const fixture = createRuntime();
     fixture.port.emit('message', { type: 'disconnect', requestId: 'before-init' });
@@ -675,8 +769,35 @@ describe('injected worker runtime', () => {
     await flush();
     expect(requestFixture.port.sent).toContainEqual({
       type: 'result', runtimeId, instanceId, requestId: 'timed-out', ok: false, errorCode: 'timeout',
+    });
   });
-});
+
+  it('forces exit after a hard cleanup deadline when init and SDK disconnect both hang', async () => {
+    let resolveConnect: ((result: SdkResult) => void) | undefined;
+    let resolveDisconnect: (() => void) | undefined;
+    const sdk = new FakeSdk();
+    sdk.connectImpl = () => new Promise((resolve) => { resolveConnect = resolve; });
+    sdk.disconnectImpl = () => new Promise((resolve) => { resolveDisconnect = resolve; });
+    const fixture = createRuntime({ sdk });
+    fixture.port.emit('message', init('hung-cleanup-token'));
+    await flush();
+
+    fixture.timers.run(workerApi().WORKER_INIT_TIMEOUT_MS);
+    await flush();
+    expect(fixture.exits).toEqual([]);
+    fixture.timers.run(workerApi().WORKER_CLEANUP_TIMEOUT_MS);
+    await flush();
+    expect(fixture.exits).toEqual([1]);
+    expect(fixture.timers.pending.size).toBe(0);
+    const eventsAfterExit = structuredClone(fixture.port.sent);
+
+    resolveConnect?.({ code: 0 });
+    resolveDisconnect?.();
+    await flush();
+    expect(fixture.port.sent).toEqual(eventsAfterExit);
+    expect(fixture.exits).toEqual([1]);
+    expect(fixture.timers.pending.size).toBe(0);
+  });
 
 describe('real child-process supervisor boundary', () => {
   it('keeps credentials IPC-only, isolates sibling PIDs, reaps exits, and disposes every handle', async () => {

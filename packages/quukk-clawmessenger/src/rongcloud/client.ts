@@ -312,6 +312,7 @@ const registrations = [
 
 const authenticationCodes = new Set([1002, 31004, 31020, 31029]);
 const sentUidLimit = 2_048;
+const inboundMessageLimit = 1_024;
 
 export class RongCloudClient {
   readonly #sdk: RongCloudSdkFacade;
@@ -406,7 +407,7 @@ export class RongCloudClient {
       }
       result = { code };
     }
-    this.#assertCurrent(generation);
+    this.#assertConnectedAttempt(generation);
 
     const firstCode = resultCode(result);
     if (!isSuccess(result) && firstCode !== undefined && authenticationCodes.has(firstCode) && this.#refreshToken) {
@@ -426,7 +427,7 @@ export class RongCloudClient {
           this.#desiredConnected = false;
           throw failure('authentication_failed');
         }
-        this.#assertCurrent(generation);
+        this.#assertConnectedAttempt(generation);
       }
     }
 
@@ -441,8 +442,8 @@ export class RongCloudClient {
   }
 
   disconnect(): Promise<void> {
-    if (this.#disconnectAttempt) return this.#disconnectAttempt;
     const wasActive = this.#desiredConnected || this.#connected || this.#connectAttempt !== undefined;
+    if (this.#disconnectAttempt && !wasActive) return this.#disconnectAttempt;
     this.#desiredConnected = false;
     this.#connected = false;
     this.#generation += 1;
@@ -643,7 +644,8 @@ export class RongCloudClient {
   }
 
   #receive(event: unknown): void {
-    if (event === null || typeof event !== 'object' || isProxy(event)) return;
+    if (!this.#connected || !this.#desiredConnected || this.#disposed
+      || event === null || typeof event !== 'object' || isProxy(event)) return;
     let messages: unknown;
     try {
       const descriptor = Object.getOwnPropertyDescriptor(event, 'messages');
@@ -653,9 +655,36 @@ export class RongCloudClient {
     } catch {
       return;
     }
-    if (!Array.isArray(messages)) return;
-    for (const raw of messages) {
-      const normalized = normalizeRongCloudMessage(raw);
+    if (isProxy(messages) || !Array.isArray(messages)) return;
+    let length: number | undefined;
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(messages, 'length');
+      const value = descriptor && Object.prototype.hasOwnProperty.call(descriptor, 'value')
+        ? descriptor.value
+        : undefined;
+      if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) length = value;
+    } catch {
+      return;
+    }
+    if (length === undefined || length > inboundMessageLimit) return;
+    const snapshot: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      try {
+        const descriptor = Object.getOwnPropertyDescriptor(messages, String(index));
+        if (descriptor && Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+          snapshot.push(descriptor.value);
+        }
+      } catch {
+        // One hostile index cannot block safe sibling descriptors.
+      }
+    }
+    for (const raw of snapshot) {
+      let normalized: ReturnType<typeof normalizeRongCloudMessage>;
+      try {
+        normalized = normalizeRongCloudMessage(raw);
+      } catch {
+        continue;
+      }
       if (!normalized.ok || !this.#onMessage) continue;
       try {
         void Promise.resolve(this.#onMessage(normalized.value)).catch(() => undefined);
@@ -688,6 +717,16 @@ export class RongCloudClient {
 
   #assertCurrent(generation: number): void {
     if (!this.#isCurrent(generation)) throw failure('disconnected');
+  }
+
+  #assertConnectedAttempt(generation: number): void {
+    if (this.#isCurrent(generation)) return;
+    try {
+      void Promise.resolve(this.#sdk.disconnect()).catch(() => undefined);
+    } catch {
+      // A stale physical connection remains logically fenced even if cleanup fails.
+    }
+    throw failure('disconnected');
   }
 
   #assertOperation(generation: number, signal?: AbortSignal): void {
