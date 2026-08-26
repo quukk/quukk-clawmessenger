@@ -1,0 +1,21 @@
+{
+  "name": "quukk-clawmessenger",
+  "version": "0.1.0-beta.1",
+  "description": "Connect local AI agents to ClawMessenger, built on Multica",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "bin": { "quukk-clawmessenger": "bin/quukk-clawmessenger.js" },
+  "files": ["bin", "dist", "LICENSE", "NOTICE", "MODIFICATIONS.md", "THIRD_PARTY_NOTICES.md", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "devDependencies": {
+    "@multica/tsconfig": "workspace:*",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

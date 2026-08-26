@@ -242,6 +242,10 @@ Node supervisor 只管理自己启动的 Go 守护进程和 RongCloud worker 子
 6. 社区 fork、内部使用和源码分发按当前 Multica License 执行。公开托管、商业嵌入或商业分发在未取得 Multica, Inc. 的书面商业许可前不进入发布范围；去除/修改品牌还需要单独的书面 branding waiver。
 7. 同步上游使用 merge，不重写已发布历史；每次同步后运行完整兼容测试和许可证打包审计。
 
+### 8.1 初始脚手架记录
+
+2026-08-26 建立 `quukk-clawmessenger` 发布包和 `@quukk/clawmessenger-bridge-ui` 私有工作区。该脚手架仅定义发布边界、版本标识和 UI 构建输出位置；不包含 RongCloud SDK、服务端连接或运行时业务逻辑。
+
 ## 9. 测试策略
 
 开发遵循测试先行。默认测试禁止执行宿主机上真实安装的智能体 CLI。

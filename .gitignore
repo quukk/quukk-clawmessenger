@@ -65,6 +65,7 @@ _features/
 
 # runtime
 *.pid
+.quukk-clawmessenger/
 
 # platform specific
 *.dmg
