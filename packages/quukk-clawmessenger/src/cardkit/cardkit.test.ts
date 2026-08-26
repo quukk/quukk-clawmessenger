@@ -1,5 +1,7 @@
 // @vitest-environment node
 
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -33,6 +35,17 @@ import {
   sessionsCard,
 } from './templates.js';
 import { buildUnsupportedApprovalResult, routeCardAction } from './action-router.js';
+
+const cardkitFixture = JSON.parse(readFileSync(
+  new URL('../protocol/fixtures/cardkit-wire.json', import.meta.url),
+  'utf8',
+)) as {
+  cardMessage: { card: CardModel; timestamp: number };
+  cardUpdate: { cardId: string; card: CardModel; timestamp: number };
+  cardAction: Record<string, unknown>;
+  permissionAction: Record<string, unknown>;
+  permissionCommandResult: Record<string, unknown> & { timestamp: number };
+};
 
 function allSections(): CardSection[] {
   const actions = [
@@ -404,5 +417,58 @@ describe('CardKit deterministic templates', () => {
       'commands-card',
       Array.from({ length: 25 }, (_, index) => ({ name: `/command-${index}` })),
     ).sections).toHaveLength(20);
+  });
+});
+
+describe('CardKit shared wire fixture and provenance gate', () => {
+  it('rebuilds every external fixture envelope byte-for-byte', () => {
+    expect(buildCardMessage(cardkitFixture.cardMessage.card, cardkitFixture.cardMessage.timestamp))
+      .toEqual(cardkitFixture.cardMessage);
+    expect(buildCardUpdate(
+      cardkitFixture.cardUpdate.cardId,
+      cardkitFixture.cardUpdate.card,
+      cardkitFixture.cardUpdate.timestamp,
+    )).toEqual(cardkitFixture.cardUpdate);
+    expect(routeCardAction(cardkitFixture.cardAction)).toMatchObject({
+      ok: true, kind: 'command', name: '/status', cardId: 'wire-card', requestId: 'wire-request-1',
+    });
+    expect(buildUnsupportedApprovalResult(
+      cardkitFixture.permissionAction,
+      cardkitFixture.permissionCommandResult.timestamp,
+    )).toEqual(cardkitFixture.permissionCommandResult);
+  });
+
+  it('records full immutable provenance and complete MIT notices', () => {
+    const fixtureReadme = readFileSync(
+      new URL('../protocol/fixtures/README.md', import.meta.url),
+      'utf8',
+    );
+    for (const evidence of [
+      '79155a50592f113496ae9b5da16c18d2405d581f',
+      '710b46e02c5797dee61bd8387edc5e59c5c30b41e76687e802b19532f0cfe027',
+      '9ccf1f404fbf9e3a3fcc29f08316043832cd0d93',
+      '96950ede1c5522d085d63d702ef76ea2161f2c91507cde2e371875785f5dfc4d',
+      '33900f70684573574c1cbbd9434af1e77565fe8b',
+      '517c43105b64d4adccbc142cb21fbba54e0e9528fc95104d7c7b49961e4a1575',
+    ]) expect(fixtureReadme).toContain(evidence);
+
+    const notices = readFileSync(
+      new URL('../../../../THIRD_PARTY_NOTICES.md', import.meta.url),
+      'utf8',
+    );
+    expect(notices).not.toContain('Future compatibility work may adapt');
+    expect(notices).toContain('Copyright (c) 2026 Quukk');
+    expect(notices).toContain('Copyright (c) 2024 quukk');
+    expect(notices.match(/Permission is hereby granted/g)).toHaveLength(2);
+
+    for (const source of [
+      'schema.ts', 'builders.ts', 'validate.ts', 'parse-marker.ts', 'templates.ts', 'action-router.ts',
+      '../protocol/messages.ts', '../protocol/discussion-v1.ts',
+      '../protocol/discussion-v2.ts', '../protocol/discussion-wire.ts',
+    ]) {
+      const contents = readFileSync(new URL(source, import.meta.url), 'utf8');
+      expect(contents).toContain('THIRD_PARTY_NOTICES.md');
+      expect(contents).toMatch(/3f3a2e4d6a8cb143a0088350aed2e1b4d1675473|a50f2393213f6f1c42da139491d2fe20937e7c7a/);
+    }
   });
 });

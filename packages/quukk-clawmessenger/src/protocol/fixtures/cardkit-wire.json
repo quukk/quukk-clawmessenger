@@ -1,0 +1,106 @@
+{
+  "cardMessage": {
+    "msg_type": "card_message",
+    "schema": "1.0.0",
+    "card": {
+      "schema": "1.0.0",
+      "id": "wire-card",
+      "header": { "title": "Wire card", "color": "blue" },
+      "sections": [
+        { "kind": "markdown", "content": "Public fixture content" },
+        {
+          "kind": "buttonRow",
+          "buttons": [
+            {
+              "id": "status-button",
+              "label": "Status",
+              "action": { "type": "command", "name": "/status" }
+            }
+          ],
+          "layout": "inline"
+        }
+      ],
+      "config": {}
+    },
+    "timestamp": 100
+  },
+  "cardUpdate": {
+    "msg_type": "card_update",
+    "cardId": "wire-card",
+    "card": {
+      "schema": "1.0.0",
+      "id": "wire-card",
+      "header": { "title": "Wire card", "color": "blue" },
+      "sections": [
+        { "kind": "markdown", "content": "Public fixture content" },
+        {
+          "kind": "buttonRow",
+          "buttons": [
+            {
+              "id": "status-button",
+              "label": "Status",
+              "action": { "type": "command", "name": "/status" }
+            }
+          ],
+          "layout": "inline"
+        }
+      ],
+      "config": {}
+    },
+    "timestamp": 101
+  },
+  "cardAction": {
+    "msg_type": "card_action",
+    "cardId": "wire-card",
+    "buttonId": "status-button",
+    "action": { "type": "command", "name": "/status" },
+    "request_id": "wire-request-1",
+    "timestamp": 102
+  },
+  "permissionAction": {
+    "msg_type": "card_action",
+    "cardId": "wire-card",
+    "buttonId": "permission-button",
+    "action": { "type": "permission", "permissionId": "permission-1", "reply": "once" },
+    "request_id": "wire-request-approval",
+    "timestamp": 103
+  },
+  "permissionCommandResult": {
+    "msg_type": "command_result",
+    "request_id": "wire-request-approval",
+    "status": "error",
+    "code": 501,
+    "message": "unsupported_interactive_approval",
+    "data": {
+      "card_state": {
+        "card_id": "wire-card",
+        "status": "error",
+        "result": "unsupported_interactive_approval",
+        "completed_action": "permission",
+        "completed_at": 200,
+        "card": {
+          "schema": "1.0.0",
+          "id": "wire-card",
+          "header": { "title": "Interactive approval unavailable", "color": "orange" },
+          "sections": [
+            {
+              "kind": "keyValue",
+              "items": [
+                { "label": "Permission", "value": "unsupported" },
+                { "label": "Request", "value": "unsupported" }
+              ]
+            },
+            {
+              "kind": "note",
+              "text": "Interactive permission replies are not available in this runtime."
+            },
+            { "kind": "note", "text": "" },
+            { "kind": "note", "text": "unsupported_interactive_approval" }
+          ],
+          "config": {}
+        }
+      }
+    },
+    "timestamp": 200
+  }
+}

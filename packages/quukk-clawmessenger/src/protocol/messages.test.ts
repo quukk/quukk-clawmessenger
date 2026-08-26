@@ -1,5 +1,7 @@
 // @vitest-environment node
 
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -19,7 +21,24 @@ const baseMessage = {
   messageType: 'command',
 };
 
+const contentFixture = JSON.parse(readFileSync(
+  new URL('./fixtures/rongcloud-content-shapes.json', import.meta.url),
+  'utf8',
+)) as {
+  base: Record<string, unknown>;
+  cases: Array<{
+    name: string;
+    content: unknown;
+    expected: Record<string, unknown>;
+  }>;
+};
+
 describe('normalizeRongCloudMessage', () => {
+  it.each(contentFixture.cases)('matches shared RongCloud content fixture: $name', ({ content, expected }) => {
+    expect(normalizeRongCloudMessage({ ...contentFixture.base, content }))
+      .toMatchObject({ ok: true, value: expected });
+  });
+
   it.each([
     ['plain text', 'hello', 'hello'],
     ['content object', { content: 'hello' }, 'hello'],

@@ -1,0 +1,80 @@
+{
+  "base": {
+    "messageUId": "fixture-message-1",
+    "senderUserId": "fixture-user-1",
+    "targetId": "fixture-node-1",
+    "conversationType": 1,
+    "messageType": "command"
+  },
+  "cases": [
+    {
+      "name": "plain text",
+      "content": "hello",
+      "expected": { "text": "hello", "attachments": [] }
+    },
+    {
+      "name": "content object",
+      "content": { "content": "object text" },
+      "expected": {
+        "text": "object text",
+        "attachments": [],
+        "rawContent": { "content": "object text" }
+      }
+    },
+    {
+      "name": "JSON content",
+      "content": "{\"content\":\"json text\"}",
+      "expected": {
+        "text": "json text",
+        "attachments": [],
+        "rawContent": { "content": "json text" }
+      }
+    },
+    {
+      "name": "one nested JSON layer",
+      "content": { "content": "{\"content\":\"nested text\"}" },
+      "expected": {
+        "text": "nested text",
+        "attachments": [],
+        "rawContent": { "content": "nested text" }
+      }
+    },
+    {
+      "name": "fresh allowlisted attachment content",
+      "content": {
+        "content": "file text",
+        "attachments": [
+          {
+            "kind": "file",
+            "url": "https://example.test/file.txt",
+            "name": "file.txt",
+            "size": 12
+          }
+        ],
+        "unknownProviderState": { "credential": "drop" }
+      },
+      "expected": {
+        "text": "file text",
+        "attachments": [
+          {
+            "kind": "file",
+            "url": "https://example.test/file.txt",
+            "name": "file.txt",
+            "size": 12
+          }
+        ],
+        "rawContent": {
+          "content": "file text",
+          "attachments": [
+            {
+              "kind": "file",
+              "url": "https://example.test/file.txt",
+              "name": "file.txt",
+              "size": 12
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
