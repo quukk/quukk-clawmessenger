@@ -12,7 +12,7 @@ Quukk ClawMessenger 采用 **fork 路线**：在 Multica 完整 monorepo 上增�
 npm install -g quukk-clawmessenger
 ```
 
-安装后的交互式桌面环境会启动本地服务并打开浏览器；非交互环境、CI、禁用 lifecycle scripts 的 npm 配置不会自动弹窗，用户可执行 `multica-clawmessenger setup` 获得同样结果。首次页面展示本机检测到的 OpenCode、OpenClaw、Codex 与 Hermes 运行时，用户选择一个或全部后，系统为每个所选运行时幂等注册一个独立融云用户，并启动对应消息桥。
+安装后的交互式桌面环境会启动本地服务并打开浏览器；非交互环境、CI、禁用 lifecycle scripts 的 npm 配置不会自动弹窗，用户可执行 `quukk-clawmessenger setup` 获得同样结果。首次页面展示本机检测到的 OpenCode、OpenClaw、Codex 与 Hermes 运行时，用户选择一个或全部后，系统为每个所选运行时幂等注册一个独立融云用户，并启动对应消息桥。
 
 架构职责固定如下：
 
@@ -136,7 +136,7 @@ ClawMessenger App / 小程序
 - `GET /v1/runtimes`：返回稳定 runtime ID、provider、版本、路径、能力和检测状态。
 - `POST /v1/runtimes/refresh`：触发一次有超时的重新探测。
 - `POST /v1/tasks`：以 runtime ID、conversation key、工作目录和 prompt 启动或恢复任务。
-- `GET /v1/tasks/{id}/events`：SSE 输出标准化增量、工具调用、审批、完成和错误事件。
+- `GET /v1/tasks/{id}/events`：SSE 输出标准化增量、工具调用、状态、完成和错误事件。
 - `POST /v1/tasks/{id}/cancel`：取消完整进程树。
 - `GET /healthz`：报告版本、启动时间和探测器状态。
 
@@ -146,10 +146,10 @@ ClawMessenger App / 小程序
 
 | Provider | 主协议 | 探测依据 | 关键行为 |
 | --- | --- | --- | --- |
-| OpenCode | `opencode run --format json`；已有 server 模式可作为后续优化 | PATH、已知安装目录、版本探针 | 解析 JSON 事件；按会话恢复；拒绝恢复时新建一次 |
+| OpenCode | `opencode run --format json`；已有 server 模式可作为后续优化 | PATH、登录 shell PATH、版本探针 | 解析 JSON 事件；按会话恢复；拒绝恢复时新建一次 |
 | OpenClaw | `openclaw agent --json` | PATH、版本探针 | 使用 agent JSON 输出；当前 adapter 只保证任务结束后的最终结果，不承诺 token 级增量；Bridge mode 不依赖网关插件安装 |
-| Codex | Codex app-server JSON-RPC | PATH、常见安装入口、版本探针 | 线程创建/恢复、审批事件、容量错误分类、进程树取消 |
-| Hermes | ACP | PATH、Hermes 配置目录、版本探针 | 标准 ACP 会话；认证缺失映射为 `needs_auth` |
+| Codex | Codex app-server JSON-RPC | PATH、登录 shell PATH、macOS app bundle、版本探针 | 线程创建/恢复、守护进程内审批处理、容量错误分类、进程树取消 |
+| Hermes | ACP | PATH、登录 shell PATH、版本探针 | 标准 ACP 会话；任务返回明确认证错误后映射为 `needs_auth` |
 
 探测不使用 shell 字符串拼接。每个候选可执行文件用参数数组启动，限制并发、单次探针超时和输出大小；Bridge 路径覆盖必须是绝对文件路径。结果带来源优先级并选择一个主候选：用户覆盖 > 进程 PATH > 有缓存的登录 shell PATH > Codex macOS app bundle。重新扫描不会改变已启用 runtime ID，除非原路径已不可用。瞬时探针超时使用 `probe_failed`，不会被误报成已确认不可运行。
 
@@ -185,7 +185,7 @@ type RuntimeBinding = {
 - 会话控制：新建、切换、列出、清理会话。
 - 命令：帮助、状态、取消、工作目录与支持的既有命令。
 - 设备状态/设备控制：只执行白名单动作。
-- discussion v2 / CardKit：路由审批、回答、导航、会话和自定义动作。
+- discussion v2 / CardKit：路由回答、导航、会话和自定义动作；权限动作按兼容协议解析并确定返回“不支持交互审批”。
 
 每个 binding 拥有独立 `SessionStore`，conversation key 只在该 binding 内解析，杜绝 OpenCode 会话串到 Codex。消息确认、已读回执和“处理中”反馈在任务成功创建后发送；启动失败返回明确错误而不写入错误的会话映射。
 
@@ -218,7 +218,7 @@ Windows 使用用户 ACL，Unix 文件权限为 `0600`、目录为 `0700`。JSON
 
 配置优先级固定为：CLI 参数 > `QUUKK_CLAWMESSENGER_*` 环境变量 > 配置文件 > 内置默认值。默认 ClawMessenger 服务地址为 `https://newsradar.dreamdt.cn/im`，允许在设置页和 CLI 显式覆盖。启动时检测旧的单 provider 配置，只展示可导入项并要求用户确认；导入成功前不移动或删除旧文件。
 
-Node supervisor 只管理自己启动的 Go 守护进程和 RongCloud worker 子进程，并通过 PID、进程创建时间和随机实例 ID 三者共同校验，避免杀错复用 PID 的进程。`stop` 先通知所有 worker 正常断开，再关闭 Go 守护进程，超时后才终止已验证的子进程树。
+Node supervisor 只管理自己启动的 Go 守护进程和 RongCloud worker 子进程，并通过 readiness/health 一致的 PID、`started_at` 和随机实例 ID 三者共同校验，避免杀错复用 PID 的进程。`stop` 先通知所有 worker 正常断开，再关闭 Go 守护进程，超时后才终止已验证的子进程树。
 
 ## 7. 安全与故障处理
 
@@ -234,7 +234,7 @@ Node supervisor 只管理自己启动的 Go 守护进程和 RongCloud worker 子
 
 ## 8. 许可证与 fork 治理
 
-1. Git 历史完整保留；fork 基线为上游 commit `54027ba763fa7da0699b2fe89df4a6b2c13d1c6f`。原仓库远端命名为 `upstream`，业务开发位于 `codex/clawmessenger-fork` 及后续 `codex/*` 分支，禁止向 `upstream` 推送 fork 发布提交。
+1. Git 历史完整保留；fork 基线为上游 commit `54027ba763fa7da0699b2fe89df4a6b2c13d1c6f`。原仓库远端命名为 `upstream`，业务开发位于 `codex/quukk-clawmessenger` 及后续 `codex/*` 分支，禁止向 `upstream` 推送 fork 发布提交。
 2. 仓库、源码发布物、二进制发布物和 npm tarball 均携带完整、未删减的 Multica `LICENSE` 与 `NOTICE`。
 3. 任何从 `apps/web`、`apps/desktop`、`apps/mobile`、`packages/views`、`packages/ui` 派生的界面继续展示 Multica Logo、产品名、版权和归属；`Quukk ClawMessenger` 只作相邻的附加衍生版标识。
 4. 用户文档明确写明“Built on Multica”，链接到 `https://github.com/multica-ai/multica`。
@@ -257,7 +257,7 @@ Node supervisor 只管理自己启动的 Go 守护进程和 RongCloud worker 子
 
 ### 9.2 集成测试
 
-- fake CLI 覆盖 OpenCode JSON、OpenClaw JSON、Codex JSON-RPC、Hermes ACP 的新建、恢复、审批、失败和取消。
+- fake CLI 覆盖 OpenCode JSON、OpenClaw JSON、Codex JSON-RPC、Hermes ACP 的新建、恢复、内部权限处理、失败和取消。
 - mock ClawMessenger 注册 API 验证四个独立 node type、响应校验与重试上限。
 - mock RongCloud transport 验证四个 worker 并发、SDK 状态隔离、单连接掉线不影响其他连接、重连后终态发送。
 - Node supervisor 与 Go Bridge API 的鉴权、SSE、正常关闭和崩溃恢复。
@@ -288,7 +288,7 @@ CI 构建 Windows x64/arm64、macOS x64/arm64、Linux glibc x64/arm64；每个�
 - 新用户在支持的平台只安装入口包即可看到本地智能体列表。
 - 本机同时存在 OpenCode 和 OpenClaw 时，页面准确展示两者；可只接入其中一个，也可全部接入。
 - 四个 provider 中每个所选运行时都拥有可验证、互不串号的融云身份。
-- 从 ClawMessenger 发给某一智能体的消息只进入该智能体的会话，回复、审批、取消和状态回传行为与现有单 provider 插件一致。
+- 从 ClawMessenger 发给某一智能体的消息只进入该智能体的会话；回复、取消和状态回传保持兼容，权限消息按 v1 明示的 headless 策略处理。
 - 任一智能体离线、认证失败或崩溃不影响其他智能体继续工作。
 - 重启后身份、选择和会话可恢复，敏感数据不出现在日志和诊断导出中。
 - 默认测试无宿主机 CLI 副作用，跨平台安装矩阵与发布物审计均通过。
