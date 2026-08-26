@@ -39,6 +39,8 @@ const (
 	BridgeEventCancelled    BridgeEventType = "cancelled"
 )
 
+const BridgeTaskStatusResumeInvalidated = "resume_invalidated"
+
 type BridgeError struct {
 	Category string `json:"category"`
 	Message  string `json:"message"`
@@ -79,17 +81,18 @@ const (
 )
 
 type bridgeTaskDeps struct {
-	resolveBackend   func(string, agent.Config) (agent.Backend, error)
-	runtimeByID      func(string) (BridgeRuntime, bool)
-	markNeedsAuth    func(string)
-	canonicalWorkDir func(string) (string, error)
-	newTaskID        func() string
-	now              func() time.Time
-	logger           *slog.Logger
-	timeout          time.Duration
-	eventLimit       int
-	subscriberSize   int
-	terminalTTL      time.Duration
+	resolveBackend           func(string, agent.Config) (agent.Backend, error)
+	runtimeByID              func(string) (BridgeRuntime, bool)
+	markNeedsAuth            func(string)
+	canonicalWorkDir         func(string) (string, error)
+	newTaskID                func() string
+	now                      func() time.Time
+	logger                   *slog.Logger
+	timeout                  time.Duration
+	eventLimit               int
+	subscriberSize           int
+	terminalTTL              time.Duration
+	afterConversationAcquire func(string)
 }
 
 type bridgeTaskManager struct {
@@ -214,6 +217,13 @@ func (m *bridgeTaskManager) Start(req BridgeTaskRequest) (string, error) {
 			return
 		}
 		defer release()
+		if m.deps.afterConversationAcquire != nil {
+			m.deps.afterConversationAcquire(task.id)
+		}
+		if taskCtx.Err() != nil {
+			task.publish(BridgeTaskEvent{Type: BridgeEventCancelled})
+			return
+		}
 		m.execute(taskCtx, task, runtime, req, workDir)
 	}()
 	return taskID, nil
@@ -345,7 +355,7 @@ func (m *bridgeTaskManager) execute(ctx context.Context, task *bridgeTask, runti
 		BuiltinRuntime: true,
 	})
 	if err != nil {
-		m.finishError(ctx, task, runtime.ID, err.Error())
+		m.finishError(ctx, task, runtime.ID, err.Error(), "")
 		return
 	}
 
@@ -358,19 +368,21 @@ func (m *bridgeTaskManager) execute(ctx context.Context, task *bridgeTask, runti
 	}
 	result, tools, err := m.executeAttempt(ctx, task, backend, req.Prompt, opts)
 	if err != nil {
-		m.finishError(ctx, task, runtime.ID, err.Error())
+		m.finishError(ctx, task, runtime.ID, err.Error(), "")
 		return
 	}
+	terminalStatus := ""
 	if ctx.Err() == nil && bridgeTaskShouldRetry(result, req.ResumeSessionID, tools, runtime.Provider) {
+		terminalStatus = BridgeTaskStatusResumeInvalidated
 		opts.ResumeSessionID = ""
 		opts.ResumeExpected = false
 		result, _, err = m.executeAttempt(ctx, task, backend, req.Prompt, opts)
 		if err != nil {
-			m.finishError(ctx, task, runtime.ID, err.Error())
+			m.finishError(ctx, task, runtime.ID, err.Error(), terminalStatus)
 			return
 		}
 	}
-	m.finishResult(ctx, task, runtime.ID, result)
+	m.finishResult(ctx, task, runtime.ID, result, terminalStatus)
 }
 
 func (m *bridgeTaskManager) executeAttempt(ctx context.Context, task *bridgeTask, backend agent.Backend, prompt string, opts agent.ExecOptions) (agent.Result, int32, error) {
@@ -419,32 +431,32 @@ func (m *bridgeTaskManager) executeAttempt(ctx context.Context, task *bridgeTask
 	return result, toolCount, nil
 }
 
-func (m *bridgeTaskManager) finishResult(ctx context.Context, task *bridgeTask, runtimeID string, result agent.Result) {
+func (m *bridgeTaskManager) finishResult(ctx context.Context, task *bridgeTask, runtimeID string, result agent.Result, terminalStatus string) {
 	if ctx.Err() != nil || result.Status == "aborted" || result.Status == "cancelled" {
-		task.publish(BridgeTaskEvent{Type: BridgeEventCancelled, SessionID: result.SessionID})
+		task.publish(BridgeTaskEvent{Type: BridgeEventCancelled, SessionID: result.SessionID, Status: terminalStatus})
 		return
 	}
 	if result.Status == "completed" {
-		task.publish(BridgeTaskEvent{Type: BridgeEventCompleted, Output: result.Output, SessionID: result.SessionID})
+		task.publish(BridgeTaskEvent{Type: BridgeEventCompleted, Output: result.Output, SessionID: result.SessionID, Status: terminalStatus})
 		return
 	}
 	reason := taskfailure.Classify(result.Error)
 	if reason == taskfailure.ReasonAgentProviderAuthOrAccess {
 		m.deps.markNeedsAuth(runtimeID)
 	}
-	task.publish(BridgeTaskEvent{Type: BridgeEventFailed, SessionID: result.SessionID, Error: bridgeTaskSafeErrorReason(reason)})
+	task.publish(BridgeTaskEvent{Type: BridgeEventFailed, SessionID: result.SessionID, Status: terminalStatus, Error: bridgeTaskSafeErrorReason(reason)})
 }
 
-func (m *bridgeTaskManager) finishError(ctx context.Context, task *bridgeTask, runtimeID, raw string) {
+func (m *bridgeTaskManager) finishError(ctx context.Context, task *bridgeTask, runtimeID, raw, terminalStatus string) {
 	if ctx.Err() != nil {
-		task.publish(BridgeTaskEvent{Type: BridgeEventCancelled})
+		task.publish(BridgeTaskEvent{Type: BridgeEventCancelled, Status: terminalStatus})
 		return
 	}
 	reason := taskfailure.Classify(raw)
 	if reason == taskfailure.ReasonAgentProviderAuthOrAccess {
 		m.deps.markNeedsAuth(runtimeID)
 	}
-	task.publish(BridgeTaskEvent{Type: BridgeEventFailed, Error: bridgeTaskSafeErrorReason(reason)})
+	task.publish(BridgeTaskEvent{Type: BridgeEventFailed, Status: terminalStatus, Error: bridgeTaskSafeErrorReason(reason)})
 }
 
 func (t *bridgeTask) publish(event BridgeTaskEvent) {
@@ -523,6 +535,7 @@ func bridgeTaskShouldRetry(result agent.Result, originalResumeID string, toolCou
 }
 
 func truncateBridgeTaskUTF8(value string, limit int) string {
+	value = strings.ToValidUTF8(value, "\uFFFD")
 	if len(value) <= limit {
 		return value
 	}

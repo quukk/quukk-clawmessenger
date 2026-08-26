@@ -323,6 +323,35 @@ func TestBridgeTaskAgentInputsAndEventMapping(t *testing.T) {
 	}
 }
 
+func TestBridgeTaskToolOutputNormalizesInvalidUTF8BeforeLimit(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "short invalid input",
+			input: string([]byte{'a', 0xff, 'b'}),
+			want:  "a\uFFFDb",
+		},
+		{
+			name:  "invalid input near byte limit",
+			input: strings.Repeat("a", 8180) + string([]byte{0xff}) + strings.Repeat("b", 20),
+			want:  strings.Repeat("a", 8180) + "\uFFFD" + strings.Repeat("b", 9),
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := truncateBridgeTaskUTF8(testCase.input, bridgeTaskToolOutputLimit)
+			if got != testCase.want {
+				t.Fatalf("normalized output bytes = %d, want exact %d-byte normalized prefix", len(got), len(testCase.want))
+			}
+			if !utf8.ValidString(got) || len(got) > bridgeTaskToolOutputLimit {
+				t.Fatalf("output bytes/UTF-8 = %d/%v, want <=%d/valid", len(got), utf8.ValidString(got), bridgeTaskToolOutputLimit)
+			}
+		})
+	}
+}
+
 func TestBridgeTaskResumeFallbackPolicy(t *testing.T) {
 	runtime := BridgeRuntime{ID: "rt-codex", Provider: "codex", Version: "1.2.3", Path: `D:\fake\codex.exe`, Status: BridgeRuntimeReady}
 
@@ -357,7 +386,7 @@ func TestBridgeTaskResumeFallbackPolicy(t *testing.T) {
 		if opts[1].ResumeSessionID != "" || opts[1].ResumeExpected {
 			t.Errorf("retry options = %+v, want fresh execution", opts[1])
 		}
-		if terminal := bridgeTaskTerminalEvents(events); len(terminal) != 1 || terminal[0].Type != BridgeEventCompleted || terminal[0].Output != "fresh" {
+		if terminal := bridgeTaskTerminalEvents(events); len(terminal) != 1 || terminal[0].Type != BridgeEventCompleted || terminal[0].Output != "fresh" || terminal[0].Status != "resume_invalidated" {
 			t.Fatalf("terminal events = %+v, want one authoritative completion", terminal)
 		}
 	})
@@ -383,7 +412,7 @@ func TestBridgeTaskResumeFallbackPolicy(t *testing.T) {
 		if gotAttempts != 2 {
 			t.Fatalf("Execute calls = %d, want exactly 2", gotAttempts)
 		}
-		if terminal := bridgeTaskTerminalEvents(events); len(terminal) != 1 || terminal[0].Type != BridgeEventFailed {
+		if terminal := bridgeTaskTerminalEvents(events); len(terminal) != 1 || terminal[0].Type != BridgeEventFailed || terminal[0].Status != "resume_invalidated" {
 			t.Fatalf("terminal events = %+v, want one final failure", terminal)
 		}
 	})
@@ -412,8 +441,72 @@ func TestBridgeTaskResumeFallbackPolicy(t *testing.T) {
 		if !reflect.DeepEqual(marked, []string{runtime.ID}) {
 			t.Fatalf("needs_auth marks = %v, want one final exact runtime ID", marked)
 		}
-		if terminal := bridgeTaskTerminalEvents(events); len(terminal) != 1 || terminal[0].Error == nil || terminal[0].Error.Category != "authentication" || terminal[0].SessionID != "" {
+		if terminal := bridgeTaskTerminalEvents(events); len(terminal) != 1 || terminal[0].Error == nil || terminal[0].Error.Category != "authentication" || terminal[0].SessionID != "" || terminal[0].Status != "resume_invalidated" {
 			t.Fatalf("terminal events = %+v, want final authentication failure", terminal)
+		}
+	})
+
+	t.Run("fresh Execute error invalidates rejected resume", func(t *testing.T) {
+		attempts := 0
+		backend := &bridgeTaskFakeBackend{execute: func(context.Context, string, agent.ExecOptions) (*agent.Session, error) {
+			attempts++
+			if attempts == 1 {
+				return bridgeTaskBufferedSession(nil, agent.Result{Status: "failed", Error: "resume rejected", ResumeRejected: true}), nil
+			}
+			return nil, errors.New("fresh backend unavailable")
+		}}
+		manager := newBridgeTaskManager(context.Background(), bridgeTaskTestDeps(runtime, backend))
+		taskID, err := manager.Start(BridgeTaskRequest{RuntimeID: runtime.ID, ConversationKey: "chat", ResumeSessionID: "sess-old", WorkDir: `D:\work`, Prompt: "hello"})
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		terminal := bridgeTaskTerminalEvents(bridgeTaskCollectEvents(t, manager, taskID, 0))
+		if attempts != 2 {
+			t.Fatalf("Execute calls = %d, want 2", attempts)
+		}
+		if len(terminal) != 1 || terminal[0].Type != BridgeEventFailed || terminal[0].SessionID != "" || terminal[0].Status != "resume_invalidated" || terminal[0].Error == nil || terminal[0].Error.Category != "runtime" {
+			t.Fatalf("terminal events = %+v, want marked safe failure without session", terminal)
+		}
+	})
+
+	t.Run("cancelled fresh retry invalidates rejected resume", func(t *testing.T) {
+		attempts := 0
+		freshStarted := make(chan struct{})
+		backend := &bridgeTaskFakeBackend{execute: func(ctx context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
+			attempts++
+			if attempts == 1 {
+				return bridgeTaskBufferedSession(nil, agent.Result{Status: "failed", Error: "resume rejected", ResumeRejected: true}), nil
+			}
+			close(freshStarted)
+			messages := make(chan agent.Message)
+			results := make(chan agent.Result, 1)
+			go func() {
+				<-ctx.Done()
+				close(messages)
+				results <- agent.Result{Status: "cancelled"}
+				close(results)
+			}()
+			return &agent.Session{Messages: messages, Result: results}, nil
+		}}
+		manager := newBridgeTaskManager(context.Background(), bridgeTaskTestDeps(runtime, backend))
+		taskID, err := manager.Start(BridgeTaskRequest{RuntimeID: runtime.ID, ConversationKey: "chat", ResumeSessionID: "sess-old", WorkDir: `D:\work`, Prompt: "hello"})
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		select {
+		case <-freshStarted:
+		case <-time.After(3 * time.Second):
+			t.Fatal("fresh retry did not start")
+		}
+		if err := manager.Cancel(taskID); err != nil {
+			t.Fatalf("Cancel: %v", err)
+		}
+		terminal := bridgeTaskTerminalEvents(bridgeTaskCollectEvents(t, manager, taskID, 0))
+		if attempts != 2 {
+			t.Fatalf("Execute calls = %d, want 2", attempts)
+		}
+		if len(terminal) != 1 || terminal[0].Type != BridgeEventCancelled || terminal[0].Status != "resume_invalidated" {
+			t.Fatalf("terminal events = %+v, want marked cancellation", terminal)
 		}
 	})
 
@@ -461,6 +554,9 @@ func TestBridgeTaskResumeFallbackPolicy(t *testing.T) {
 			terminal := bridgeTaskTerminalEvents(events)
 			if len(terminal) != 1 || terminal[0].Type != BridgeEventFailed || terminal[0].Error == nil || terminal[0].Error.Category != testCase.wantCategory {
 				t.Fatalf("terminal events = %+v, want one %s failure", terminal, testCase.wantCategory)
+			}
+			if terminal[0].Status != "" {
+				t.Fatalf("non-retried terminal status = %q, want empty", terminal[0].Status)
 			}
 			if testCase.wantCategory == "authentication" {
 				if !reflect.DeepEqual(marked, []string{runtime.ID}) {
@@ -720,6 +816,85 @@ func TestBridgeTaskCancellationDoesNotStartFreshRetry(t *testing.T) {
 	}
 	if terminal := bridgeTaskTerminalEvents(events); len(terminal) != 1 || terminal[0].Type != BridgeEventCancelled {
 		t.Fatalf("terminal events = %+v, want one cancellation", terminal)
+	}
+}
+
+func TestBridgeTaskQueuedCancellationNeverStartsBackend(t *testing.T) {
+	for _, cancelMode := range []string{"explicit", "root"} {
+		t.Run(cancelMode, func(t *testing.T) {
+			root, rootCancel := context.WithCancel(context.Background())
+			defer rootCancel()
+			runtime := BridgeRuntime{ID: "rt-codex", Provider: "codex", Version: "1.2.3", Path: `D:\fake\codex.exe`, Status: BridgeRuntimeReady}
+			firstEntered := make(chan struct{})
+			releaseFirst := make(chan struct{})
+			secondAcquired := make(chan struct{})
+			releaseSecond := make(chan struct{})
+			var callsMu sync.Mutex
+			resolveCalls := 0
+			executeCalls := 0
+			backend := &bridgeTaskFakeBackend{execute: func(_ context.Context, prompt string, _ agent.ExecOptions) (*agent.Session, error) {
+				callsMu.Lock()
+				executeCalls++
+				callsMu.Unlock()
+				if prompt == "first" {
+					close(firstEntered)
+					<-releaseFirst
+				}
+				return bridgeTaskBufferedSession(nil, agent.Result{Status: "completed"}), nil
+			}}
+			deps := bridgeTaskTestDeps(runtime, backend)
+			deps.newTaskID = bridgeTaskSequentialIDs()
+			deps.afterConversationAcquire = func(taskID string) {
+				if taskID == "task-2" {
+					close(secondAcquired)
+					<-releaseSecond
+				}
+			}
+			deps.resolveBackend = func(string, agent.Config) (agent.Backend, error) {
+				callsMu.Lock()
+				resolveCalls++
+				callsMu.Unlock()
+				return backend, nil
+			}
+			manager := newBridgeTaskManager(root, deps)
+			firstID, err := manager.Start(BridgeTaskRequest{RuntimeID: runtime.ID, ConversationKey: "chat", WorkDir: `D:\work`, Prompt: "first"})
+			if err != nil {
+				t.Fatalf("Start first: %v", err)
+			}
+			<-firstEntered
+			secondID, err := manager.Start(BridgeTaskRequest{
+				RuntimeID: runtime.ID, ConversationKey: "chat", WorkDir: `D:\work`, Prompt: "second",
+			})
+			if err != nil {
+				t.Fatalf("Start second: %v", err)
+			}
+			close(releaseFirst)
+			select {
+			case <-secondAcquired:
+			case <-time.After(3 * time.Second):
+				t.Fatal("second task did not acquire the conversation gate")
+			}
+			if cancelMode == "root" {
+				rootCancel()
+			} else {
+				if err := manager.Cancel(secondID); err != nil {
+					t.Fatalf("Cancel queued task %q: %v", secondID, err)
+				}
+			}
+			close(releaseSecond)
+
+			events := bridgeTaskCollectEvents(t, manager, secondID, 0)
+			if len(events) != 1 || events[0].Type != BridgeEventCancelled {
+				t.Fatalf("queued task %q events = %+v, want only cancelled", secondID, events)
+			}
+			bridgeTaskCollectEvents(t, manager, firstID, 0)
+			callsMu.Lock()
+			gotResolveCalls, gotExecuteCalls := resolveCalls, executeCalls
+			callsMu.Unlock()
+			if gotResolveCalls != 1 || gotExecuteCalls != 1 {
+				t.Fatalf("resolve/Execute calls = %d/%d, want only predecessor's 1/1", gotResolveCalls, gotExecuteCalls)
+			}
+		})
 	}
 }
 
