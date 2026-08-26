@@ -270,15 +270,28 @@ describe('discussion v2 replay and cancellation guard', () => {
     expect(guard.claim('another-owner', fixture.assignment, 'node-member').status).toBe('accepted');
   });
 
-  it('fails closed at 256 unique live cancellation tombstones', () => {
+  it('uses the cancel-only FIFO exception at 257 without evicting logical replay tombstones', () => {
     const guard = new DiscussionV2Guard({ clock: () => 1_000 });
+    const logical = { ...fixture.hostTurn, discussionId: 'logical-only', requestId: 'logical-request' };
+    const logicalClaim = guard.claim('owner-1', logical, 'node-host');
+    expect(logicalClaim.status).toBe('accepted');
+    if (logicalClaim.status !== 'accepted') throw new Error('expected logical claim');
+    expect(guard.complete(logicalClaim.key)).toBe(true);
+
     for (let index = 0; index < DISCUSSION_V2_LIMITS.maxCancelTombstones; index += 1) {
       expect(guard.cancel('owner-1', {
         ...fixture.cancel, discussionId: `discussion-${index}`,
       }).status).toBe('accepted');
     }
     expect(guard.cancel('owner-1', { ...fixture.cancel, discussionId: 'overflow' }))
-      .toEqual({ status: 'capacity' });
+      .toMatchObject({ status: 'accepted', clearDiscussionId: 'overflow' });
+    expect(guard.claim('owner-1', {
+      ...fixture.assignment, discussionId: 'discussion-0', requestId: 'oldest-assignment',
+    }, 'node-member')).toMatchObject({ status: 'accepted' });
+    expect(guard.claim('owner-1', {
+      ...fixture.assignment, discussionId: 'overflow', requestId: 'newest-assignment',
+    }, 'node-member')).toEqual({ status: 'cancelled' });
+    expect(guard.claim('owner-1', logical, 'node-host')).toEqual({ status: 'replay' });
   });
 });
 

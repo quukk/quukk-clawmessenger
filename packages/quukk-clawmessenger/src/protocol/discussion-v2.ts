@@ -891,8 +891,12 @@ export class DiscussionV2Guard {
     };
     const key = cancelKey(cancellation);
     if (this.cancellations.has(key)) return { status: 'replay' };
+    // Cancel tombstones are the sole bounded FIFO exception. Logical replay
+    // tombstones remain fail-closed and are never evicted before their TTL.
     if (this.cancellations.size >= DISCUSSION_V2_LIMITS.maxCancelTombstones) {
-      return { status: 'capacity' };
+      const oldest = this.cancellations.keys().next().value;
+      if (oldest === undefined) return { status: 'capacity' };
+      this.cancellations.delete(oldest);
     }
     this.cancellations.set(key, cancellation);
     const now = this.clock();
