@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/daemon"
+	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
 
@@ -351,6 +352,104 @@ func TestBridgeCommandPreServeFailuresPrintNoReadinessAndCloseBoundListener(t *t
 			t.Fatalf("serve failure: err=%v stdout=%q closes=%d", err, stdout, listener.closeCalls.Load())
 		}
 	})
+}
+
+func TestBridgeCommandUsesInjectedShutdownContext(t *testing.T) {
+	listener := &bridgeCommandFakeListener{addr: bridgeCommandFakeAddr("127.0.0.1:6")}
+	seamCalled := make(chan struct{})
+	serveStarted := make(chan struct{})
+	cancellationReachedServe := make(chan struct{})
+	var trigger context.CancelFunc
+	deps := bridgeCommandDeps{
+		listen: func(string, string) (net.Listener, error) { return listener, nil },
+		now:    func() time.Time { return time.Unix(0, 0).UTC() },
+		pid:    func() int { return 1 },
+		random: bytes.NewReader(make([]byte, 16)),
+		shutdownContext: func(parent context.Context) (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(parent)
+			trigger = cancel
+			close(seamCalled)
+			return ctx, cancel
+		},
+		serve: func(ctx context.Context, _ net.Listener, cfg daemon.BridgeHTTPConfig) error {
+			if err := cfg.Ready(); err != nil {
+				return err
+			}
+			close(serveStarted)
+			<-ctx.Done()
+			close(cancellationReachedServe)
+			return nil
+		},
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := bridgeCommandExecute(t, deps, bridgeCommandValidInput(nil))
+		done <- err
+	}()
+	<-seamCalled
+	<-serveStarted
+	trigger()
+	select {
+	case <-cancellationReachedServe:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown-context cancellation did not reach ServeBridgeHTTP")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bridge command did not return after shutdown cancellation")
+	}
+}
+
+type bridgeCommandCountingReader struct{ calls atomic.Int32 }
+
+func (r *bridgeCommandCountingReader) Read([]byte) (int, error) {
+	r.calls.Add(1)
+	return 0, errors.New("stdin must not be read")
+}
+
+func TestBridgeCommandRejectsChangedInheritedFlagsBeforeStartupIO(t *testing.T) {
+	for _, flag := range []string{"--debug", "--server-url=https://sentinel.invalid"} {
+		t.Run(flag, func(t *testing.T) {
+			stdin := &bridgeCommandCountingReader{}
+			listenCalls := 0
+			serveCalls := 0
+			deps := bridgeCommandDeps{
+				listen: func(string, string) (net.Listener, error) {
+					listenCalls++
+					return &bridgeCommandFakeListener{addr: bridgeCommandFakeAddr("127.0.0.1:7")}, nil
+				},
+				now:    time.Now,
+				pid:    func() int { return 1 },
+				random: errorReader{},
+				serve: func(context.Context, net.Listener, daemon.BridgeHTTPConfig) error {
+					serveCalls++
+					return nil
+				},
+			}
+			root := &cobra.Command{Use: "multica", SilenceUsage: true, SilenceErrors: true}
+			root.PersistentFlags().Bool("debug", false, "")
+			root.PersistentFlags().String("server-url", "", "")
+			parent := &cobra.Command{Use: "daemon"}
+			parent.AddCommand(newBridgeCommand(deps))
+			root.AddCommand(parent)
+			root.SetIn(stdin)
+			var stdout bytes.Buffer
+			root.SetOut(&stdout)
+			root.SetErr(io.Discard)
+			root.SetArgs([]string{"daemon", "bridge", flag})
+			err := root.ExecuteContext(context.Background())
+			if err == nil {
+				t.Fatal("changed inherited flag was accepted")
+			}
+			if stdin.calls.Load() != 0 || listenCalls != 0 || serveCalls != 0 || stdout.Len() != 0 {
+				t.Fatalf("flag rejection side effects: reads=%d listen=%d serve=%d stdout=%q", stdin.calls.Load(), listenCalls, serveCalls, stdout.String())
+			}
+		})
+	}
 }
 
 type errorReader struct{}

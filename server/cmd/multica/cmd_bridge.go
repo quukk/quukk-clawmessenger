@@ -10,10 +10,8 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/signal"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/daemon"
@@ -38,20 +36,22 @@ type bridgeCommandStartup struct {
 }
 
 type bridgeCommandDeps struct {
-	listen func(string, string) (net.Listener, error)
-	now    func() time.Time
-	pid    func() int
-	random io.Reader
-	serve  func(context.Context, net.Listener, daemon.BridgeHTTPConfig) error
+	listen          func(string, string) (net.Listener, error)
+	now             func() time.Time
+	pid             func() int
+	random          io.Reader
+	serve           func(context.Context, net.Listener, daemon.BridgeHTTPConfig) error
+	shutdownContext func(context.Context) (context.Context, context.CancelFunc)
 }
 
 func defaultBridgeCommandDeps() bridgeCommandDeps {
 	return bridgeCommandDeps{
-		listen: net.Listen,
-		now:    time.Now,
-		pid:    os.Getpid,
-		random: rand.Reader,
-		serve:  daemon.ServeBridgeHTTP,
+		listen:          net.Listen,
+		now:             time.Now,
+		pid:             os.Getpid,
+		random:          rand.Reader,
+		serve:           daemon.ServeBridgeHTTP,
+		shutdownContext: notifyShutdownContext,
 	}
 }
 
@@ -71,6 +71,9 @@ func newBridgeCommand(deps bridgeCommandDeps) *cobra.Command {
 	}
 	if deps.serve == nil {
 		deps.serve = defaults.serve
+	}
+	if deps.shutdownContext == nil {
+		deps.shutdownContext = defaults.shutdownContext
 	}
 	return &cobra.Command{
 		Use:           "bridge",
@@ -94,6 +97,9 @@ func init() {
 }
 
 func runBridgeCommand(cmd *cobra.Command, deps bridgeCommandDeps) error {
+	if cmd.Flags().NFlag() != 0 || cmd.InheritedFlags().NFlag() != 0 || cmd.LocalNonPersistentFlags().NFlag() != 0 {
+		return errBridgeCommandInvalidStartup
+	}
 	startup, err := decodeBridgeCommandStartup(cmd.InOrStdin())
 	if err != nil {
 		return err
@@ -133,7 +139,7 @@ func runBridgeCommand(cmd *cobra.Command, deps bridgeCommandDeps) error {
 	readiness = append(readiness, '\n')
 	var ready atomic.Bool
 
-	root, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+	root, stop := deps.shutdownContext(cmd.Context())
 	defer stop()
 	err = deps.serve(root, listener, daemon.BridgeHTTPConfig{
 		Secret:                startup.Secret,

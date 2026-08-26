@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -873,3 +875,382 @@ func TestBridgeHTTPServeRefreshesBeforeReadinessAndShutsDownWithRoot(t *testing.
 		t.Fatal("server did not shut down after root cancellation")
 	}
 }
+
+type bridgeHTTPCleanupBackend struct {
+	started    chan struct{}
+	cancelSeen chan struct{}
+	release    chan struct{}
+}
+
+func (b *bridgeHTTPCleanupBackend) Execute(ctx context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
+	messages := make(chan agent.Message)
+	close(messages)
+	result := make(chan agent.Result, 1)
+	close(b.started)
+	go func() {
+		<-ctx.Done()
+		close(b.cancelSeen)
+		<-b.release
+		result <- agent.Result{Status: "cancelled"}
+		close(result)
+	}()
+	return &agent.Session{Messages: messages, Result: result}, nil
+}
+
+func newBridgeHTTPReadyTestBridge() *Bridge {
+	path := `C:\tools\codex.exe`
+	return newBridge("install", map[string]string{"codex": path}, bridgeDeps{
+		probeAgentCLIs: func() map[string]AgentEntry { return map[string]AgentEntry{} },
+		resolveAgentExecutablePath: func(candidate string) (string, error) {
+			if candidate == path {
+				return candidate, nil
+			}
+			return "", errors.New("not found")
+		},
+		canonicalExecutablePath: func(candidate string) string { return strings.ToLower(candidate) },
+		executablePresent:       func(string) bool { return true },
+		detectVersion:           func(context.Context, agent.Command) (string, error) { return "1.2.3", nil },
+		checkMinVersion:         func(string, string) error { return nil },
+		probeTimeout:            time.Second,
+		maxConcurrent:           1,
+	})
+}
+
+func TestBridgeHTTPServeWaitsForTaskTerminalAfterShutdownWithoutSSE(t *testing.T) {
+	bridge := newBridgeHTTPReadyTestBridge()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &bridgeHTTPCleanupBackend{
+		started:    make(chan struct{}),
+		cancelSeen: make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	var manager *bridgeTaskManager
+	ready := make(chan string, 1)
+	cfg := BridgeHTTPConfig{
+		Secret:     bridgeHTTPTestSecret,
+		InstallID:  "install",
+		Version:    "0.1.0-beta.1",
+		PID:        1,
+		InstanceID: "br_0123456789abcdef0123456789abcdef",
+		StartedAt:  time.Unix(0, 0).UTC(),
+		Ready: func() error {
+			for _, runtime := range bridge.Runtimes() {
+				if runtime.Provider == "codex" {
+					ready <- runtime.ID
+					return nil
+				}
+			}
+			return errors.New("codex runtime missing")
+		},
+	}
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- serveBridgeHTTPWithDeps(context.Background(), listener, cfg, bridge, bridgeHTTPServeDeps{
+			newTasks: func(root context.Context, bridge *Bridge) *bridgeTaskManager {
+				manager = newBridgeTaskManager(root, bridgeTaskDeps{
+					resolveBackend:   func(string, agent.Config) (agent.Backend, error) { return backend, nil },
+					runtimeByID:      bridge.bridgeRuntimeByID,
+					markNeedsAuth:    bridge.markBridgeRuntimeNeedsAuth,
+					canonicalWorkDir: canonicalBridgeTaskWorkDir,
+				})
+				return manager
+			},
+		})
+	}()
+	runtimeID := <-ready
+
+	requestBody, err := json.Marshal(BridgeTaskRequest{
+		RuntimeID:       runtimeID,
+		ConversationKey: "conversation",
+		WorkDir:         t.TempDir(),
+		Prompt:          "hello",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, "http://"+listener.Addr().String()+"/v1/tasks", bytes.NewReader(requestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+bridgeHTTPTestSecret)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("task response status = %d", response.StatusCode)
+	}
+	<-backend.started
+
+	shutdown, err := http.NewRequest(http.MethodPost, "http://"+listener.Addr().String()+"/shutdown", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shutdown.Header.Set("Authorization", "Bearer "+bridgeHTTPTestSecret)
+	shutdownResponse, err := http.DefaultClient.Do(shutdown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shutdownResponse.Body.Close()
+	if shutdownResponse.StatusCode != http.StatusAccepted {
+		t.Fatalf("shutdown response status = %d", shutdownResponse.StatusCode)
+	}
+	<-backend.cancelSeen
+	select {
+	case err := <-serveDone:
+		t.Fatalf("ServeBridgeHTTP returned before task terminal cleanup: %v", err)
+	default:
+	}
+	close(backend.release)
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ServeBridgeHTTP did not return after task became terminal")
+	}
+	if manager == nil {
+		t.Fatal("task manager was not constructed")
+	}
+}
+
+func TestBridgeHTTPServeTimeoutForceClosesAndJoinsBlockedHandler(t *testing.T) {
+	bridge := newBridge("install", nil, bridgeDeps{
+		probeAgentCLIs:             func() map[string]AgentEntry { return map[string]AgentEntry{} },
+		resolveAgentExecutablePath: func(string) (string, error) { return "", errors.New("not found") },
+	})
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan struct{})
+	handlerEntered := make(chan struct{})
+	handlerExited := make(chan struct{})
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- serveBridgeHTTPWithDeps(ctx, listener, BridgeHTTPConfig{
+			Secret: bridgeHTTPTestSecret,
+			Ready: func() error {
+				close(ready)
+				return nil
+			},
+		}, bridge, bridgeHTTPServeDeps{
+			shutdownTimeout: 20 * time.Millisecond,
+			wrapHandler: func(next http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path != "/blocked" {
+						next.ServeHTTP(w, r)
+						return
+					}
+					close(handlerEntered)
+					<-r.Context().Done()
+					close(handlerExited)
+				})
+			},
+		})
+	}()
+	<-ready
+	clientDone := make(chan error, 1)
+	go func() {
+		request, err := http.NewRequest(http.MethodGet, "http://"+listener.Addr().String()+"/blocked", nil)
+		if err != nil {
+			clientDone <- err
+			return
+		}
+		_, err = http.DefaultClient.Do(request)
+		clientDone <- err
+	}()
+	<-handlerEntered
+	cancel()
+	select {
+	case <-handlerExited:
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown timeout did not force-close the blocked connection")
+	}
+	select {
+	case err := <-serveDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("ServeBridgeHTTP error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ServeBridgeHTTP did not join forced-close cleanup")
+	}
+	select {
+	case <-clientDone:
+	case <-time.After(time.Second):
+		t.Fatal("force-closed client request did not return")
+	}
+}
+
+func TestBridgeHTTPServeCancellationWinsPostRefreshPreReadyGate(t *testing.T) {
+	bridge := newBridge("install", nil, bridgeDeps{
+		probeAgentCLIs:             func() map[string]AgentEntry { return map[string]AgentEntry{} },
+		resolveAgentExecutablePath: func(string) (string, error) { return "", errors.New("not found") },
+	})
+	listener := &bridgeCommandlessTestListener{addr: bridgeCommandlessTestAddr("127.0.0.1:8")}
+	ctx, cancel := context.WithCancel(context.Background())
+	readyCalls := atomic.Int32{}
+	barrierEntered := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- serveBridgeHTTPWithDeps(ctx, listener, BridgeHTTPConfig{
+			Secret: bridgeHTTPTestSecret,
+			Ready: func() error {
+				readyCalls.Add(1)
+				return nil
+			},
+		}, bridge, bridgeHTTPServeDeps{
+			beforeReady: func(root context.Context) {
+				close(barrierEntered)
+				<-root.Done()
+			},
+		})
+	}()
+	<-barrierEntered
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("post-refresh cancellation did not finish startup")
+	}
+	if readyCalls.Load() != 0 {
+		t.Fatalf("Ready calls = %d, want 0", readyCalls.Load())
+	}
+	if listener.closeCalls.Load() != 1 {
+		t.Fatalf("listener close calls = %d, want 1", listener.closeCalls.Load())
+	}
+}
+
+func TestBridgeHTTPServeUnexpectedServeErrorCancelsAndJoinsTaskCleanup(t *testing.T) {
+	bridge := newBridgeHTTPReadyTestBridge()
+	backend := &bridgeHTTPCleanupBackend{
+		started:    make(chan struct{}),
+		cancelSeen: make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	serveFailure := errors.New("listener accept failed")
+	listener := &bridgeHTTPFailingTestListener{
+		addr:    bridgeCommandlessTestAddr("127.0.0.1:9"),
+		release: make(chan struct{}),
+		err:     serveFailure,
+	}
+	var manager *bridgeTaskManager
+	done := make(chan error, 1)
+	go func() {
+		done <- serveBridgeHTTPWithDeps(context.Background(), listener, BridgeHTTPConfig{
+			Secret: bridgeHTTPTestSecret,
+			Ready: func() error {
+				var runtimeID string
+				for _, runtime := range bridge.Runtimes() {
+					if runtime.Provider == "codex" {
+						runtimeID = runtime.ID
+						break
+					}
+				}
+				if runtimeID == "" {
+					return errors.New("codex runtime missing")
+				}
+				if _, err := manager.Start(BridgeTaskRequest{
+					RuntimeID:       runtimeID,
+					ConversationKey: "conversation",
+					WorkDir:         t.TempDir(),
+					Prompt:          "hello",
+				}); err != nil {
+					return err
+				}
+				select {
+				case <-backend.started:
+					listener.releaseAccept()
+					return nil
+				case <-time.After(time.Second):
+					return errors.New("task backend did not start")
+				}
+			},
+		}, bridge, bridgeHTTPServeDeps{
+			newTasks: func(root context.Context, bridge *Bridge) *bridgeTaskManager {
+				manager = newBridgeTaskManager(root, bridgeTaskDeps{
+					resolveBackend:   func(string, agent.Config) (agent.Backend, error) { return backend, nil },
+					runtimeByID:      bridge.bridgeRuntimeByID,
+					markNeedsAuth:    bridge.markBridgeRuntimeNeedsAuth,
+					canonicalWorkDir: canonicalBridgeTaskWorkDir,
+				})
+				return manager
+			},
+		})
+	}()
+	select {
+	case <-backend.cancelSeen:
+	case err := <-done:
+		t.Fatalf("ServeBridgeHTTP returned before cancelling the task: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("unexpected Serve error did not cancel the task root")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("ServeBridgeHTTP returned before task cleanup completed: %v", err)
+	default:
+	}
+	close(backend.release)
+	select {
+	case err := <-done:
+		if !errors.Is(err, serveFailure) {
+			t.Fatalf("ServeBridgeHTTP error = %v, want listener failure", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ServeBridgeHTTP did not return after unexpected-error cleanup")
+	}
+}
+
+type bridgeHTTPFailingTestListener struct {
+	addr        net.Addr
+	release     chan struct{}
+	releaseOnce sync.Once
+	err         error
+	closeCalls  atomic.Int32
+}
+
+func (l *bridgeHTTPFailingTestListener) releaseAccept() {
+	l.releaseOnce.Do(func() { close(l.release) })
+}
+
+func (l *bridgeHTTPFailingTestListener) Accept() (net.Conn, error) {
+	<-l.release
+	return nil, l.err
+}
+
+func (l *bridgeHTTPFailingTestListener) Close() error {
+	l.closeCalls.Add(1)
+	l.releaseAccept()
+	return nil
+}
+
+func (l *bridgeHTTPFailingTestListener) Addr() net.Addr { return l.addr }
+
+type bridgeCommandlessTestAddr string
+
+func (a bridgeCommandlessTestAddr) Network() string { return "tcp" }
+func (a bridgeCommandlessTestAddr) String() string  { return string(a) }
+
+type bridgeCommandlessTestListener struct {
+	addr       net.Addr
+	closeCalls atomic.Int32
+}
+
+func (l *bridgeCommandlessTestListener) Accept() (net.Conn, error) { return nil, net.ErrClosed }
+func (l *bridgeCommandlessTestListener) Close() error {
+	l.closeCalls.Add(1)
+	return nil
+}
+func (l *bridgeCommandlessTestListener) Addr() net.Addr { return l.addr }
