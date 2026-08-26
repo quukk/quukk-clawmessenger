@@ -353,7 +353,7 @@ Expected: compile failure.
 - Resolve the backend with `agent.ResolveBackend` in production and an injected fake in tests.
 - Derive task contexts from the Bridge root, never from POST/SSE request contexts.
 - Pass `OpenclawMode: "local"`, canonical workdir, timeout, and optional resume session.
-- Reuse `shouldRetryWithFreshSession`; retry at most once and never after a tool event, authentication/network failure, a fresh task, or a second failure.
+- Reuse `shouldRetryWithFreshSession`; retry at most once and never after a tool event, authentication/network failure, a fresh task, or a second failure. When a resumed task chooses the fresh retry, every authoritative terminal event carries `status: "resume_invalidated"` so Node can compare-and-swap clear the submitted session before applying a replacement.
 - Emit only `started`, `text_delta`, `tool_started`, `tool_finished`, `status`, `completed`, `failed`, and `cancelled`.
 - Keep a bounded ring per task and a bounded terminal TTL. Cancellation reaches the adapter context and emits exactly one terminal event after cleanup.
 
@@ -388,7 +388,7 @@ git commit -m "feat: execute and replay Bridge tasks"
 
 **Step 1: Add RED HTTP tests**
 
-Test every endpoint with missing/wrong bearer, non-loopback `RemoteAddr`, wrong method, unknown JSON field, oversized body, unknown runtime/task, invalid workdir, SSE replay with `Last-Event-ID`, heartbeat comments, and terminal closure. Assert health never includes secrets, prompts, environment values, or bearer material.
+Test the global loopback-before-bearer boundary, wrong methods, strict task JSON and body limits, unknown runtime/task, invalid workdir, exact health/readiness schemas, SSE replay with `Last-Event-ID`, overflow, heartbeat/flush/terminal closure, subscriber-only disconnect, and graceful shutdown. Assert health never includes secrets, prompts, environment values, install identity, paths, or bearer material.
 
 ```powershell
 go test ./internal/daemon -run '^TestBridgeHTTP' -count=1
@@ -404,23 +404,24 @@ Expose:
 - `GET /v1/tasks/{id}/events`
 - `POST /v1/tasks/{id}/cancel`
 - `GET /healthz`
+- `POST /shutdown`
 
-Require `Authorization: Bearer …` for every route, compare using `subtle.ConstantTimeCompare`, reject non-loopback peers, apply `http.MaxBytesReader`, use `DisallowUnknownFields`, and set no CORS headers. Use read/header/idle server timeouts but no global `WriteTimeout`, because SSE is long-lived.
+Require `Authorization: Bearer …` for every route, including unknown routes. Reject non-loopback peers before authentication; compare SHA-256 digests of the received and expected authorization headers with `subtle.ConstantTimeCompare`. Apply `http.MaxBytesReader`, use `DisallowUnknownFields`, set `Cache-Control: no-store`, and set no CORS headers. SSE replays strictly after the supplied event ID, flushes headers/events and `: heartbeat\n\n` comments, and closes after a terminal event. Use read/header/idle server timeouts but no global `WriteTimeout`, because SSE is long-lived.
 
 **Step 3: Add RED command tests**
 
-Test bounded startup JSON from stdin, missing secret/install ID, rejection of non-loopback listen addresses, and exactly one readiness line after the listener is bound. Inject a fake Bridge factory so command tests do not scan the machine.
+Test bounded strict startup JSON from stdin, missing secret/install ID/version, version mismatch, unsupported provider keys and `pinned_runtime_paths`, fixed `tcp4 127.0.0.1:0` listener arguments, and exactly one readiness line after binding and initial refresh. Inject a fake serving function so command tests do not scan the machine.
 
 Startup input:
 
 ```json
-{"secret":"...","install_id":"...","version":"...","provider_path_overrides":{},"pinned_runtime_paths":{}}
+{"secret":"...","install_id":"...","version":"0.1.0-beta.1","provider_path_overrides":{}}
 ```
 
 Readiness output:
 
 ```json
-{"address":"127.0.0.1:49152","pid":1234,"version":"0.1.0-beta.1","instance_id":"br_8e0d5a","started_at":"2026-08-26T08:00:00Z"}
+{"address":"127.0.0.1:49152","pid":1234,"version":"0.1.0-beta.1","instance_id":"br_0123456789abcdef0123456789abcdef","started_at":"2026-08-26T08:00:00Z"}
 ```
 
 ```powershell
@@ -429,7 +430,7 @@ go test ./cmd/multica -run '^TestBridgeCommand' -count=1
 
 **Step 4: Implement hidden `multica daemon bridge`**
 
-Register from the new file's `init` hook, bind `tcp4` to `127.0.0.1:0`, receive the secret only over bounded stdin, and print readiness only after successful bind. Readiness and authenticated health both carry the same `pid`, `instance_id`, and `started_at` values for supervisor fencing. Do not attach to `Daemon.Run` or modify its existing health server.
+Register from the new file's `init` hook, bind `tcp4` to `127.0.0.1:0`, receive the secret only over at-most-64-KiB stdin, and require the supplied version to equal the compiled binary version. Perform one initial runtime refresh and print readiness only after successful bind and refresh. Readiness and authenticated health both carry the same `pid`, version, `instance_id`, and `started_at` values for supervisor fencing. `POST /shutdown` flushes `202` before asynchronously cancelling the Bridge root so Windows can stop gracefully. Do not attach to `Daemon.Run` or modify its existing health server.
 
 **Step 5: Run GREEN and full Go verification**
 
@@ -534,7 +535,7 @@ git commit -m "feat: persist runtime bindings and identities"
 
 **Step 1: Add RED client tests**
 
-Test bearer injection, zod validation, HTTP error classification, incremental SSE parsing across chunk boundaries, `Last-Event-ID`, replay, cancellation, and propagation of returned session IDs. The test server binds loopback only.
+Test bearer injection, zod validation, HTTP error classification, incremental SSE parsing across chunk boundaries, `Last-Event-ID`, replay/overflow/reconnect, cancellation, graceful authenticated shutdown, propagation of returned session IDs, and transparent `resume_invalidated` terminals. The test server binds loopback only.
 
 ```powershell
 & $pnpm --dir packages/quukk-clawmessenger exec vitest run src/go/client.test.ts
@@ -744,7 +745,7 @@ Admission order must be asserted explicitly:
 1. Validate and size-bound input.
 2. Claim `(runtimeId, messageUid)` dedup.
 3. Start the Go task.
-4. Persist the returned session ID from task events.
+4. Persist the returned session ID from task events. On `resume_invalidated`, compare-and-swap clear only the originally submitted resume ID before applying any new non-empty authoritative session ID.
 5. Only after successful task creation, send receipt and “processing” feedback.
 
 ```powershell
