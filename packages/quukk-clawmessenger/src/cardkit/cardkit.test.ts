@@ -246,6 +246,14 @@ describe('CardKit balanced markers', () => {
     for (const value of ['hello [', 'hello [C', 'hello [CARD]', 'hello [CARD][', 'hello [CARD][{"schema":']) {
       expect(streamSafeContent(value)).toBe('hello ');
     }
+    expect(streamSafeContent('hello [CARD][{"schema":"1.0.0"}')).toBe('hello ');
+    const waitingForClose = new CardMarkerStream();
+    expect(waitingForClose.push('hello [CARD][{"schema":"1.0.0"}').text).toBe('hello ');
+    expect(waitingForClose.push('] tail')).toMatchObject({
+      text: 'hello  tail',
+      cards: [{ schema: '1.0.0' }],
+      errors: [],
+    });
     expect(streamSafeContent(`hello [CARD][${cardJson}] tail`)).toBe('hello  tail');
   });
 

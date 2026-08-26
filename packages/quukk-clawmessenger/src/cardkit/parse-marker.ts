@@ -145,6 +145,7 @@ function parse(text: string, final: boolean): CardMarkerParseResult {
       }
       break;
     }
+    if (!final && scan.end === text.length) break;
     const markerEnd = text[scan.end] === ']' ? scan.end + 1 : text.length;
     const hasMarkerClose = text[scan.end] === ']';
     const rawJson = text.slice(jsonStart, scan.end);
