@@ -2,5 +2,8 @@
 *.sh text eol=lf
 docker/entrypoint.sh text eol=lf
 
+# Cryptographic cross-runtime fixtures must remain byte-for-byte stable on Windows.
+packages/quukk-clawmessenger/src/protocol/fixtures/discussion-wire-cross-runtime.json text eol=lf
+
 # Default behavior
 * text=auto
