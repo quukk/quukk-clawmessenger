@@ -12,6 +12,9 @@
     "test": "vitest run"
   },
   "license": "SEE LICENSE IN LICENSE",
+  "dependencies": {
+    "zod": "catalog:"
+  },
   "devDependencies": {
     "@multica/tsconfig": "workspace:*",
     "@types/node": "catalog:",

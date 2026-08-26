@@ -760,6 +760,10 @@ importers:
         version: 5.9.3
 
   packages/quukk-clawmessenger:
+    dependencies:
+      zod:
+        specifier: 'catalog:'
+        version: 4.3.6
     devDependencies:
       '@multica/tsconfig':
         specifier: workspace:*
