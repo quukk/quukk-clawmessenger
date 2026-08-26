@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { basename, dirname } from 'node:path';
 import { PassThrough } from 'node:stream';
 
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
@@ -109,9 +110,19 @@ class FakeIdentityFileSystem {
   afterRead?: (path: string) => Promise<void>;
   afterRename?: (source: string, destination: string) => Promise<void>;
   linkErrorCode?: string;
+  renameErrorCode?: string;
+  scanErrorCode?: string;
+  unlinkErrorCode?: string;
+  renameOverwritesDestination = false;
+  #claimSequence = 0;
 
   dependencies(_label: string) {
+    const fileSystem = this;
     return {
+      claimId: (): string => {
+        this.#claimSequence += 1;
+        return this.#claimSequence.toString(16).padStart(32, '0');
+      },
       read: async (path: string, maximumBytes: number): Promise<unknown | undefined> => {
         this.reads.push({ path, maximumBytes });
         const captured = cloneJson(this.files.get(path));
@@ -123,13 +134,24 @@ class FakeIdentityFileSystem {
         this.files.set(path, cloneJson(value));
       },
       rename: async (source: string, destination: string): Promise<void> => {
+        if (this.renameErrorCode !== undefined) throw fileSystemError(this.renameErrorCode);
         const value = this.files.get(source);
         if (value === undefined) throw fileSystemError('ENOENT');
-        if (this.files.has(destination)) throw fileSystemError('EEXIST');
+        if (this.files.has(destination) && !this.renameOverwritesDestination) {
+          throw fileSystemError('EEXIST');
+        }
         this.renames.push({ source, destination });
         this.files.delete(source);
         this.files.set(destination, value);
         await this.afterRename?.(source, destination);
+      },
+      scan: async function* (directory: string): AsyncIterable<string> {
+        if (fileSystem.scanErrorCode !== undefined) {
+          throw fileSystemError(fileSystem.scanErrorCode);
+        }
+        for (const path of [...fileSystem.files.keys()].sort()) {
+          if (dirname(path) === directory) yield basename(path);
+        }
       },
       link: async (existing: string, destination: string): Promise<void> => {
         this.links.push({ existing, destination });
@@ -141,11 +163,17 @@ class FakeIdentityFileSystem {
       },
       unlink: async (path: string): Promise<void> => {
         this.unlinks.push(path);
+        if (this.unlinkErrorCode !== undefined) throw fileSystemError(this.unlinkErrorCode);
         if (!this.files.delete(path)) throw fileSystemError('ENOENT');
       },
-      tombstonePath: (path: string): string => `${path}.claim`,
     };
   }
+}
+
+function identityClaims(fileSystem: FakeIdentityFileSystem): string[] {
+  return [...fileSystem.files.keys()].filter((path) =>
+    path.startsWith(`${identityPath}.claim-`),
+  );
 }
 
 function pauseFirstIdentityClaim(fileSystem: FakeIdentityFileSystem): {
@@ -312,7 +340,68 @@ describe('BridgeProcessIdentityStore', () => {
 
     await expect(Promise.all([firstRemoval, secondRemoval])).resolves.toEqual([true, false]);
     expect(fileSystem.files.has(identityPath)).toBe(false);
-    expect(fileSystem.files.has(`${identityPath}.claim`)).toBe(false);
+    expect(identityClaims(fileSystem)).toEqual([]);
+  });
+
+  it('preserves generation B across two POSIX removers, a writer, and a reader', async () => {
+    const fileSystem = new FakeIdentityFileSystem();
+    fileSystem.renameOverwritesDestination = true;
+    fileSystem.files.set(identityPath, identity());
+    const first = new BridgeProcessIdentityStore({
+      homeDirectory: 'D:\\fake-home',
+      dependencies: fileSystem.dependencies('first'),
+    });
+    const second = new BridgeProcessIdentityStore({
+      homeDirectory: 'D:\\fake-home',
+      dependencies: fileSystem.dependencies('second'),
+    });
+    const writer = new BridgeProcessIdentityStore({
+      homeDirectory: 'D:\\fake-home',
+      dependencies: fileSystem.dependencies('writer'),
+    });
+    const reader = new BridgeProcessIdentityStore({
+      homeDirectory: 'D:\\fake-home',
+      dependencies: fileSystem.dependencies('reader'),
+    });
+    let firstRead!: () => void;
+    let releaseFirst!: () => void;
+    let secondRename!: () => void;
+    let releaseSecond!: () => void;
+    const firstReadReached = new Promise<void>((resolve) => { firstRead = resolve; });
+    const firstReadBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const secondRenameReached = new Promise<void>((resolve) => { secondRename = resolve; });
+    const secondRenameBlocked = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    let claimReadPaused = false;
+    let renameCount = 0;
+    fileSystem.afterRead = async (path) => {
+      if (claimReadPaused || !path.startsWith(`${identityPath}.claim`)) return;
+      claimReadPaused = true;
+      firstRead();
+      await firstReadBlocked;
+    };
+    fileSystem.afterRename = async () => {
+      renameCount += 1;
+      if (renameCount !== 2) return;
+      secondRename();
+      await secondRenameBlocked;
+    };
+
+    const firstRemoval = first.removeIfMatches(identity());
+    await firstReadReached;
+    const replacement = identity({ pid: 9876, address: '127.0.0.1:49876' });
+    await writer.write(replacement);
+    const secondRemoval = second.removeIfMatches(identity());
+    await secondRenameReached;
+    releaseFirst();
+    await expect(firstRemoval).resolves.toBe(true);
+    const readResult = await reader.read();
+    releaseSecond();
+    await expect(secondRemoval).rejects.toMatchObject({ code: 'identity_write_failed' });
+
+    expect(readResult).toEqual(replacement);
+    await expect(reader.read()).resolves.toEqual(replacement);
+    expect(fileSystem.files.get(identityPath)).toEqual(replacement);
+    expect(identityClaims(fileSystem)).toEqual([]);
   });
 
   it('preserves the winner when a write precedes a claim or races mismatch restoration', async () => {
@@ -349,27 +438,61 @@ describe('BridgeProcessIdentityStore', () => {
     await restoreWriter.write(newest);
     gate.release();
     await expect(removing).resolves.toBe(false);
-    expect(restoreRace.links).toContainEqual({
-      existing: `${identityPath}.claim`,
-      destination: identityPath,
-    });
+    expect(restoreRace.links).toHaveLength(1);
+    expect(restoreRace.links[0]?.existing).toMatch(
+      /^D:\\fake-home\\\.quukk-clawmessenger\\run\\bridge\.pid\.claim-/,
+    );
+    expect(restoreRace.links[0]?.destination).toBe(identityPath);
     await expect(restoreWriter.read()).resolves.toEqual(newest);
   });
 
-  it('recovers a valid orphaned filesystem claim instead of leaving a permanent lock', async () => {
+  it('recovers one exact-prefix orphan and ignores unrelated names', async () => {
     const fileSystem = new FakeIdentityFileSystem();
-    fileSystem.files.set(`${identityPath}.claim`, identity());
-    const { tombstonePath: _injectedPath, ...defaultPathDependencies } =
-      fileSystem.dependencies('stale-claim');
+    const orphan = `${identityPath}.claim-4321-${'a'.repeat(32)}`;
+    const lookalike = `${identityPath}.claimed-4321-${'b'.repeat(32)}`;
+    fileSystem.files.set(orphan, identity());
+    fileSystem.files.set(lookalike, { unrelated: true });
     const persistence = new BridgeProcessIdentityStore({
       homeDirectory: 'D:\\fake-home',
-      dependencies: defaultPathDependencies,
+      dependencies: fileSystem.dependencies('stale-claim'),
     });
 
     await expect(persistence.read()).resolves.toEqual(identity());
     expect(fileSystem.files.get(identityPath)).toEqual(identity());
-    expect(fileSystem.files.has(`${identityPath}.claim`)).toBe(false);
+    expect(fileSystem.files.has(orphan)).toBe(false);
+    expect(fileSystem.files.get(lookalike)).toEqual({ unrelated: true });
     await expect(persistence.removeIfMatches(identity())).resolves.toBe(true);
+  });
+
+  it('fails closed on multiple claims, scan overflow, and scan failure', async () => {
+    const multiple = new FakeIdentityFileSystem();
+    multiple.files.set(`${identityPath}.claim-1-${'a'.repeat(32)}`, identity());
+    multiple.files.set(`${identityPath}.claim-2-${'b'.repeat(32)}`, identity({ pid: 2 }));
+    const multipleStore = new BridgeProcessIdentityStore({
+      homeDirectory: 'D:\\fake-home',
+      dependencies: multiple.dependencies('multiple'),
+    });
+    await expect(multipleStore.read()).rejects.toMatchObject({ code: 'identity_corrupt' });
+    expect(multiple.files.has(identityPath)).toBe(false);
+    expect(identityClaims(multiple)).toHaveLength(2);
+
+    const overflow = new FakeIdentityFileSystem();
+    for (let index = 0; index < 257; index += 1) {
+      overflow.files.set(`${dirname(identityPath)}\\unrelated-${String(index).padStart(3, '0')}`, {});
+    }
+    const overflowStore = new BridgeProcessIdentityStore({
+      homeDirectory: 'D:\\fake-home',
+      dependencies: overflow.dependencies('overflow'),
+    });
+    await expect(overflowStore.read()).rejects.toMatchObject({ code: 'identity_corrupt' });
+
+    const failed = new FakeIdentityFileSystem();
+    failed.scanErrorCode = 'EACCES';
+    const failedStore = new BridgeProcessIdentityStore({
+      homeDirectory: 'D:\\fake-home',
+      dependencies: failed.dependencies('failed'),
+    });
+    await expect(failedStore.read()).rejects.toMatchObject({ code: 'identity_corrupt' });
   });
 
   it.each(['EACCES', 'EPERM'])(
@@ -388,7 +511,8 @@ describe('BridgeProcessIdentityStore', () => {
         code: 'identity_write_failed',
       });
       expect(fileSystem.files.has(identityPath)).toBe(false);
-      expect(fileSystem.files.get(`${identityPath}.claim`)).toEqual(replacement);
+      expect(identityClaims(fileSystem)).toHaveLength(1);
+      expect(fileSystem.files.get(identityClaims(fileSystem)[0]!)).toEqual(replacement);
 
       const child = new FakeChild();
       const resolveBinary = vi.fn<BridgeSupervisorDependencies['resolveBinary']>();
@@ -405,6 +529,40 @@ describe('BridgeProcessIdentityStore', () => {
       expect(spawn).not.toHaveBeenCalled();
     },
   );
+
+  it('fails closed without deleting the canonical identity when rename fails', async () => {
+    const fileSystem = new FakeIdentityFileSystem();
+    fileSystem.files.set(identityPath, identity());
+    fileSystem.renameErrorCode = 'EACCES';
+    const persistence = new BridgeProcessIdentityStore({
+      homeDirectory: 'D:\\fake-home',
+      dependencies: fileSystem.dependencies('rename-failure'),
+    });
+
+    await expect(persistence.removeIfMatches(identity())).rejects.toMatchObject({
+      code: 'identity_write_failed',
+    });
+    expect(fileSystem.files.get(identityPath)).toEqual(identity());
+    expect(identityClaims(fileSystem)).toEqual([]);
+  });
+
+  it('keeps an unlink failure recoverable and fail closed', async () => {
+    const fileSystem = new FakeIdentityFileSystem();
+    fileSystem.files.set(identityPath, identity());
+    fileSystem.unlinkErrorCode = 'EACCES';
+    const persistence = new BridgeProcessIdentityStore({
+      homeDirectory: 'D:\\fake-home',
+      dependencies: fileSystem.dependencies('unlink-failure'),
+    });
+
+    await expect(persistence.removeIfMatches(identity())).rejects.toMatchObject({
+      code: 'identity_write_failed',
+    });
+    expect(fileSystem.files.has(identityPath)).toBe(false);
+    expect(identityClaims(fileSystem)).toHaveLength(1);
+    await expect(persistence.read()).rejects.toMatchObject({ code: 'identity_write_failed' });
+    expect(fileSystem.files.get(identityPath)).toEqual(identity());
+  });
 });
 
 describe('BridgeSupervisor startup', () => {

@@ -1,4 +1,11 @@
-import { link as fsLink, rename as fsRename, unlink as fsUnlink } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import {
+  link as fsLink,
+  opendir as fsOpenDirectory,
+  rename as fsRename,
+  unlink as fsUnlink,
+} from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 
 import { z } from 'zod';
 
@@ -6,6 +13,8 @@ import { atomicWriteJson, readJsonFileIfExists } from '../config/atomic-json.js'
 import { localPaths } from '../config/paths.js';
 
 const IDENTITY_LIMIT = 16_384;
+const DIRECTORY_ENTRY_LIMIT = 256;
+const CLAIM_ID_PATTERN = /^[0-9a-f]{32}$/;
 
 export const BridgeProcessIdentitySchema = z.strictObject({
   schema_version: z.literal(1),
@@ -45,9 +54,10 @@ export type BridgeProcessIdentityDependencies = {
   read(path: string, maximumBytes: number): Promise<unknown | undefined>;
   write(path: string, value: unknown): Promise<void>;
   rename(source: string, destination: string): Promise<unknown>;
+  scan(directory: string): AsyncIterable<string>;
   link(existing: string, destination: string): Promise<unknown>;
   unlink(path: string): Promise<unknown>;
-  tombstonePath(path: string): string;
+  claimId(): string;
 };
 
 export interface BridgeProcessIdentityPersistence {
@@ -78,6 +88,17 @@ function equalIdentity(left: BridgeProcessIdentity, right: BridgeProcessIdentity
   );
 }
 
+async function* scanDirectory(directory: string): AsyncIterable<string> {
+  let handle;
+  try {
+    handle = await fsOpenDirectory(directory);
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return;
+    throw error;
+  }
+  for await (const entry of handle) yield entry.name;
+}
+
 export class BridgeProcessIdentityStore implements BridgeProcessIdentityPersistence {
   readonly #path: string;
   readonly #deps: BridgeProcessIdentityDependencies;
@@ -90,17 +111,22 @@ export class BridgeProcessIdentityStore implements BridgeProcessIdentityPersiste
         ((path, maximumBytes) => readJsonFileIfExists(path, z.unknown(), maximumBytes)),
       write: options.dependencies?.write ?? atomicWriteJson,
       rename: options.dependencies?.rename ?? fsRename,
+      scan: options.dependencies?.scan ?? scanDirectory,
       link: options.dependencies?.link ?? fsLink,
       unlink: options.dependencies?.unlink ?? fsUnlink,
-      tombstonePath:
-        options.dependencies?.tombstonePath ??
-        ((path) => `${path}.claim`),
+      claimId:
+        options.dependencies?.claimId ??
+        (() => randomUUID().replaceAll('-', '')),
     };
   }
 
   async read(): Promise<BridgeProcessIdentity | undefined> {
-    await this.#recoverClaim(this.#deps.tombstonePath(this.#path));
-    return this.#read(this.#path);
+    await this.#recoverClaim();
+    const current = await this.#read(this.#path);
+    if ((await this.#claims()).length !== 0) {
+      throw new BridgeProcessIdentityError('identity_corrupt');
+    }
+    return current;
   }
 
   async #read(path: string): Promise<BridgeProcessIdentity | undefined> {
@@ -129,7 +155,11 @@ export class BridgeProcessIdentityStore implements BridgeProcessIdentityPersiste
   async removeIfMatches(expected: BridgeProcessIdentity): Promise<boolean> {
     const parsed = BridgeProcessIdentitySchema.safeParse(expected);
     if (!parsed.success) throw new BridgeProcessIdentityError('identity_invalid');
-    const tombstone = this.#deps.tombstonePath(this.#path);
+    const claimId = this.#deps.claimId();
+    if (!CLAIM_ID_PATTERN.test(claimId)) {
+      throw new BridgeProcessIdentityError('identity_write_failed');
+    }
+    const tombstone = `${this.#path}.claim-${process.pid}-${claimId}`;
     try {
       await this.#deps.rename(this.#path, tombstone);
     } catch (error) {
@@ -176,7 +206,33 @@ export class BridgeProcessIdentityStore implements BridgeProcessIdentityPersiste
     }
   }
 
-  async #recoverClaim(tombstone: string): Promise<void> {
+  async #claims(): Promise<string[]> {
+    const directory = dirname(this.#path);
+    const prefix = `${basename(this.#path)}.claim-`;
+    const claims: string[] = [];
+    let entries = 0;
+    try {
+      for await (const name of this.#deps.scan(directory)) {
+        entries += 1;
+        if (entries > DIRECTORY_ENTRY_LIMIT) {
+          throw new BridgeProcessIdentityError('identity_corrupt');
+        }
+        if (basename(name) !== name || !name.startsWith(prefix)) continue;
+        claims.push(join(directory, name));
+        if (claims.length > 1) {
+          throw new BridgeProcessIdentityError('identity_corrupt');
+        }
+      }
+    } catch (error) {
+      if (error instanceof BridgeProcessIdentityError) throw error;
+      throw new BridgeProcessIdentityError('identity_corrupt');
+    }
+    return claims;
+  }
+
+  async #recoverClaim(): Promise<void> {
+    const [tombstone] = await this.#claims();
+    if (tombstone === undefined) return;
     const claimed = await this.#read(tombstone);
     if (claimed === undefined) return;
     try {
