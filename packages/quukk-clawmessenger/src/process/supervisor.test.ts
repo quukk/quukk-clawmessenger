@@ -1,9 +1,10 @@
 import { EventEmitter } from 'node:events';
-import { basename, dirname } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { PassThrough } from 'node:stream';
 
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 
+import { localPaths } from '../config/paths.js';
 import { BridgeClientError } from '../go/client.js';
 import type { BridgeHealth, BridgeTaskPort } from '../go/types.js';
 import {
@@ -26,7 +27,8 @@ const installId = 'install-id-sentinel';
 const binaryPath = 'D:\\sensitive\\multica.exe';
 const startedAt = '2026-08-26T08:00:00.000000123Z';
 const instanceId = `br_${'a'.repeat(32)}`;
-const identityPath = 'D:\\fake-home\\.quukk-clawmessenger\\run\\bridge.pid';
+const fakeHome = 'D:\\fake-home';
+const identityPath = localPaths(fakeHome).bridgePid;
 
 function identity(overrides: Partial<BridgeProcessIdentity> = {}): BridgeProcessIdentity {
   return {
@@ -439,9 +441,9 @@ describe('BridgeProcessIdentityStore', () => {
     gate.release();
     await expect(removing).resolves.toBe(false);
     expect(restoreRace.links).toHaveLength(1);
-    expect(restoreRace.links[0]?.existing).toMatch(
-      /^D:\\fake-home\\\.quukk-clawmessenger\\run\\bridge\.pid\.claim-/,
-    );
+    const claimPrefix = `${identityPath}.claim-${process.pid}-`;
+    expect(restoreRace.links[0]?.existing?.startsWith(claimPrefix)).toBe(true);
+    expect(restoreRace.links[0]?.existing?.slice(claimPrefix.length)).toMatch(/^[0-9a-f]{32}$/);
     expect(restoreRace.links[0]?.destination).toBe(identityPath);
     await expect(restoreWriter.read()).resolves.toEqual(newest);
   });
@@ -478,7 +480,10 @@ describe('BridgeProcessIdentityStore', () => {
 
     const overflow = new FakeIdentityFileSystem();
     for (let index = 0; index < 257; index += 1) {
-      overflow.files.set(`${dirname(identityPath)}\\unrelated-${String(index).padStart(3, '0')}`, {});
+      overflow.files.set(
+        join(dirname(identityPath), `unrelated-${String(index).padStart(3, '0')}`),
+        {},
+      );
     }
     const overflowStore = new BridgeProcessIdentityStore({
       homeDirectory: 'D:\\fake-home',
