@@ -1,13 +1,21 @@
 // @vitest-environment node
 
+import { fork, type ChildProcess, type ForkOptions } from 'node:child_process';
+import { once } from 'node:events';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { resolve } from 'node:path';
+import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import * as ts from 'typescript';
 import { beforeAll, describe, expect, it } from 'vitest';
 
 import { parseWorkerEvent } from './worker-protocol.js';
+import {
+  RongCloudWorkerSupervisor,
+  type SupervisorBinding,
+} from './worker-supervisor.js';
 
 type SdkResult = { code: number; data?: { messageUId?: string } };
 
@@ -265,6 +273,81 @@ async function listen(server: Server): Promise<number> {
 
 async function close(server: Server): Promise<void> {
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+}
+
+async function waitFor(predicate: () => boolean, label: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('wait_timeout:' + label);
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function literalModuleSpecifiers(filePath: string, source: string): string[] {
+  const sourceFile = ts.createSourceFile(filePath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const specifiers: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node))
+      && node.moduleSpecifier && ts.isStringLiteralLike(node.moduleSpecifier)) {
+      specifiers.push(node.moduleSpecifier.text);
+    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword
+      && node.arguments.length === 1 && ts.isStringLiteralLike(node.arguments[0]!)) {
+      specifiers.push(node.arguments[0]!.text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return specifiers;
+}
+
+async function existingSource(importer: string, specifier: string): Promise<string | undefined> {
+  const imported = resolve(dirname(importer), specifier);
+  const extension = extname(imported);
+  const candidates = extension
+    ? [imported, imported.replace(/\.[cm]?js$/u, '.ts')]
+    : [imported + '.ts', join(imported, 'index.ts')];
+  for (const candidate of candidates) {
+    try {
+      await access(candidate);
+      return candidate;
+    } catch {
+      // Try the next source form.
+    }
+  }
+  return undefined;
+}
+
+async function reachableImportViolations(entrypoints: readonly string[]): Promise<{
+  visited: string[];
+  violations: string[];
+}> {
+  const bannedPackages = [
+    '@rongcloud/imlib-next', '@rongcloud/engine', 'fake-indexeddb', 'jsdom', 'ws',
+  ];
+  const pending = [...entrypoints];
+  const visited = new Set<string>();
+  const violations: string[] = [];
+  while (pending.length > 0) {
+    const filePath = pending.pop()!;
+    if (visited.has(filePath)) continue;
+    visited.add(filePath);
+    const source = await readFile(filePath, 'utf8');
+    for (const specifier of literalModuleSpecifiers(filePath, source)) {
+      if (bannedPackages.some((name) => specifier === name || specifier.startsWith(name + '/'))) {
+        violations.push(relative(process.cwd(), filePath) + ' -> ' + specifier);
+        continue;
+      }
+      if (!specifier.startsWith('.')) continue;
+      const imported = await existingSource(filePath, specifier);
+      if (!imported) continue;
+      if (basename(imported) === 'env-polyfill.ts') {
+        violations.push(relative(process.cwd(), filePath) + ' -> ' + specifier);
+        continue;
+      }
+      pending.push(imported);
+    }
+  }
+  return { visited: [...visited], violations };
 }
 
 function xhrRequest(Xhr: new () => XMLHttpRequestLike, url: string): Promise<XMLHttpRequestLike> {
@@ -592,8 +675,233 @@ describe('injected worker runtime', () => {
     await flush();
     expect(requestFixture.port.sent).toContainEqual({
       type: 'result', runtimeId, instanceId, requestId: 'timed-out', ok: false, errorCode: 'timeout',
-    });
   });
+});
+
+describe('real child-process supervisor boundary', () => {
+  it('keeps credentials IPC-only, isolates sibling PIDs, reaps exits, and disposes every handle', async () => {
+    const configuredTemp = process.env.TEMP ?? process.env.TMP;
+    if (!configuredTemp) throw new Error('task_temp_required');
+    const tempRoot = resolve(configuredTemp);
+    await mkdir(tempRoot, { recursive: true });
+    const testDirectory = await mkdtemp(join(tempRoot, 'quukk-task9-real-child-'));
+    expect(resolve(testDirectory).startsWith(tempRoot + sep)).toBe(true);
+    const childEntry = join(testDirectory, 'fake-rongcloud-worker.cjs');
+    const fakeChildSource = [
+      "'use strict';",
+      'let identity;',
+      'let tokenWasIpcOnly = false;',
+      "const instanceId = 'rcw_' + process.pid.toString(16).padStart(32, '0');",
+      'const send = (event) => { if (process.connected && process.send) process.send(event); };',
+      "process.on('message', (command) => {",
+      "  if (!command || typeof command !== 'object') { process.exitCode = 90; process.disconnect(); return; }",
+      "  if (command.type === 'init') {",
+      '    if (identity) { process.exitCode = 91; process.disconnect(); return; }',
+      '    const inherited = JSON.stringify({ argv: process.argv, env: process.env });',
+      "    tokenWasIpcOnly = typeof command.token === 'string' && !inherited.includes(command.token);",
+      '    identity = { runtimeId: command.binding.runtimeId, instanceId };',
+      "    send({ type: 'ready', ...identity });",
+      "    send({ type: 'connection', ...identity, state: 'online' });",
+      '    return;',
+      '  }',
+      "  if (!identity || typeof command.requestId !== 'string') { process.exitCode = 92; process.disconnect(); return; }",
+      "  if (command.type === 'send' && command.content === 'hang') {",
+      "    send({ type: 'connection', ...identity, state: 'connecting' });",
+      '    return;',
+      '  }',
+      "  if (command.type === 'send') {",
+      "    send({ type: 'result', ...identity, requestId: command.requestId, ok: true,",
+      "      messageUid: tokenWasIpcOnly ? 'uid-' + String(command.content) : 'token-not-ipc-only' });",
+      '    return;',
+      '  }',
+      "  if (command.type === 'receipt' || command.type === 'join_chatroom' || command.type === 'disconnect') {",
+      "    send({ type: 'result', ...identity, requestId: command.requestId, ok: true });",
+      '    return;',
+      '  }',
+      '  process.exitCode = 93;',
+      '  process.disconnect();',
+      '});',
+      "process.on('disconnect', () => { process.exit(); });",
+    ].join('\n');
+    await writeFile(childEntry, fakeChildSource, 'utf8');
+
+    const children: ChildProcess[] = [];
+    const reapedChildren = new Set<ChildProcess>();
+    const spawnAudit: Array<{ modulePath: string; args: readonly string[]; options: ForkOptions }> = [];
+    const order: string[] = [];
+    const timerHandles = new Set<NodeJS.Timeout>();
+    const schedule = (callback: () => void, milliseconds: number): NodeJS.Timeout => {
+      const timer = setTimeout(() => {
+        timerHandles.delete(timer);
+        callback();
+      }, milliseconds);
+      timerHandles.add(timer);
+      return timer;
+    };
+    const clear = (value: unknown): void => {
+      const timer = value as NodeJS.Timeout;
+      clearTimeout(timer);
+      timerHandles.delete(timer);
+    };
+    const firstToken = 'PHASE_E_TOKEN_SENTINEL_FIRST';
+    const secondToken = 'PHASE_E_TOKEN_SENTINEL_SECOND';
+    const first: SupervisorBinding = {
+      runtimeId: 'rt_11111111111111111111111111111111',
+      nodeId: 'real-child-one',
+      enabled: true,
+      tokenRef: 'rc_11111111111111111111111111111111',
+      storageDir: join(testDirectory, 'storage-one'),
+    };
+    const second: SupervisorBinding = {
+      runtimeId: 'rt_22222222222222222222222222222222',
+      nodeId: 'real-child-two',
+      enabled: true,
+      tokenRef: 'rc_22222222222222222222222222222222',
+      storageDir: join(testDirectory, 'storage-two'),
+    };
+    const credentials = new Map([[first.nodeId, firstToken], [second.nodeId, secondToken]]);
+    const parentEnv: NodeJS.ProcessEnv = process.platform === 'win32'
+      ? {
+          SystemRoot: process.env.SystemRoot,
+          WINDIR: process.env.WINDIR,
+          ComSpec: process.env.ComSpec,
+          TEMP: testDirectory,
+          TMP: testDirectory,
+          CLAW_TOKEN: firstToken,
+          NODE_TLS_REJECT_UNAUTHORIZED: '0',
+          USERPROFILE: 'C:\\Users\\must-not-reach-child',
+        }
+      : {
+          PATH: process.env.PATH,
+          LANG: process.env.LANG,
+          TEMP: testDirectory,
+          TMP: testDirectory,
+          CLAW_TOKEN: firstToken,
+          NODE_TLS_REJECT_UNAUTHORIZED: '0',
+          HOME: '/home/must-not-reach-child',
+        };
+    const supervisor = new RongCloudWorkerSupervisor({
+      workerEntryPath: childEntry,
+      processEnv: parentEnv,
+      platform: process.platform,
+      spawnChild: (modulePath, args, options) => {
+        const child = fork(modulePath, [...args], options as ForkOptions);
+        children.push(child);
+        order.push('spawn:' + child.pid);
+        spawnAudit.push({ modulePath, args: [...args], options });
+        child.once('exit', () => reapedChildren.add(child));
+        return child;
+      },
+      resolveCredential: async (value) => {
+        order.push('credential:' + value.nodeId);
+        return { appKey: 'real-child-app-key', token: credentials.get(value.nodeId)! };
+      },
+      refreshCredential: async () => 'unused-refresh-token',
+      setTimeout: schedule,
+      clearTimeout: clear,
+      requestTimeoutMs: 5_000,
+      restartBaseMs: 60_000,
+      restartMaxMs: 60_000,
+      stableWindowMs: 60_000,
+    });
+
+    const awaitReaped = async (child: ChildProcess): Promise<void> => {
+      if (reapedChildren.has(child)) return;
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('child_reap_timeout')), 5_000);
+        timer.unref();
+        child.once('exit', () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+      });
+    };
+
+    try {
+      await supervisor.reconcile([first, second]);
+      await waitFor(
+        () => supervisor.snapshots().length === 2
+          && supervisor.snapshots().every(({ state }) => state === 'online'),
+        'two real workers online',
+      );
+      expect(children).toHaveLength(2);
+      expect(new Set(children.map(({ pid }) => pid)).size).toBe(2);
+      expect(order.slice(0, 4)).toEqual([
+        expect.stringMatching(/^spawn:/u),
+        'credential:' + first.nodeId,
+        expect.stringMatching(/^spawn:/u),
+        'credential:' + second.nodeId,
+      ]);
+      const spawnMaterial = JSON.stringify(spawnAudit);
+      expect(spawnMaterial).not.toMatch(/PHASE_E_TOKEN_SENTINEL|CLAW_TOKEN|NODE_TLS_REJECT_UNAUTHORIZED/u);
+
+      await expect(supervisor.send(first, {
+        conversationType: 1, targetId: 'target-one', messageType: 'text', content: 'first-result',
+      })).resolves.toBe('uid-first-result');
+      await expect(supervisor.send(second, {
+        conversationType: 1, targetId: 'target-two', messageType: 'text', content: 'second-result',
+      })).resolves.toBe('uid-second-result');
+
+      const pending = supervisor.send(first, {
+        conversationType: 1, targetId: 'target-one', messageType: 'text', content: 'hang',
+      }).then(
+        (value) => ({ ok: true as const, value }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      await waitFor(
+        () => supervisor.snapshots().some(({ runtimeId, state }) =>
+          runtimeId === first.runtimeId && state === 'starting'),
+        'hung request received',
+      );
+      const exitedChild = children[0]!;
+      const siblingChild = children[1]!;
+      const exited = once(exitedChild, 'exit');
+      expect(exitedChild.kill('SIGTERM')).toBe(true);
+      await exited;
+      expect(reapedChildren.has(exitedChild)).toBe(true);
+      expect(exitedChild.connected).toBe(false);
+      expect(await pending).toMatchObject({ ok: false, error: { code: 'worker_exited' } });
+      expect(siblingChild.exitCode).toBeNull();
+      expect(siblingChild.signalCode).toBeNull();
+      expect(siblingChild.connected).toBe(true);
+      await expect(supervisor.send(second, {
+        conversationType: 1, targetId: 'target-two', messageType: 'text', content: 'sibling-still-alive',
+      })).resolves.toBe('uid-sibling-still-alive');
+
+      await supervisor.dispose();
+      expect(supervisor.snapshots()).toEqual([]);
+      expect(timerHandles.size).toBe(0);
+      expect(children.every((child) => reapedChildren.has(child) && !child.connected)).toBe(true);
+    } finally {
+      await supervisor.dispose();
+      await Promise.all(children.map(awaitReaped));
+      for (const timer of timerHandles) clearTimeout(timer);
+      timerHandles.clear();
+      await rm(testDirectory, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it('keeps SDK and polyfill modules unreachable from every current main entrypoint', async () => {
+    const sourceRoot = resolve('src');
+    const candidates = ['index.ts', 'cli.ts', 'router.ts', 'http.ts', 'http-server.ts', 'server.ts']
+      .map((name) => join(sourceRoot, name));
+    const entrypoints: string[] = [];
+    for (const candidate of candidates) {
+      try {
+        await access(candidate);
+        entrypoints.push(candidate);
+      } catch {
+        // This optional entrypoint does not exist in the current package.
+      }
+    }
+    expect(entrypoints.map((entry) => basename(entry))).toContain('index.ts');
+    const graph = await reachableImportViolations(entrypoints);
+    expect(graph.violations).toEqual([]);
+    expect(graph.visited.map((filePath) => basename(filePath))).not.toContain('worker-entry.ts');
+    expect(graph.visited.map((filePath) => basename(filePath))).not.toContain('env-polyfill.ts');
+  });
+});
 
   it('times out a hung initial connect, disposes it, and cannot be revived by a late success', async () => {
     let resolveConnect: ((result: SdkResult) => void) | undefined;

@@ -63,6 +63,9 @@ class FakeChild {
   alive = true;
   killCalls = 0;
   disconnectCalls = 0;
+  exitOnSigterm = true;
+  exitOnSigkill = true;
+  readonly killSignals: Array<string | number> = [];
 
   constructor(readonly pid: number, readonly recordSend: (message: unknown) => void) {}
 
@@ -89,10 +92,11 @@ class FakeChild {
 
   kill(signal = 'SIGTERM'): boolean {
     this.killCalls += 1;
+    this.killSignals.push(signal);
     if (!this.alive) return false;
-    this.alive = false;
-    this.connected = false;
-    this.emit('exit', 0, signal);
+    if ((signal === 'SIGTERM' && !this.exitOnSigterm)
+      || (signal === 'SIGKILL' && !this.exitOnSigkill)) return true;
+    this.reap(0, signal);
     return true;
   }
 
@@ -109,9 +113,14 @@ class FakeChild {
 
   crash(code = 1): void {
     if (!this.alive) return;
+    this.reap(code, null);
+  }
+
+  reap(code = 0, signal: string | number | null = 'SIGTERM'): void {
+    if (!this.alive) return;
     this.alive = false;
     this.connected = false;
-    this.emit('exit', code, null);
+    this.emit('exit', code, signal);
   }
 
   dropIpc(): void {
@@ -122,6 +131,10 @@ class FakeChild {
 
   emitStaleMessage(listenerIndex: number, message: unknown): void {
     this.messageListenerHistory[listenerIndex]?.(message);
+  }
+
+  emitFault(event: 'error' | 'disconnect'): void {
+    this.emit(event, event === 'error' ? new Error('fake_child_error') : undefined);
   }
 
   #emit(event: ChildEvent, ...values: unknown[]): void {
@@ -757,6 +770,256 @@ describe('RongCloud worker supervisor', () => {
     await flush();
     expect(fixture.spawn.calls).toHaveLength(1);
     expect(fixture.supervisor.snapshots()).toEqual([]);
+  });
+
+  it('waits for delayed process exit before stop and global disposal settle', async () => {
+    const fixture = createFixture({ terminateGraceMs: 10, killGraceMs: 20 });
+    const bindings = [binding(0), binding(1)];
+    await fixture.supervisor.reconcile(bindings);
+    const [stoppedChild, disposedChild] = fixture.spawn.calls.map(({ child }) => child);
+    stoppedChild!.exitOnSigterm = false;
+    disposedChild!.exitOnSigterm = false;
+
+    const stopped = track(fixture.supervisor.stop(identity(bindings[0]!)));
+    await flush();
+    expect(stopped.settled()).toBe(false);
+    expect(stoppedChild!.killSignals).toEqual(['SIGTERM']);
+    stoppedChild!.reap();
+    await flush();
+    expect(await stopped.outcome).toEqual({ ok: true, value: undefined });
+    expect(fixture.supervisor.snapshots()).toContainEqual(expect.objectContaining({
+      runtimeId: bindings[0]!.runtimeId, state: 'stopped',
+    }));
+
+    const disposed = track(fixture.supervisor.dispose());
+    await flush();
+    expect(disposed.settled()).toBe(false);
+    expect(disposedChild!.killSignals).toEqual(['SIGTERM']);
+    disposedChild!.reap();
+    await flush();
+    expect(await disposed.outcome).toEqual({ ok: true, value: undefined });
+    expect(fixture.timers.pendingDelays()).toEqual([]);
+  });
+
+  it('never starts a replacement before delayed exit on restart or credential change', async () => {
+    const fixture = createFixture({ terminateGraceMs: 10, killGraceMs: 20 });
+    const value = binding(0);
+    await fixture.supervisor.reconcile([value]);
+    const original = fixture.spawn.calls[0]!.child;
+    original.exitOnSigterm = false;
+
+    const changed = { ...value, tokenRef: `rc_${hex(999)}` };
+    const reconciled = track(fixture.supervisor.reconcile([changed]));
+    await flush();
+    expect(reconciled.settled()).toBe(false);
+    expect(fixture.spawn.calls).toHaveLength(1);
+    expect(original.alive).toBe(true);
+    original.reap();
+    await flush();
+    expect(await reconciled.outcome).toEqual({ ok: true, value: undefined });
+    expect(fixture.spawn.calls).toHaveLength(2);
+    const credentialReplacement = fixture.spawn.calls[1]!.child;
+    expect(original.alive).toBe(false);
+    expect(credentialReplacement.alive).toBe(true);
+
+    credentialReplacement.exitOnSigterm = false;
+    const restarted = track(fixture.supervisor.restart(identity(changed)));
+    await flush();
+    expect(restarted.settled()).toBe(false);
+    expect(fixture.spawn.calls).toHaveLength(2);
+    credentialReplacement.reap();
+    await flush();
+    expect(await restarted.outcome).toEqual({ ok: true, value: undefined });
+    expect(fixture.spawn.calls).toHaveLength(3);
+    expect(fixture.spawn.calls.filter(({ child }) => child.alive)).toHaveLength(1);
+  });
+
+  it('fails explicit restart safely without replacement when KILL is not reaped', async () => {
+    const fixture = createFixture({ terminateGraceMs: 10, killGraceMs: 20 });
+    const value = binding(0);
+    await fixture.supervisor.reconcile([value]);
+    const child = fixture.spawn.calls[0]!.child;
+    child.exitOnSigterm = false;
+    child.exitOnSigkill = false;
+    const restarted = track(fixture.supervisor.restart(identity(value)));
+    await flush();
+    expect(restarted.settled()).toBe(false);
+    expect(fixture.spawn.calls).toHaveLength(1);
+    fixture.timers.advance(10);
+    await flush();
+    fixture.timers.advance(20);
+    await flush();
+    expect(await restarted.outcome).toMatchObject({ ok: false, error: { code: 'worker_exited' } });
+    expect(fixture.spawn.calls).toHaveLength(1);
+    expect(fixture.supervisor.snapshots()[0]).toMatchObject({ state: 'backoff' });
+    expect(fixture.timers.pendingDelays()).toEqual([]);
+    child.reap();
+    fixture.timers.advance(restartMaxMs * 10);
+    await flush();
+    expect(fixture.spawn.calls).toHaveLength(1);
+  });
+
+  it('fails credential-change reconcile safely without replacement when KILL is not reaped', async () => {
+    const fixture = createFixture({ terminateGraceMs: 10, killGraceMs: 20 });
+    const value = binding(0);
+    await fixture.supervisor.reconcile([value]);
+    const child = fixture.spawn.calls[0]!.child;
+    child.exitOnSigterm = false;
+    child.exitOnSigkill = false;
+    const changed = track(fixture.supervisor.reconcile([{
+      ...value, tokenRef: `rc_${hex(997)}`,
+    }]));
+    await flush();
+    expect(changed.settled()).toBe(false);
+    expect(fixture.spawn.calls).toHaveLength(1);
+    fixture.timers.advance(10);
+    await flush();
+    fixture.timers.advance(20);
+    await flush();
+    expect(await changed.outcome).toMatchObject({ ok: false, error: { code: 'worker_exited' } });
+    expect(fixture.spawn.calls).toHaveLength(1);
+    expect(fixture.supervisor.snapshots()[0]).toMatchObject({ state: 'backoff' });
+    expect(fixture.timers.pendingDelays()).toEqual([]);
+    child.reap();
+    fixture.timers.advance(restartMaxMs * 10);
+    await flush();
+    expect(fixture.spawn.calls).toHaveLength(1);
+  });
+
+  it('escalates TERM to KILL with finite deadlines and contains timer failures safely', async () => {
+    const fixture = createFixture({ terminateGraceMs: 10, killGraceMs: 20 });
+    const value = binding(0);
+    await fixture.supervisor.reconcile([value]);
+    const child = fixture.spawn.calls[0]!.child;
+    child.exitOnSigterm = false;
+    child.exitOnSigkill = false;
+    const stopped = track(fixture.supervisor.stop(identity(value)));
+    await flush();
+    expect(stopped.settled()).toBe(false);
+    expect(child.killSignals).toEqual(['SIGTERM']);
+    expect(fixture.timers.pendingDelays()).toEqual([10]);
+
+    fixture.timers.advance(10);
+    await flush();
+    expect(stopped.settled()).toBe(false);
+    expect(child.killSignals).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(fixture.timers.pendingDelays()).toEqual([20]);
+    fixture.timers.advance(20);
+    await flush();
+    expect(await stopped.outcome).toEqual({ ok: true, value: undefined });
+    expect(fixture.supervisor.snapshots()[0]).toMatchObject({ state: 'stopped' });
+    expect(fixture.timers.pendingDelays()).toEqual([]);
+    child.reap();
+
+    const timerFailure = createFixture({
+      terminateGraceMs: 10,
+      killGraceMs: 20,
+      setTimeout: () => { throw new Error('PHASE_E_REAP_TIMER_SENTINEL'); },
+    });
+    const timerBinding = binding(8);
+    await timerFailure.supervisor.reconcile([timerBinding]);
+    const timerChild = timerFailure.spawn.calls[0]!.child;
+    timerChild.exitOnSigterm = false;
+    timerChild.exitOnSigkill = false;
+    const timerOutcome = await track(timerFailure.supervisor.stop(identity(timerBinding))).outcome;
+    expect(timerOutcome).toEqual({ ok: true, value: undefined });
+    expect(timerChild.killSignals).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(timerFailure.supervisor.snapshots()[0]).toMatchObject({ state: 'stopped' });
+    expect(JSON.stringify(timerOutcome)).not.toContain('PHASE_E_REAP_TIMER_SENTINEL');
+    timerChild.reap();
+  });
+
+  it('bounds disposal of an unreaped child and never resurrects it after a late exit', async () => {
+    const fixture = createFixture({ terminateGraceMs: 10, killGraceMs: 20 });
+    const value = binding(0);
+    await fixture.supervisor.reconcile([value]);
+    const child = fixture.spawn.calls[0]!.child;
+    child.exitOnSigterm = false;
+    child.exitOnSigkill = false;
+    const disposed = track(fixture.supervisor.dispose());
+    await flush();
+    expect(disposed.settled()).toBe(false);
+    fixture.timers.advance(10);
+    await flush();
+    fixture.timers.advance(20);
+    await flush();
+    expect(await disposed.outcome).toEqual({ ok: true, value: undefined });
+    expect(fixture.supervisor.snapshots()).toEqual([]);
+    expect(fixture.timers.pendingDelays()).toEqual([]);
+    child.reap();
+    fixture.timers.advance(restartMaxMs * 10);
+    await flush();
+    expect(fixture.spawn.calls).toHaveLength(1);
+    expect(fixture.timers.pendingDelays()).toEqual([]);
+  });
+
+  it('retains binding ownership across unreaped removal and permits re-add only after late exit', async () => {
+    const fixture = createFixture({ terminateGraceMs: 10, killGraceMs: 20 });
+    const value = binding(0);
+    await fixture.supervisor.reconcile([value]);
+    const child = fixture.spawn.calls[0]!.child;
+    child.exitOnSigterm = false;
+    child.exitOnSigkill = false;
+    const removed = track(fixture.supervisor.reconcile([]));
+    await flush();
+    expect(removed.settled()).toBe(false);
+    fixture.timers.advance(10);
+    await flush();
+    fixture.timers.advance(20);
+    await flush();
+    expect(await removed.outcome).toEqual({ ok: true, value: undefined });
+    expect(fixture.spawn.calls).toHaveLength(1);
+    expect(fixture.supervisor.snapshots()).toEqual([]);
+
+    await expect(fixture.supervisor.reconcile([value])).rejects.toMatchObject({ code: 'worker_exited' });
+    expect(fixture.spawn.calls).toHaveLength(1);
+    expect(child.alive).toBe(true);
+    child.reap();
+    await flush();
+    expect(fixture.spawn.calls).toHaveLength(1);
+
+    await fixture.supervisor.reconcile([value]);
+    expect(fixture.spawn.calls).toHaveLength(2);
+    expect(fixture.spawn.calls[1]!.child.alive).toBe(true);
+  });
+
+  it('honors a concurrent re-add after the removing child exits without losing key ownership', async () => {
+    const fixture = createFixture({ terminateGraceMs: 10, killGraceMs: 20 });
+    const value = binding(0);
+    await fixture.supervisor.reconcile([value]);
+    const child = fixture.spawn.calls[0]!.child;
+    child.exitOnSigterm = false;
+
+    const removed = track(fixture.supervisor.reconcile([]));
+    await flush();
+    const readded = track(fixture.supervisor.reconcile([value]));
+    await flush();
+    expect(removed.settled()).toBe(false);
+    expect(readded.settled()).toBe(false);
+    expect(fixture.spawn.calls).toHaveLength(1);
+    expect(fixture.supervisor.snapshots()).toHaveLength(1);
+
+    child.reap();
+    await flush();
+    expect(await removed.outcome).toEqual({ ok: true, value: undefined });
+    expect(await readded.outcome).toEqual({ ok: true, value: undefined });
+    expect(fixture.spawn.calls).toHaveLength(2);
+    expect(fixture.spawn.calls[1]!.child.alive).toBe(true);
+  });
+
+  it('does not wait a reap grace period or double-kill when exit already occurred', async () => {
+    const fixture = createFixture({ terminateGraceMs: 11, killGraceMs: 21 });
+    const value = binding(0);
+    await fixture.supervisor.reconcile([value]);
+    const child = fixture.spawn.calls[0]!.child;
+    child.crash();
+    child.emitFault('error');
+    child.emitFault('disconnect');
+    await flush();
+    expect(child.killCalls).toBeLessThanOrEqual(1);
+    expect(fixture.timers.pendingDelays()).toEqual([restartBaseMs]);
+    expect(fixture.timers.scheduled).toEqual([restartBaseMs]);
+    expect(fixture.supervisor.snapshots()[0]).toMatchObject({ state: 'backoff', restartCount: 1 });
   });
 
   it('supports isolated stop/restart and global disposal without touching unrelated state', async () => {

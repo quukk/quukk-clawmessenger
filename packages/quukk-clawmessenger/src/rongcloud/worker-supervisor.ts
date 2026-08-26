@@ -16,6 +16,8 @@ export const SUPERVISOR_MAX_BUFFERED_COMMANDS = 32;
 export const SUPERVISOR_RESTART_BASE_MS = 250;
 export const SUPERVISOR_RESTART_MAX_MS = 30_000;
 export const SUPERVISOR_STABLE_WINDOW_MS = 60_000;
+export const SUPERVISOR_TERMINATE_GRACE_MS = 2_000;
+export const SUPERVISOR_KILL_GRACE_MS = 1_000;
 
 export interface WorkerIdentity {
   runtimeId: string;
@@ -44,6 +46,8 @@ export interface WorkerSnapshot extends WorkerIdentity {
 export interface WorkerChild {
   readonly pid?: number;
   readonly connected?: boolean;
+  readonly exitCode?: number | null;
+  readonly signalCode?: NodeJS.Signals | null;
   send(message: unknown): boolean | void;
   kill(signal?: NodeJS.Signals | number): boolean;
   disconnect?(): void;
@@ -83,6 +87,8 @@ export interface RongCloudWorkerSupervisorOptions {
   restartBaseMs?: number;
   restartMaxMs?: number;
   stableWindowMs?: number;
+  terminateGraceMs?: number;
+  killGraceMs?: number;
   maxPendingRequests?: number;
   maxBufferedCommands?: number;
 }
@@ -118,6 +124,17 @@ interface WorkerListeners {
   disconnect: (...values: unknown[]) => void;
 }
 
+interface ChildLifecycle {
+  readonly child: WorkerChild;
+  readonly generation: number;
+  readonly exitPromise: Promise<void>;
+  readonly resolveExit: () => void;
+  readonly onExit: (...values: unknown[]) => void;
+  exited: boolean;
+  abandoned: boolean;
+  termination?: Promise<boolean>;
+}
+
 interface WorkerRecord {
   readonly key: string;
   binding: SupervisorBinding;
@@ -125,6 +142,7 @@ interface WorkerRecord {
   generation: number;
   failedGeneration?: number;
   child?: WorkerChild;
+  lifecycle?: ChildLifecycle;
   listeners?: WorkerListeners;
   state: SupervisorState;
   instanceId: string | null;
@@ -137,6 +155,9 @@ interface WorkerRecord {
   pending: Map<string, PendingRequest>;
   buffer: PendingRequest[];
   refreshRequestId?: string;
+  restartAttempt?: Promise<void>;
+  reapBlocked: boolean;
+  removeWhenReaped: boolean;
 }
 
 type TimerSchedule = { ok: true; timer: unknown } | { ok: false };
@@ -227,11 +248,14 @@ export class RongCloudWorkerSupervisor {
   readonly #restartBaseMs: number;
   readonly #restartMaxMs: number;
   readonly #stableWindowMs: number;
+  readonly #terminateGraceMs: number;
+  readonly #killGraceMs: number;
   readonly #maxPendingRequests: number;
   readonly #maxBufferedCommands: number;
   readonly #records = new Map<string, WorkerRecord>();
   #requestSequence = 0;
   #disposed = false;
+  #disposeAttempt?: Promise<void>;
 
   constructor(options: RongCloudWorkerSupervisorOptions) {
     this.#workerEntryPath = options.workerEntryPath ?? defaultWorkerEntryPath;
@@ -267,6 +291,12 @@ export class RongCloudWorkerSupervisor {
       SUPERVISOR_STABLE_WINDOW_MS,
       10 * 60_000,
     );
+    this.#terminateGraceMs = boundedInteger(
+      options.terminateGraceMs,
+      SUPERVISOR_TERMINATE_GRACE_MS,
+      30_000,
+    );
+    this.#killGraceMs = boundedInteger(options.killGraceMs, SUPERVISOR_KILL_GRACE_MS, 30_000);
     this.#maxPendingRequests = boundedInteger(
       options.maxPendingRequests,
       SUPERVISOR_MAX_PENDING_REQUESTS,
@@ -288,9 +318,11 @@ export class RongCloudWorkerSupervisor {
       desired.set(key, binding);
     }
 
+    const removals: Promise<void>[] = [];
     for (const [key, record] of [...this.#records]) {
-      if (!desired.has(key)) this.#removeRecord(record);
+      if (!desired.has(key)) removals.push(this.#removeRecord(record));
     }
+    await Promise.all(removals);
 
     const starts: Promise<void>[] = [];
     for (const [key, binding] of desired) {
@@ -308,6 +340,8 @@ export class RongCloudWorkerSupervisor {
           restartCount: 0,
           pending: new Map(),
           buffer: [],
+          reapBlocked: false,
+          removeWhenReaped: false,
         };
         this.#records.set(key, record);
         starts.push(this.#spawn(record));
@@ -318,9 +352,11 @@ export class RongCloudWorkerSupervisor {
         || existing.binding.storageDir !== binding.storageDir;
       existing.binding = binding;
       existing.desired = true;
+      existing.removeWhenReaped = false;
       if (credentialsChanged || existing.state === 'stopped') {
         starts.push(this.#restartRecord(existing));
-      } else if (!existing.child && existing.restartTimer === undefined) {
+      } else if (!existing.child && !existing.lifecycle && !existing.reapBlocked
+        && existing.restartTimer === undefined && !existing.restartAttempt) {
         starts.push(this.#spawn(existing));
       }
     }
@@ -359,9 +395,10 @@ export class RongCloudWorkerSupervisor {
     const record = this.#record(identity);
     if (!record) return;
     record.desired = false;
+    record.removeWhenReaped = false;
     this.#cancelLifecycleTimers(record);
     this.#rejectPending(record, 'worker_exited');
-    this.#terminate(record);
+    await this.#terminate(record);
     record.state = 'stopped';
     record.instanceId = null;
     record.readySeen = false;
@@ -378,6 +415,7 @@ export class RongCloudWorkerSupervisor {
 
   snapshots(): readonly WorkerSnapshot[] {
     return [...this.#records.values()]
+      .filter((record) => !record.removeWhenReaped)
       .sort((left, right) => left.key.localeCompare(right.key))
       .map((record) => ({
         runtimeId: record.binding.runtimeId,
@@ -388,26 +426,48 @@ export class RongCloudWorkerSupervisor {
       }));
   }
 
-  async dispose(): Promise<void> {
-    if (this.#disposed) return;
+  dispose(): Promise<void> {
+    if (this.#disposeAttempt) return this.#disposeAttempt;
     this.#disposed = true;
-    for (const record of this.#records.values()) {
+    const records = [...this.#records.values()];
+    const attempt = Promise.all(records.map(async (record) => {
       record.desired = false;
       this.#cancelLifecycleTimers(record);
       this.#rejectPending(record, 'worker_exited');
-      this.#terminate(record);
-    }
-    this.#records.clear();
+      await this.#terminate(record);
+    })).then(() => {
+      this.#records.clear();
+    });
+    this.#disposeAttempt = attempt;
+    return attempt;
   }
 
   #record(identity: WorkerIdentity): WorkerRecord | undefined {
     return this.#records.get(workerBindingKey(identity));
   }
 
-  async #restartRecord(record: WorkerRecord): Promise<void> {
+  #restartRecord(record: WorkerRecord): Promise<void> {
+    if (record.restartAttempt) return record.restartAttempt;
+    const attempt = this.#performRestart(record);
+    record.restartAttempt = attempt;
+    const clear = (): void => {
+      if (record.restartAttempt === attempt) record.restartAttempt = undefined;
+    };
+    void attempt.then(clear, clear);
+    return attempt;
+  }
+
+  async #performRestart(record: WorkerRecord): Promise<void> {
     this.#cancelLifecycleTimers(record);
     this.#rejectPending(record, 'worker_exited');
-    this.#terminate(record);
+    record.state = 'backoff';
+    record.instanceId = null;
+    record.readySeen = false;
+    record.routable = false;
+    const reaped = await this.#terminate(record);
+    if (!reaped) throw failure('worker_exited');
+    if (this.#disposed || !record.desired || this.#records.get(record.key) !== record) return;
+    this.#cancelLifecycleTimers(record);
     record.restartCount = 0;
     record.failedGeneration = undefined;
     record.state = 'starting';
@@ -418,7 +478,8 @@ export class RongCloudWorkerSupervisor {
   }
 
   async #spawn(record: WorkerRecord): Promise<void> {
-    if (this.#disposed || !record.desired || this.#records.get(record.key) !== record) return;
+    if (this.#disposed || !record.desired || this.#records.get(record.key) !== record
+      || record.child || record.lifecycle || record.reapBlocked) return;
     const generation = ++record.generation;
     record.failedGeneration = undefined;
     record.state = 'starting';
@@ -441,6 +502,7 @@ export class RongCloudWorkerSupervisor {
       return;
     }
     record.child = child;
+    this.#trackChild(record, child, generation);
     this.#attach(record, child, generation);
 
     let credential: SupervisorCredential;
@@ -470,6 +532,51 @@ export class RongCloudWorkerSupervisor {
     } catch {
       this.#failRecord(record, generation);
     }
+  }
+
+  #trackChild(record: WorkerRecord, child: WorkerChild, generation: number): ChildLifecycle {
+    let resolveExit = (): void => undefined;
+    const exitPromise = new Promise<void>((resolve) => { resolveExit = resolve; });
+    let lifecycle: ChildLifecycle;
+    const onExit = (): void => this.#markExited(record, lifecycle);
+    lifecycle = {
+      child,
+      generation,
+      exitPromise,
+      resolveExit,
+      onExit,
+      exited: false,
+      abandoned: false,
+    };
+    record.lifecycle = lifecycle;
+    child.on('exit', onExit);
+    if (this.#childHasExited(child)) this.#markExited(record, lifecycle);
+    return lifecycle;
+  }
+
+  #markExited(record: WorkerRecord, lifecycle: ChildLifecycle): void {
+    if (lifecycle.exited) return;
+    lifecycle.exited = true;
+    lifecycle.resolveExit();
+    if (lifecycle.abandoned) {
+      this.#releaseLifecycle(record, lifecycle);
+      if (record.removeWhenReaped && !record.desired && this.#records.get(record.key) === record) {
+        this.#records.delete(record.key);
+      }
+    }
+  }
+
+  #releaseLifecycle(record: WorkerRecord, lifecycle: ChildLifecycle): void {
+    removeListener(lifecycle.child, 'exit', lifecycle.onExit);
+    if (record.lifecycle === lifecycle) {
+      record.lifecycle = undefined;
+      record.reapBlocked = false;
+    }
+  }
+
+  #childHasExited(child: WorkerChild): boolean {
+    return (child.exitCode !== undefined && child.exitCode !== null)
+      || (child.signalCode !== undefined && child.signalCode !== null);
   }
 
   #attach(record: WorkerRecord, child: WorkerChild, generation: number): void {
@@ -743,39 +850,100 @@ export class RongCloudWorkerSupervisor {
     if (record.stableTimer !== undefined) this.#clearTimeout(record.stableTimer);
     record.stableTimer = undefined;
     this.#rejectPending(record, 'worker_exited');
-    this.#terminate(record);
     record.instanceId = null;
     record.readySeen = false;
     record.routable = false;
     record.state = 'backoff';
     record.restartCount += 1;
-    const exponent = Math.min(record.restartCount - 1, 30);
-    const delay = Math.min(this.#restartMaxMs, this.#restartBaseMs * (2 ** exponent));
-    const scheduled = this.#schedule(() => {
-      record.restartTimer = undefined;
-      if (this.#disposed || !record.desired || this.#records.get(record.key) !== record) return;
-      void this.#spawn(record).catch(() => this.#failRecord(record, record.generation));
-    }, delay);
-    record.restartTimer = scheduled.ok ? scheduled.timer : undefined;
+    void this.#terminate(record).then((reaped) => {
+      if (!reaped || this.#disposed || !record.desired || this.#records.get(record.key) !== record
+        || record.generation !== generation || record.failedGeneration !== generation) return;
+      const exponent = Math.min(record.restartCount - 1, 30);
+      const delay = Math.min(this.#restartMaxMs, this.#restartBaseMs * (2 ** exponent));
+      const scheduled = this.#schedule(() => {
+        record.restartTimer = undefined;
+        if (this.#disposed || !record.desired || this.#records.get(record.key) !== record
+          || record.reapBlocked) return;
+        void this.#spawn(record).catch(() => this.#failRecord(record, record.generation));
+      }, delay);
+      record.restartTimer = scheduled.ok ? scheduled.timer : undefined;
+    }, () => undefined);
   }
 
-  #terminate(record: WorkerRecord): void {
-    const child = record.child;
-    if (!child) return;
+  #terminate(record: WorkerRecord): Promise<boolean> {
+    const lifecycle = record.lifecycle;
+    const child = record.child ?? lifecycle?.child;
+    if (!child) return Promise.resolve(!record.reapBlocked);
+    const tracked = lifecycle?.child === child
+      ? lifecycle
+      : this.#trackChild(record, child, record.generation);
+    if (tracked.termination) return tracked.termination;
     this.#detach(record, child);
-    record.child = undefined;
+    if (record.child === child) record.child = undefined;
+    const termination = this.#terminateLifecycle(record, tracked);
+    tracked.termination = termination;
+    return termination;
+  }
+
+  async #terminateLifecycle(record: WorkerRecord, lifecycle: ChildLifecycle): Promise<boolean> {
+    const child = lifecycle.child;
+    if (this.#childHasExited(child)) this.#markExited(record, lifecycle);
+    if (lifecycle.exited) {
+      this.#releaseLifecycle(record, lifecycle);
+      return true;
+    }
     if (child.connected !== false) {
       try {
         child.disconnect?.();
       } catch {
-        // Continue to the bounded process termination attempt.
+        // Continue to process termination.
       }
     }
-    try {
-      child.kill('SIGTERM');
-    } catch {
-      // The child may already have exited.
+    this.#kill(child, 'SIGTERM');
+    if (lifecycle.exited || await this.#waitForExit(lifecycle, this.#terminateGraceMs)) {
+      this.#releaseLifecycle(record, lifecycle);
+      return true;
     }
+    this.#kill(child, 'SIGKILL');
+    if (lifecycle.exited || await this.#waitForExit(lifecycle, this.#killGraceMs)) {
+      this.#releaseLifecycle(record, lifecycle);
+      return true;
+    }
+    record.reapBlocked = true;
+    lifecycle.abandoned = true;
+    return false;
+  }
+
+  #kill(child: WorkerChild, signal: NodeJS.Signals): void {
+    try {
+      child.kill(signal);
+    } catch {
+      // Reaping deadlines still provide a finite result.
+    }
+  }
+
+  #waitForExit(lifecycle: ChildLifecycle, milliseconds: number): Promise<boolean> {
+    if (lifecycle.exited) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer: unknown;
+      let hasTimer = false;
+      const finish = (exited: boolean): void => {
+        if (settled) return;
+        settled = true;
+        if (hasTimer) this.#clearTimeout(timer);
+        resolve(exited);
+      };
+      void lifecycle.exitPromise.then(() => finish(true));
+      const scheduled = this.#schedule(() => finish(false), milliseconds);
+      if (!scheduled.ok) {
+        finish(false);
+        return;
+      }
+      timer = scheduled.timer;
+      hasTimer = true;
+      if (settled) this.#clearTimeout(timer);
+    });
   }
 
   #detach(record: WorkerRecord, child: WorkerChild): void {
@@ -795,12 +963,24 @@ export class RongCloudWorkerSupervisor {
     record.stableTimer = undefined;
   }
 
-  #removeRecord(record: WorkerRecord): void {
+  async #removeRecord(record: WorkerRecord): Promise<void> {
     record.desired = false;
+    record.removeWhenReaped = true;
     this.#cancelLifecycleTimers(record);
     this.#rejectPending(record, 'worker_exited');
-    this.#terminate(record);
-    this.#records.delete(record.key);
+    record.state = 'stopped';
+    record.instanceId = null;
+    record.readySeen = false;
+    record.routable = false;
+    const reaped = await this.#terminate(record);
+    if (
+      reaped &&
+      record.removeWhenReaped &&
+      !record.desired &&
+      this.#records.get(record.key) === record
+    ) {
+      this.#records.delete(record.key);
+    }
   }
 
   #isCurrent(record: WorkerRecord, child: WorkerChild, generation: number): boolean {
