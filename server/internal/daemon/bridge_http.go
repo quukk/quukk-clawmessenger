@@ -139,7 +139,7 @@ func (t *bridgeHTTPHandlerTracker) wrap(next http.Handler) http.Handler {
 		t.mu.Lock()
 		if t.sealed {
 			t.mu.Unlock()
-			return
+			panic(http.ErrAbortHandler)
 		}
 		t.active++
 		t.mu.Unlock()

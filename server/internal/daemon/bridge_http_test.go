@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1173,7 +1174,7 @@ func TestBridgeHTTPServeTimeoutDoesNotWaitForHandlerIgnoringRequestCancellation(
 	}
 }
 
-func TestBridgeHTTPHandlerTrackerRejectsBusinessEntriesAfterSeal(t *testing.T) {
+func TestBridgeHTTPHandlerTrackerAbortsBusinessEntriesAfterSeal(t *testing.T) {
 	tracker := newBridgeHTTPHandlerTracker()
 	businessCalls := 0
 	handler := tracker.wrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -1185,9 +1186,41 @@ func TestBridgeHTTPHandlerTrackerRejectsBusinessEntriesAfterSeal(t *testing.T) {
 	if err := tracker.wait(waitCtx); err != nil {
 		t.Fatalf("sealed empty tracker wait error = %v", err)
 	}
-	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://127.0.0.1/late", nil))
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://127.0.0.1/late", nil))
+	}()
+	if recovered != http.ErrAbortHandler {
+		t.Fatalf("sealed handler panic = %v, want http.ErrAbortHandler", recovered)
+	}
 	if businessCalls != 0 {
 		t.Fatalf("business handler calls after seal = %d, want 0", businessCalls)
+	}
+}
+
+func TestBridgeHTTPHandlerTrackerSealedRealServerAbortsWithoutResponse(t *testing.T) {
+	tracker := newBridgeHTTPHandlerTracker()
+	businessCalls := atomic.Int32{}
+	server := httptest.NewUnstartedServer(tracker.wrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		businessCalls.Add(1)
+	})))
+	var serverLog bytes.Buffer
+	server.Config.ErrorLog = log.New(&serverLog, "", 0)
+	server.Start()
+	defer server.Close()
+	tracker.seal()
+
+	response, err := server.Client().Get(server.URL)
+	if err == nil {
+		response.Body.Close()
+		t.Fatalf("sealed late request received HTTP %d, want connection error", response.StatusCode)
+	}
+	if businessCalls.Load() != 0 {
+		t.Fatalf("business handler calls after seal = %d, want 0", businessCalls.Load())
+	}
+	if serverLog.Len() != 0 {
+		t.Fatalf("http.ErrAbortHandler produced server log noise: %q", serverLog.String())
 	}
 }
 
