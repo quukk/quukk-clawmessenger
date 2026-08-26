@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { link as fsLink, rename as fsRename, unlink as fsUnlink } from 'node:fs/promises';
 
 import { z } from 'zod';
@@ -95,11 +94,12 @@ export class BridgeProcessIdentityStore implements BridgeProcessIdentityPersiste
       unlink: options.dependencies?.unlink ?? fsUnlink,
       tombstonePath:
         options.dependencies?.tombstonePath ??
-        ((path) => `${path}.claim-${process.pid}-${randomUUID()}`),
+        ((path) => `${path}.claim`),
     };
   }
 
   async read(): Promise<BridgeProcessIdentity | undefined> {
+    await this.#recoverClaim(this.#deps.tombstonePath(this.#path));
     return this.#read(this.#path);
   }
 
@@ -164,6 +164,27 @@ export class BridgeProcessIdentityStore implements BridgeProcessIdentityPersiste
       await this.#deps.link(tombstone, this.#path);
     } catch (error) {
       if (errorCode(error) !== 'EEXIST') {
+        throw new BridgeProcessIdentityError('identity_write_failed');
+      }
+    }
+    try {
+      await this.#deps.unlink(tombstone);
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') {
+        throw new BridgeProcessIdentityError('identity_write_failed');
+      }
+    }
+  }
+
+  async #recoverClaim(tombstone: string): Promise<void> {
+    const claimed = await this.#read(tombstone);
+    if (claimed === undefined) return;
+    try {
+      await this.#deps.link(tombstone, this.#path);
+    } catch (error) {
+      const code = errorCode(error);
+      if (code === 'ENOENT') return;
+      if (code !== 'EEXIST') {
         throw new BridgeProcessIdentityError('identity_write_failed');
       }
     }

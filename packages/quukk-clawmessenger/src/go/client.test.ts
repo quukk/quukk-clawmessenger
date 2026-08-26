@@ -129,6 +129,8 @@ describe('parseSSE', () => {
       byteChunks(`id: 1\revent: started\ndata: ${data}\n\n`),
       byteChunks(`id: 1\nevent: started\rdata: ${data}\n\n`),
       byteChunks(`id: 1\nevent: started\ndata: ${data}\r\r`),
+      byteChunks('id: 1\nevent: started\ndata: ab\rcd\n\n'),
+      byteChunks('data: ab\rid: 1\nevent: started\n\n'),
       (async function* () {
         yield encoder.encode('id: 1\r');
         yield encoder.encode(`event: started\ndata: ${data}\n\n`);
