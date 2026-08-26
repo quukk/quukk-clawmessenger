@@ -595,6 +595,32 @@ describe('injected worker runtime', () => {
     });
   });
 
+  it('times out a hung initial connect, disposes it, and cannot be revived by a late success', async () => {
+    let resolveConnect: ((result: SdkResult) => void) | undefined;
+    const sdk = new FakeSdk();
+    sdk.connectImpl = () => new Promise((resolve) => { resolveConnect = resolve; });
+    const fixture = createRuntime({ sdk });
+    fixture.port.emit('message', init('hung-connect-token'));
+    await flush();
+    expect(fixture.port.sent).toContainEqual({ type: 'ready', runtimeId, instanceId });
+    expect(fixture.port.sent).not.toContainEqual({
+      type: 'connection', runtimeId, instanceId, state: 'online',
+    });
+
+    fixture.timers.run(workerApi().WORKER_INIT_TIMEOUT_MS);
+    await flush();
+    expect(fixture.exits).toEqual([1]);
+    expect(fixture.timers.pending.size).toBe(0);
+    expect(sdk.disconnectCalls).toBe(1);
+    expect(sdk.destroyCalls).toBe(1);
+    const eventsAfterTimeout = structuredClone(fixture.port.sent);
+
+    resolveConnect?.({ code: 0 });
+    await flush();
+    expect(fixture.port.sent).toEqual(eventsAfterTimeout);
+    expect(fixture.exits).toEqual([1]);
+  });
+
   it('cleans listeners, client resources, and timers when the parent disconnects', async () => {
     const fixture = createRuntime();
     await initialize(fixture);

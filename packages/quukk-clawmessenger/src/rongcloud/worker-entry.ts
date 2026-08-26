@@ -148,7 +148,6 @@ class Runtime implements WorkerRuntime {
   async #initialize(command: Extract<WorkerCommand, { type: 'init' }>): Promise<void> {
     this.#initializing = true;
     this.#runtimeId = command.binding.runtimeId;
-    this.#clearInitTimer();
     const client = new RongCloudClient({
       sdk: this.#sdk,
       nodeId: command.binding.nodeId,
@@ -168,6 +167,7 @@ class Runtime implements WorkerRuntime {
       if (this.#closing) return;
       this.#initializing = false;
       this.#active = true;
+      this.#clearInitTimer();
     } catch (error) {
       if (!this.#closing) {
         const code = fixedErrorCode(error, 'connect_failed');
