@@ -1,4 +1,5 @@
-import { unlink as fsUnlink } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { link as fsLink, rename as fsRename, unlink as fsUnlink } from 'node:fs/promises';
 
 import { z } from 'zod';
 
@@ -44,7 +45,10 @@ export class BridgeProcessIdentityError extends Error {
 export type BridgeProcessIdentityDependencies = {
   read(path: string, maximumBytes: number): Promise<unknown | undefined>;
   write(path: string, value: unknown): Promise<void>;
+  rename(source: string, destination: string): Promise<unknown>;
+  link(existing: string, destination: string): Promise<unknown>;
   unlink(path: string): Promise<unknown>;
+  tombstonePath(path: string): string;
 };
 
 export interface BridgeProcessIdentityPersistence {
@@ -78,7 +82,6 @@ function equalIdentity(left: BridgeProcessIdentity, right: BridgeProcessIdentity
 export class BridgeProcessIdentityStore implements BridgeProcessIdentityPersistence {
   readonly #path: string;
   readonly #deps: BridgeProcessIdentityDependencies;
-  #mutationQueue: Promise<void> = Promise.resolve();
 
   constructor(options: BridgeProcessIdentityStoreOptions = {}) {
     this.#path = localPaths(options.homeDirectory).bridgePid;
@@ -87,14 +90,23 @@ export class BridgeProcessIdentityStore implements BridgeProcessIdentityPersiste
         options.dependencies?.read ??
         ((path, maximumBytes) => readJsonFileIfExists(path, z.unknown(), maximumBytes)),
       write: options.dependencies?.write ?? atomicWriteJson,
+      rename: options.dependencies?.rename ?? fsRename,
+      link: options.dependencies?.link ?? fsLink,
       unlink: options.dependencies?.unlink ?? fsUnlink,
+      tombstonePath:
+        options.dependencies?.tombstonePath ??
+        ((path) => `${path}.claim-${process.pid}-${randomUUID()}`),
     };
   }
 
   async read(): Promise<BridgeProcessIdentity | undefined> {
+    return this.#read(this.#path);
+  }
+
+  async #read(path: string): Promise<BridgeProcessIdentity | undefined> {
     let value: unknown | undefined;
     try {
-      value = await this.#deps.read(this.#path, IDENTITY_LIMIT);
+      value = await this.#deps.read(path, IDENTITY_LIMIT);
     } catch {
       throw new BridgeProcessIdentityError('identity_corrupt');
     }
@@ -107,37 +119,60 @@ export class BridgeProcessIdentityStore implements BridgeProcessIdentityPersiste
   async write(value: BridgeProcessIdentity): Promise<void> {
     const parsed = BridgeProcessIdentitySchema.safeParse(value);
     if (!parsed.success) throw new BridgeProcessIdentityError('identity_invalid');
-    return this.#mutate(async () => {
-      try {
-        await this.#deps.write(this.#path, parsed.data);
-      } catch {
-        throw new BridgeProcessIdentityError('identity_write_failed');
-      }
-    });
+    try {
+      await this.#deps.write(this.#path, parsed.data);
+    } catch {
+      throw new BridgeProcessIdentityError('identity_write_failed');
+    }
   }
 
   async removeIfMatches(expected: BridgeProcessIdentity): Promise<boolean> {
     const parsed = BridgeProcessIdentitySchema.safeParse(expected);
     if (!parsed.success) throw new BridgeProcessIdentityError('identity_invalid');
-    return this.#mutate(async () => {
-      const current = await this.read();
-      if (current === undefined || !equalIdentity(current, parsed.data)) return false;
-      try {
-        await this.#deps.unlink(this.#path);
-        return true;
-      } catch (error) {
-        if (errorCode(error) === 'ENOENT') return false;
-        throw new BridgeProcessIdentityError('identity_write_failed');
-      }
-    });
+    const tombstone = this.#deps.tombstonePath(this.#path);
+    try {
+      await this.#deps.rename(this.#path, tombstone);
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return false;
+      throw new BridgeProcessIdentityError('identity_write_failed');
+    }
+
+    let current: BridgeProcessIdentity | undefined;
+    try {
+      current = await this.#read(tombstone);
+    } catch (error) {
+      await this.#restore(tombstone);
+      throw error;
+    }
+    if (current === undefined) {
+      throw new BridgeProcessIdentityError('identity_write_failed');
+    }
+    if (!equalIdentity(current, parsed.data)) {
+      await this.#restore(tombstone);
+      return false;
+    }
+    try {
+      await this.#deps.unlink(tombstone);
+      return true;
+    } catch {
+      throw new BridgeProcessIdentityError('identity_write_failed');
+    }
   }
 
-  #mutate<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.#mutationQueue.catch(() => undefined).then(operation);
-    this.#mutationQueue = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
+  async #restore(tombstone: string): Promise<void> {
+    try {
+      await this.#deps.link(tombstone, this.#path);
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') {
+        throw new BridgeProcessIdentityError('identity_write_failed');
+      }
+    }
+    try {
+      await this.#deps.unlink(tombstone);
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') {
+        throw new BridgeProcessIdentityError('identity_write_failed');
+      }
+    }
   }
 }

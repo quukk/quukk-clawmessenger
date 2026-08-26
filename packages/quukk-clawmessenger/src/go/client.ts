@@ -256,7 +256,6 @@ export class BridgeClient implements BridgeTaskPort {
           { method: 'GET', headers },
           context,
         );
-        context.clearDeadline();
         if (response.status !== 200) {
           throw await this.#responseError(response, context);
         }
@@ -485,6 +484,15 @@ export class BridgeClient implements BridgeTaskPort {
     const reader = response.body.getReader();
     const chunks: Uint8Array[] = [];
     let total = 0;
+    let complete = false;
+    let abortHandled = false;
+    const abortReader = () => {
+      if (abortHandled) return;
+      abortHandled = true;
+      void reader.cancel().catch(() => undefined);
+    };
+    context.signal.addEventListener('abort', abortReader, { once: true });
+    if (context.signal.aborted) abortReader();
     try {
       while (true) {
         const next = await reader.read();
@@ -493,9 +501,13 @@ export class BridgeClient implements BridgeTaskPort {
         if (total > maximumBytes) throw new BridgeClientError('response_too_large');
         chunks.push(next.value);
       }
+      if (context.signal.aborted) throw new BridgeClientError('request_aborted');
+      complete = true;
     } catch (error) {
-      await reader.cancel().catch(() => undefined);
       throw this.#normalizeError(error, context);
+    } finally {
+      context.signal.removeEventListener('abort', abortReader);
+      if (!complete) await reader.cancel().catch(() => undefined);
     }
     const output = new Uint8Array(total);
     let offset = 0;

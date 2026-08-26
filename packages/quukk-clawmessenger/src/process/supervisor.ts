@@ -373,7 +373,7 @@ export class BridgeSupervisor {
       const readinessPromise = this.#readReadiness(child, deadline, () => {
         protocolViolation = true;
         if (verified && managedClient !== undefined) {
-          void managedClient.shutdown().finally(() => {
+          void managedClient.shutdown().catch(() => undefined).then(() => {
             const running = this.#running;
             if (running !== undefined && running.child === child) running.generation.abort();
           });
@@ -468,11 +468,11 @@ export class BridgeSupervisor {
           if (next.byteLength > 0) laterOutput();
           return;
         }
-        bytes = Buffer.concat([bytes, next]);
-        if (bytes.byteLength > READINESS_LIMIT) {
+        if (next.byteLength > READINESS_LIMIT - bytes.byteLength) {
           fail('readiness_invalid');
           return;
         }
+        bytes = Buffer.concat([bytes, next]);
         const newline = bytes.indexOf(0x0a);
         if (newline === -1) return;
         if (newline !== bytes.byteLength - 1 || newline === 0 || bytes[newline - 1] === 0x0d) {

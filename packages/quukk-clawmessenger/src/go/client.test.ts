@@ -122,6 +122,23 @@ describe('parseSSE', () => {
       collect(parseSSE(byteChunks(`: ${'x'.repeat(29)}\r\n`), 32)),
     ).rejects.toMatchObject({ code: 'sse_frame_too_large' });
   });
+
+  it('rejects bare CR in fields, separators, chunk boundaries, and EOF', async () => {
+    const data = JSON.stringify(started());
+    const inputs: AsyncIterable<Uint8Array>[] = [
+      byteChunks(`id: 1\revent: started\ndata: ${data}\n\n`),
+      byteChunks(`id: 1\nevent: started\rdata: ${data}\n\n`),
+      byteChunks(`id: 1\nevent: started\ndata: ${data}\r\r`),
+      (async function* () {
+        yield encoder.encode('id: 1\r');
+        yield encoder.encode(`event: started\ndata: ${data}\n\n`);
+      })(),
+      byteChunks(': heartbeat\r'),
+    ];
+    for (const input of inputs) {
+      await expect(collect(parseSSE(input))).rejects.toBeInstanceOf(SSEProtocolError);
+    }
+  });
 });
 
 describe('BridgeClient trust boundary', () => {
@@ -416,6 +433,71 @@ describe('BridgeClient SSE lifecycle', () => {
     expect(new Headers(requests[1]?.headers).get('last-event-id')).toBe('1');
     expect(new Headers(requests[2]?.headers).get('last-event-id')).toBe('1');
     expect(delays).toEqual([1_500, 2_000]);
+  });
+
+  it('keeps the request deadline through a non-200 SSE error body and cancels it', async () => {
+    type Timer = { active: boolean; callback: () => void };
+    const timers = new Map<number, Timer>();
+    let timerID = 0;
+    let bodyController!: ReadableStreamDefaultController<Uint8Array>;
+    let bodyRead!: () => void;
+    let cancelled = 0;
+    const reading = new Promise<void>((resolve) => { bodyRead = resolve; });
+    const hanging = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          bodyController = controller;
+        },
+        pull() {
+          bodyRead();
+        },
+        cancel() {
+          cancelled += 1;
+        },
+      }),
+      {
+        status: 500,
+        headers: {
+          'cache-control': 'no-store',
+          'content-type': 'application/json; charset=utf-8',
+        },
+      },
+    );
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(hanging)
+      .mockResolvedValueOnce(jsonResponse({ error: 'task_not_found' }, 404));
+    const client = clientWith(fetchImpl, {
+      setTimeout: ((callback: () => void) => {
+        timerID += 1;
+        timers.set(timerID, { active: true, callback });
+        return timerID as unknown as ReturnType<typeof setTimeout>;
+      }) as typeof setTimeout,
+      clearTimeout: ((id: unknown) => {
+        const timer = timers.get(Number(id));
+        if (timer !== undefined) timer.active = false;
+      }) as typeof clearTimeout,
+    });
+    const next = client.events(taskId)[Symbol.asyncIterator]().next();
+    const outcome = next.then(
+      () => ({ kind: 'resolved' as const }),
+      (error: unknown) => ({ kind: 'rejected' as const, error }),
+    );
+    await reading;
+    const firstTimer = timers.get(1)!;
+    try {
+      expect(firstTimer.active).toBe(true);
+      firstTimer.callback();
+      await expect(outcome).resolves.toMatchObject({
+        kind: 'rejected',
+        error: { code: 'remote_error', remoteCode: 'task_not_found' },
+      });
+      expect(cancelled).toBe(1);
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    } finally {
+      if (cancelled === 0) bodyController.error(new Error('test cleanup'));
+      await outcome;
+    }
   });
 
   it('interrupts reconnect backoff when either lifecycle or call scope aborts', async () => {

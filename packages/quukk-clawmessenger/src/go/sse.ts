@@ -125,19 +125,15 @@ export async function* parseSSE(
       for (let index = start; index < end; index += 1) {
         const byte = chunk[index]!;
         if (pendingCR) {
-          if (byte === 0x0a) {
-            frameBytes += 1;
-            if (frameBytes > maximumBytes) {
-              throw new SSEProtocolError('sse_frame_too_large');
-            }
-            const message = finishLine();
-            if (message !== undefined) yield message;
-            pendingCR = false;
-            continue;
+          if (byte !== 0x0a) throw new SSEProtocolError();
+          frameBytes += 1;
+          if (frameBytes > maximumBytes) {
+            throw new SSEProtocolError('sse_frame_too_large');
           }
           const message = finishLine();
           if (message !== undefined) yield message;
           pendingCR = false;
+          continue;
         }
         frameBytes += 1;
         if (frameBytes > maximumBytes) throw new SSEProtocolError('sse_frame_too_large');
@@ -152,9 +148,6 @@ export async function* parseSSE(
       }
     }
   }
-  if (pendingCR) {
-    const message = finishLine();
-    if (message !== undefined) yield message;
-  }
+  if (pendingCR) throw new SSEProtocolError();
   if (line.length !== 0 || frame.fields !== 0) throw new SSEProtocolError();
 }
