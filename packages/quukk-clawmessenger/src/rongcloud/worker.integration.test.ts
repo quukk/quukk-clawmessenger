@@ -633,4 +633,21 @@ describe('injected worker runtime', () => {
     expect([...fixture.port.listeners.values()].every((listeners) => listeners.size === 0)).toBe(true);
     expect([...fixture.sdk.listeners.values()].every((listeners) => listeners.size === 0)).toBe(true);
   });
+
+  it('fences IPC before client cleanup can synchronously report offline', async () => {
+    const fixture = createRuntime();
+    await initialize(fixture);
+    const eventsBeforeClose = structuredClone(fixture.port.sent);
+
+    fixture.port.emit('disconnect');
+    expect(fixture.port.sent).toEqual(eventsBeforeClose);
+    await flush();
+
+    const firstDispose = fixture.runtime.dispose();
+    const secondDispose = fixture.runtime.dispose();
+    expect(secondDispose).toBe(firstDispose);
+    await firstDispose;
+    expect(fixture.port.sent).toEqual(eventsBeforeClose);
+    expect(fixture.exits).toEqual([0]);
+  });
 });

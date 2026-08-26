@@ -93,6 +93,7 @@ class Runtime implements WorkerRuntime {
   #started = false;
   #initializing = false;
   #active = false;
+  #closingStarted = false;
   #closing?: Promise<void>;
 
   constructor(options: WorkerRuntimeOptions) {
@@ -105,7 +106,7 @@ class Runtime implements WorkerRuntime {
   }
 
   start(): void {
-    if (this.#started || this.#closing) return;
+    if (this.#started || this.#closingStarted) return;
     this.#started = true;
     this.#port.on('message', this.#onPortMessage);
     this.#port.on('disconnect', this.#onPortDisconnect);
@@ -119,7 +120,7 @@ class Runtime implements WorkerRuntime {
   }
 
   async #receive(input: unknown): Promise<void> {
-    if (this.#closing) return;
+    if (this.#closingStarted) return;
     const parsed = parseWorkerCommand(input);
     if (!parsed.ok) {
       await this.#close(1, true);
@@ -153,10 +154,10 @@ class Runtime implements WorkerRuntime {
       nodeId: command.binding.nodeId,
       refreshToken: () => this.#requestRefresh(),
       onConnection: (state) => {
-        if (!this.#closing) this.#emit({ type: 'connection', ...this.#identity(), state });
+        if (!this.#closingStarted) this.#emit({ type: 'connection', ...this.#identity(), state });
       },
       onMessage: (message) => {
-        if (!this.#closing) this.#emit({ type: 'message', ...this.#identity(), message });
+        if (!this.#closingStarted) this.#emit({ type: 'message', ...this.#identity(), message });
       },
     });
     this.#client = client;
@@ -164,12 +165,12 @@ class Runtime implements WorkerRuntime {
       client.init({ appKey: command.binding.appKey, token: command.token });
       this.#emit({ type: 'ready', ...this.#identity() });
       await client.connect();
-      if (this.#closing) return;
+      if (this.#closingStarted) return;
       this.#initializing = false;
       this.#active = true;
       this.#clearInitTimer();
     } catch (error) {
-      if (!this.#closing) {
+      if (!this.#closingStarted) {
         const code = fixedErrorCode(error, 'connect_failed');
         this.#emit({
           type: 'connection',
@@ -182,7 +183,7 @@ class Runtime implements WorkerRuntime {
   }
 
   #requestRefresh(): Promise<string | undefined> {
-    if (this.#closing || !this.#runtimeId) return Promise.resolve(undefined);
+    if (this.#closingStarted || !this.#runtimeId) return Promise.resolve(undefined);
     const requestId = `refresh_${++this.#refreshSequence}_${randomBytes(8).toString('hex')}`;
     return new Promise((resolve) => {
       const timer = this.#setTimeout(() => {
@@ -290,6 +291,7 @@ class Runtime implements WorkerRuntime {
   }
 
   #emit(event: WorkerEvent): void {
+    if (this.#closingStarted) return;
     const parsed = parseWorkerEvent(event);
     if (!parsed.ok) {
       void this.#close(1, true);
@@ -308,7 +310,8 @@ class Runtime implements WorkerRuntime {
 
   #close(exitCode: number | undefined, callExit: boolean): Promise<void> {
     if (this.#closing) return this.#closing;
-    const closing = (async () => {
+    this.#closingStarted = true;
+    const closing = Promise.resolve().then(async () => {
       this.#active = false;
       this.#initializing = false;
       this.#clearInitTimer();
@@ -335,7 +338,7 @@ class Runtime implements WorkerRuntime {
       this.#client = undefined;
       this.#runtimeId = undefined;
       if (callExit && exitCode !== undefined) this.#exit(exitCode);
-    })();
+    });
     this.#closing = closing;
     return closing;
   }
