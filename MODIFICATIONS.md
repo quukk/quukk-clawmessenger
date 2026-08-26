@@ -17,5 +17,7 @@
 
 - `.gitignore`: excludes a repository-local Quukk ClawMessenger runtime-data directory.
 - `docs/superpowers/specs/2026-08-26-quukk-clawmessenger-fork-design.md`: records the initial workspace scaffold and its intentionally limited scope.
+- `pnpm-workspace.yaml`: adds the catalog-pinned Vite version required by the Bridge UI workspace.
+- `pnpm-lock.yaml`: records only the Task 1 workspace importers and their resolved tooling dependencies.
 
 New fork-specific files are listed in this task's commit and do not replace upstream source files.

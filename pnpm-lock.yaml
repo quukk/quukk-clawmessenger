@@ -18939,7 +18939,7 @@ snapshots:
       picomatch: 4.0.5
       smol-toml: 1.8.0
       strip-json-comments: 5.0.3
-      tinyglobby: 0.2.15
+      tinyglobby: 0.2.17
       unbash: 4.0.10
       yaml: 2.9.0
       zod: 4.4.3
@@ -20170,7 +20170,7 @@ snapshots:
       proc-log: 5.0.0
       semver: 7.7.4
       tar: 7.5.13
-      tinyglobby: 0.2.17
+      tinyglobby: 0.2.15
       which: 5.0.0
     transitivePeerDependencies:
       - supports-color
