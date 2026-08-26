@@ -1,15 +1,15 @@
-# Multica ClawMessenger Edition fork 设计规格
+# Quukk ClawMessenger fork 设计规格
 
-> 本文描述基于 Multica 上游仓库的社区衍生版。项目保留完整上游历史、Multica License、NOTICE、Multica 产品名、Logo、版权与界面归属；新增名称仅作为 "ClawMessenger Edition" 后缀。本文不是商业许可或品牌豁免。
+> 本文描述基于 Multica 上游仓库的社区衍生版。项目保留完整上游历史、Multica License、NOTICE、Multica 产品名、Logo、版权与界面归属；`Quukk ClawMessenger` 是附加的衍生版名称，不替换派生 UI 中必须保留的 Multica 品牌。本文不是商业许可或品牌豁免。
 
 ## 1. 决策摘要
 
-本项目采用 **fork 路线**：在 Multica 完整 monorepo 上增量实现 ClawMessenger 接入，不把几个现有 npm 包机械拼装成一个大进程，也不重写 Multica 已有的智能体运行时。
+Quukk ClawMessenger 采用 **fork 路线**：在 Multica 完整 monorepo 上增量实现 ClawMessenger 接入，不把几个现有 npm 包机械拼装成一个大进程，也不重写 Multica 已有的智能体运行时。
 
 用户只需要安装一个公开入口包：
 
 ```bash
-npm install -g @quukk/multica-clawmessenger
+npm install -g quukk-clawmessenger
 ```
 
 安装后的交互式桌面环境会启动本地服务并打开浏览器；非交互环境、CI、禁用 lifecycle scripts 的 npm 配置不会自动弹窗，用户可执行 `multica-clawmessenger setup` 获得同样结果。首次页面展示本机检测到的 OpenCode、OpenClaw、Codex 与 Hermes 运行时，用户选择一个或全部后，系统为每个所选运行时幂等注册一个独立融云用户，并启动对应消息桥。
@@ -56,7 +56,7 @@ npm install -g @quukk/multica-clawmessenger
 
 `postinstall` 只在同时满足以下条件时异步启动设置页：全局安装、桌面会话、非 CI、未设置禁用自动打开页面的环境变量。它不等待用户输入，不注册账号，不阻塞 npm。其他情况打印一条简短命令提示。
 
-禁用变量固定为 `CLAWMESSENGER_NO_OPEN=1`，便于企业部署、自动化脚本和问题复现使用。
+禁用变量固定为 `QUUKK_CLAWMESSENGER_NO_OPEN=1`，便于企业部署、自动化脚本和问题复现使用。
 
 本地服务绑定随机可用端口并仅监听 `127.0.0.1` / `::1`。浏览器 URL 带一次性启动票据；页面兑换后 URL 中的票据立即失效并被移除。
 
@@ -89,7 +89,7 @@ ClawMessenger App / 小程序
             │ RongCloud IM
             ▼
 ┌──────────────────────────────────────────────┐
-│ @quukk/multica-clawmessenger (Node.js)       │
+│ quukk-clawmessenger (Node.js)                │
 │  local UI/API · identity registry · router   │
 │  one RongCloud worker per enabled runtime    │
 └──────────────────────┬───────────────────────┘
@@ -105,9 +105,9 @@ ClawMessenger App / 小程序
 
 ### 4.1 新增包与模块
 
-#### `packages/clawmessenger-bridge`
+#### `packages/quukk-clawmessenger`
 
-发布为 `@quukk/multica-clawmessenger`，包含：
+发布为 `quukk-clawmessenger`，包含：
 
 - CLI：`setup`、`start`、`stop`、`status`、`logs`、`doctor`、`rescan`。
 - 本地 HTTP 服务和静态设置页资源。
@@ -119,9 +119,9 @@ ClawMessenger App / 小程序
 
 #### `apps/bridge`
 
-使用 React/Vite 构建 Bridge mode 的本地静态界面，复用 `packages/ui` 的视觉组件和 `packages/core` 的纯类型/解析器，页面自身不依赖 Multica Server 或数据库。构建产物由 `packages/clawmessenger-bridge` 提供，不启动单独前端开发服务器。
+使用 React/Vite 构建 Bridge mode 的本地静态界面，复用 `packages/ui` 的视觉组件和 `packages/core` 的纯类型/解析器，页面自身不依赖 Multica Server 或数据库。构建产物由 `packages/quukk-clawmessenger` 提供，不启动单独前端开发服务器。派生 UI 的品牌区域继续显示 Multica，并在相邻位置增加 `Quukk ClawMessenger` 标识。
 
-#### `packages/clawmessenger-runtime-*`
+#### `packages/quukk-clawmessenger-runtime-*`
 
 平台专用实现包只携带二进制与 SHA-256 构建清单，作为入口包的 optional dependencies：Windows x64/arm64、macOS x64/arm64、Linux glibc x64/arm64。入口包校验平台、架构、版本与清单哈希后才启动二进制。缺少匹配包时给出可执行的修复提示，不回退到未经校验的网络下载。
 
@@ -204,7 +204,7 @@ Node 桥向 Go Bridge API 提交 runtime ID、conversation key、prompt、工作
 运行数据使用独立目录，避免污染上游 Multica 与现有单 provider 插件：
 
 ```text
-~/.multica-clawmessenger/
+~/.quukk-clawmessenger/
   config.json
   credentials.json
   sessions.json
@@ -214,9 +214,9 @@ Node 桥向 Go Bridge API 提交 runtime ID、conversation key、prompt、工作
   run/daemon.pid
 ```
 
-Windows 使用用户 ACL，Unix 文件权限为 `0600`、目录为 `0700`。JSON 采用临时文件 + fsync + 原子替换；进程崩溃不会留下半份凭据。每个 RongCloud worker 使用 `~/.multica-clawmessenger/rongcloud/<runtimeId>/` 作为独立 SDK 存储空间。日志结构化记录 binding、provider、conversation 和 task ID，但永不记录融云 token、完整 prompt、授权票据或环境变量。`doctor --json` 默认脱敏。
+Windows 使用用户 ACL，Unix 文件权限为 `0600`、目录为 `0700`。JSON 采用临时文件 + fsync + 原子替换；进程崩溃不会留下半份凭据。每个 RongCloud worker 使用 `~/.quukk-clawmessenger/rongcloud/<runtimeId>/` 作为独立 SDK 存储空间。日志结构化记录 binding、provider、conversation 和 task ID，但永不记录融云 token、完整 prompt、授权票据或环境变量。`doctor --json` 默认脱敏。
 
-配置优先级固定为：CLI 参数 > `CLAWMESSENGER_*` 环境变量 > 配置文件 > 内置默认值。默认 ClawMessenger 服务地址为 `https://newsradar.dreamdt.cn/im`，允许在设置页和 CLI 显式覆盖。启动时检测旧的单 provider 配置，只展示可导入项并要求用户确认；导入成功前不移动或删除旧文件。
+配置优先级固定为：CLI 参数 > `QUUKK_CLAWMESSENGER_*` 环境变量 > 配置文件 > 内置默认值。默认 ClawMessenger 服务地址为 `https://newsradar.dreamdt.cn/im`，允许在设置页和 CLI 显式覆盖。启动时检测旧的单 provider 配置，只展示可导入项并要求用户确认；导入成功前不移动或删除旧文件。
 
 Node supervisor 只管理自己启动的 Go 守护进程和 RongCloud worker 子进程，并通过 PID、进程创建时间和随机实例 ID 三者共同校验，避免杀错复用 PID 的进程。`stop` 先通知所有 worker 正常断开，再关闭 Go 守护进程，超时后才终止已验证的子进程树。
 
@@ -236,7 +236,7 @@ Node supervisor 只管理自己启动的 Go 守护进程和 RongCloud worker 子
 
 1. Git 历史完整保留；fork 基线为上游 commit `54027ba763fa7da0699b2fe89df4a6b2c13d1c6f`。原仓库远端命名为 `upstream`，业务开发位于 `codex/clawmessenger-fork` 及后续 `codex/*` 分支，禁止向 `upstream` 推送 fork 发布提交。
 2. 仓库、源码发布物、二进制发布物和 npm tarball 均携带完整、未删减的 Multica `LICENSE` 与 `NOTICE`。
-3. 任何从 `apps/web`、`apps/desktop`、`apps/mobile`、`packages/views`、`packages/ui` 派生的界面继续展示 Multica Logo、产品名、版权和归属；“ClawMessenger Edition”只作附加说明。
+3. 任何从 `apps/web`、`apps/desktop`、`apps/mobile`、`packages/views`、`packages/ui` 派生的界面继续展示 Multica Logo、产品名、版权和归属；`Quukk ClawMessenger` 只作相邻的附加衍生版标识。
 4. 用户文档明确写明“Built on Multica”，链接到 `https://github.com/multica-ai/multica`。
 5. 修改上游既有源文件时添加适合该文件格式的显著修改说明，并维护 `MODIFICATIONS.md`；优先通过新增文件和现有扩展点减少上游改动。
 6. 社区 fork、内部使用和源码分发按当前 Multica License 执行。公开托管、商业嵌入或商业分发在未取得 Multica, Inc. 的书面商业许可前不进入发布范围；去除/修改品牌还需要单独的书面 branding waiver。
@@ -276,10 +276,10 @@ CI 构建 Windows x64/arm64、macOS x64/arm64、Linux glibc x64/arm64；每个�
 3. `pnpm test`、`pnpm typecheck`、Go 测试、lint、UI 测试和安装矩阵全部通过。
 4. 对每个 npm tarball 执行 `npm pack --dry-run` 审计，确认只含预期文件、完整 LICENSE/NOTICE、来源链接和修改说明。
 5. 从 tarball 在干净临时目录安装，验证首次设置、四 provider fake 探测、独立注册和停止卸载路径。
-6. 先发布平台包，再发布 `@quukk/multica-clawmessenger` 的 prerelease 版本；小范围验证后升为 stable。
+6. 先发布平台包，再发布 `quukk-clawmessenger` 的 prerelease 版本；小范围验证后升为 stable。
 7. 真正执行 `npm publish` 前再次确认 npm 登录身份、`@quukk` scope 权限、2FA、目标 tag 和版本号。发布属于不可轻易撤回的外部操作，必须由用户在当次会话明确确认。
 
-截至 2026-08-26，`@quukk/multica-clawmessenger` 在 npm registry 返回 404，可作为本设计的入口包名；发布前仍需重新检查占用状态。
+截至 2026-08-26，`quukk-clawmessenger` 在 npm 官方 registry 返回 404，可作为本设计的入口包名；发布前仍需重新检查占用状态。
 
 ## 11. 完成定义
 
