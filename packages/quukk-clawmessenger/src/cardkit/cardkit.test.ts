@@ -528,6 +528,11 @@ describe('CardKit shared wire fixture and provenance gate', () => {
     for (const evidence of [
       '79155a50592f113496ae9b5da16c18d2405d581f',
       '710b46e02c5797dee61bd8387edc5e59c5c30b41e76687e802b19532f0cfe027',
+      '74967a1e16cd6c6642bd79f892ee13049e518316',
+      '5b924f08014926df5491fe0f96d7228eb73d1b7d',
+      '39556df67918efdba661ff283d832af0857f61f30cc8bbb4bbc87f62307be137',
+      'e3ed3dc7dd7b7067ee0dc9aea2fec72939eb1f7c',
+      '7f80c05fc0ff4e9dfec64822b5a4f4a75d5e629cae48b3e918a754141a511f4a',
       '9ccf1f404fbf9e3a3fcc29f08316043832cd0d93',
       '96950ede1c5522d085d63d702ef76ea2161f2c91507cde2e371875785f5dfc4d',
       '33900f70684573574c1cbbd9434af1e77565fe8b',

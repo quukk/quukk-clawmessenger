@@ -24,9 +24,11 @@ interface WireFixture {
   frames: string[];
 }
 
-const fixture = JSON.parse(
-  readFileSync(new URL('./fixtures/discussion-wire-cross-runtime.json', import.meta.url), 'utf8'),
-) as WireFixture;
+const fixtureSource = readFileSync(
+  new URL('./fixtures/discussion-wire-cross-runtime.json', import.meta.url),
+  'utf8',
+);
+const fixture = JSON.parse(fixtureSource) as WireFixture;
 
 function payloadAtBytes(bytes: number): Record<string, unknown> {
   const payload = { content: 'x'.repeat(bytes - 14) };
@@ -91,9 +93,13 @@ describe('discussion wire encoder', () => {
 });
 
 describe('discussion wire reassembler', () => {
-  it('reassembles the MIT cross-runtime fixture byte-for-byte out of order', () => {
+  it('consumes the byte-for-byte Codex/OpenClaw/server shared fixture out of order', () => {
+    expect(Buffer.byteLength(fixtureSource, 'utf8')).toBe(34_218);
+    expect(createHash('sha256').update(fixtureSource).digest('hex'))
+      .toBe('710b46e02c5797dee61bd8387edc5e59c5c30b41e76687e802b19532f0cfe027');
     const wire = new DiscussionWireReassembler();
-    const results = [...fixture.frames].reverse().map((frame) => wire.accept('python-node', JSON.parse(frame)));
+    const results = [...fixture.frames].reverse()
+      .map((frame) => wire.acceptSerialized('python-node', frame));
 
     expect(results[0]).toEqual({ status: 'incomplete' });
     expect(results[1]).toEqual({

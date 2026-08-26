@@ -33,12 +33,20 @@ All fixtures in this directory are offline protocol data. They contain no creden
 
 ## `discussion-wire-cross-runtime.json`
 
-- Source repository: https://github.com/quukk/codex-clawmessenger
-- Pinned commit: `3f3a2e4d6a8cb143a0088350aed2e1b4d1675473`
-- Source path: `test/fixtures/discussion_wire_cross_runtime.json`
-- Git blob SHA-1: `79155a50592f113496ae9b5da16c18d2405d581f`
-- Source and local fixture SHA-256: `710b46e02c5797dee61bd8387edc5e59c5c30b41e76687e802b19532f0cfe027`
-- Adaptation: none; copied byte-for-byte under MIT to preserve deterministic cross-runtime Base64 and SHA-256 evidence.
+- Original generator/server repository: https://github.com/quukk/clawmessenger-server
+- Server origin commit: `74967a1e16cd6c6642bd79f892ee13049e518316`
+- Server path: `tests/fixtures/discussion_wire_cross_runtime.json`
+- Server Git blob SHA-1: `79155a50592f113496ae9b5da16c18d2405d581f`
+- Server fixture SHA-256: `710b46e02c5797dee61bd8387edc5e59c5c30b41e76687e802b19532f0cfe027`; byte length: `34218`
+- Codex consumer repository: https://github.com/quukk/codex-clawmessenger
+- Codex pinned commit: `3f3a2e4d6a8cb143a0088350aed2e1b4d1675473`
+- Codex fixture path: `test/fixtures/discussion_wire_cross_runtime.json`; Git blob SHA-1: `79155a50592f113496ae9b5da16c18d2405d581f`; SHA-256: `710b46e02c5797dee61bd8387edc5e59c5c30b41e76687e802b19532f0cfe027`
+- OpenClaw consumer repository: https://github.com/quukk/clawmessenger
+- OpenClaw pinned commit: `a50f2393213f6f1c42da139491d2fe20937e7c7a`
+- OpenClaw `src/__tests__/discussion-wire.test.ts` reads and consumes the same server Python fixture: Git blob SHA-1 `5b924f08014926df5491fe0f96d7228eb73d1b7d`; source SHA-256 `39556df67918efdba661ff283d832af0857f61f30cc8bbb4bbc87f62307be137`
+- OpenClaw `src/discussion/wire.ts`: Git blob SHA-1 `e3ed3dc7dd7b7067ee0dc9aea2fec72939eb1f7c`; source SHA-256 `7f80c05fc0ff4e9dfec64822b5a4f4a75d5e629cae48b3e918a754141a511f4a`
+- Local fixture SHA-256: `710b46e02c5797dee61bd8387edc5e59c5c30b41e76687e802b19532f0cfe027`; byte length: `34218`
+- Adaptation: none; copied byte-for-byte under MIT. The local wire test consumes the exact serialized frames through `acceptSerialized`, verifies the fixture hash and size, and checks deterministic Base64/SHA-256 reassembly. This records the server/Codex/OpenClaw compatibility chain without importing or executing either sibling repository.
 
 ## `cardkit-wire.json`
 
