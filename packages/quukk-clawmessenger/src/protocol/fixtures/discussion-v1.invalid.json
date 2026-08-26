@@ -1,0 +1,74 @@
+[
+  {
+    "name": "unknown top-level key",
+    "value": {
+      "msg_type": "discussion_token",
+      "service": "openclaw_coord",
+      "discussion_id": "discussion-1",
+      "version": 1,
+      "action": "heartbeat",
+      "payload": {
+        "group_id": "group-1",
+        "turn_order": ["node-a"],
+        "current_speaker": "node-a",
+        "round": 1,
+        "max_rounds": 1,
+        "originator_user": "user-1",
+        "originator_text": "topic",
+        "originator_msg_uid": "origin-1",
+        "started_at": 1723950000000,
+        "mention_ordered": false
+      },
+      "timestamp": 1723950000100,
+      "unexpected": true
+    }
+  },
+  {
+    "name": "duplicate participant",
+    "value": {
+      "msg_type": "discussion_token",
+      "service": "openclaw_coord",
+      "discussion_id": "discussion-1",
+      "version": 1,
+      "action": "pass_turn",
+      "payload": {
+        "group_id": "group-1",
+        "turn_order": ["node-a", "node-a"],
+        "current_speaker": "node-a",
+        "next_speaker": "node-a",
+        "round": 1,
+        "max_rounds": 1,
+        "originator_user": "user-1",
+        "originator_text": "topic",
+        "originator_msg_uid": "origin-1",
+        "started_at": 1723950000000,
+        "mention_ordered": false
+      },
+      "timestamp": 1723950000100
+    }
+  },
+  {
+    "name": "end token carries next speaker",
+    "value": {
+      "msg_type": "discussion_token",
+      "service": "openclaw_coord",
+      "discussion_id": "discussion-1",
+      "version": 1,
+      "action": "end_discussion",
+      "payload": {
+        "group_id": "group-1",
+        "turn_order": ["node-a", "node-b"],
+        "current_speaker": "node-b",
+        "next_speaker": "node-a",
+        "round": 1,
+        "max_rounds": 1,
+        "originator_user": "user-1",
+        "originator_text": "topic",
+        "originator_msg_uid": "origin-1",
+        "started_at": 1723950000000,
+        "mention_ordered": false
+      },
+      "timestamp": 1723950000100
+    }
+  }
+]
