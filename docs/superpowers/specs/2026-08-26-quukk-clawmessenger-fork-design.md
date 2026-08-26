@@ -29,7 +29,7 @@ npm install -g quukk-clawmessenger
 
 1. 新项目保留 Multica 上游 Git 历史，并使用 `upstream` 指向原仓库。
 2. 一个面向用户的 npm 入口包覆盖 Windows、macOS、Linux 的 x64/arm64 桌面环境。
-3. 自动检测 OpenCode、OpenClaw、Codex、Hermes；检测结果区分 `ready`、`needs_auth`、`found_not_runnable`、`not_found`。
+3. 自动检测 OpenCode、OpenClaw、Codex、Hermes；检测结果区分 `ready`、`found_not_runnable`、`not_found`、`probe_failed`。`ready` 只表示 CLI 已安装且版本探针可运行；首次任务返回明确认证错误后，运行状态转为 `needs_auth`。
 4. 首次安装后在可交互桌面环境自动打开本地设置页；所有环境均可用显式 CLI 命令完成设置。
 5. 用户可以选择单个、多个或全部已检测运行时，未选择的运行时不注册、不联网、不启动。
 6. 每个所选运行时获得独立的融云用户、token、会话存储、运行状态和故障隔离。
@@ -65,7 +65,7 @@ npm install -g quukk-clawmessenger
 设置页采用四步流程：
 
 1. **检测**：展示四种 provider 的图标、版本、可执行文件来源、认证状态和诊断信息。
-2. **选择**：默认勾选所有 `ready` 运行时；用户可逐个取消或全选。`needs_auth` 可查看本地登录命令但不可直接注册。
+2. **选择**：默认勾选所有 `ready` 运行时；用户可逐个取消或全选。曾在任务执行中确认认证失败的 `needs_auth` 运行时可查看本地登录提示，但不可直接注册。
 3. **注册**：按 provider 独立执行注册，逐项展示进行中、成功或可重试错误；部分成功不会回滚已经成功的其他运行时。
 4. **完成**：展示已上线的智能体列表和入口，允许稍后重新扫描、启停或注销单个运行时。
 
@@ -140,18 +140,18 @@ ClawMessenger App / 小程序
 - `POST /v1/tasks/{id}/cancel`：取消完整进程树。
 - `GET /healthz`：报告版本、启动时间和探测器状态。
 
-所有端点要求安装时生成的 bearer secret；守护进程拒绝非 loopback 请求。默认测试注入 fake executable，不执行环境中的真实 CLI。
+所有端点要求安装时生成的 bearer secret；守护进程拒绝非 loopback 请求。Node 控制面负责维护用户授权的工作目录根目录，并只向 Go 提交这些根目录内已经规范化且真实存在的路径。默认测试注入 fake executable，不执行环境中的真实 CLI。
 
 ### 4.2 provider 适配
 
 | Provider | 主协议 | 探测依据 | 关键行为 |
 | --- | --- | --- | --- |
 | OpenCode | `opencode run --format json`；已有 server 模式可作为后续优化 | PATH、已知安装目录、版本探针 | 解析 JSON 事件；按会话恢复；拒绝恢复时新建一次 |
-| OpenClaw | `openclaw agent --json` | PATH、OpenClaw 配置目录、版本探针 | 使用 agent JSON 输出；保留网关能力但 Bridge mode 不依赖网关插件安装 |
+| OpenClaw | `openclaw agent --json` | PATH、版本探针 | 使用 agent JSON 输出；当前 adapter 只保证任务结束后的最终结果，不承诺 token 级增量；Bridge mode 不依赖网关插件安装 |
 | Codex | Codex app-server JSON-RPC | PATH、常见安装入口、版本探针 | 线程创建/恢复、审批事件、容量错误分类、进程树取消 |
 | Hermes | ACP | PATH、Hermes 配置目录、版本探针 | 标准 ACP 会话；认证缺失映射为 `needs_auth` |
 
-探测不使用 shell 字符串拼接。每个候选可执行文件用参数数组启动，限制并发、单次探针超时和输出大小；路径覆盖必须是绝对文件路径。结果带来源优先级并选择一个主候选：用户覆盖 > PATH > 已知安装目录。重新扫描不会改变已启用 runtime ID，除非原路径已不可用。
+探测不使用 shell 字符串拼接。每个候选可执行文件用参数数组启动，限制并发、单次探针超时和输出大小；Bridge 路径覆盖必须是绝对文件路径。结果带来源优先级并选择一个主候选：用户覆盖 > 进程 PATH > 有缓存的登录 shell PATH > Codex macOS app bundle。重新扫描不会改变已启用 runtime ID，除非原路径已不可用。瞬时探针超时使用 `probe_failed`，不会被误报成已确认不可运行。
 
 ### 4.3 运行时与融云身份模型
 
@@ -191,13 +191,13 @@ type RuntimeBinding = {
 
 ### 5.2 执行
 
-Node 桥向 Go Bridge API 提交 runtime ID、conversation key、prompt、工作目录和允许的上下文。Go 守护进程选择对应 adapter：存在有效 session handle 时恢复，否则新建；恢复被 provider 明确拒绝时最多自动新建一次，其他错误不盲目重试。
+Node 桥拥有 `sessions.json`，向 Go Bridge API 提交 runtime ID、conversation key、可选 `resume_session_id`、prompt、工作目录和允许的上下文。Go 守护进程选择对应 adapter：存在有效 session ID 时恢复，否则新建，并在事件中返回实际 session ID 供 Node 原子持久化；恢复被 provider 明确拒绝或被 Multica 现有窄兼容规则判定为不可恢复时最多自动新建一次，其他错误不盲目重试。
 
-标准事件模型为：`started`、`text_delta`、`tool_started`、`tool_finished`、`approval_required`、`status`、`completed`、`failed`、`cancelled`。Node 桥按现有 ClawMessenger 消息格式聚合和限流后发回融云。连接短暂中断时，当前任务继续执行并把有限事件写入环形缓冲；重连后发送最终状态，不无限持久化 token 流。
+标准事件模型为：`started`、`text_delta`、`tool_started`、`tool_finished`、`status`、`completed`、`failed`、`cancelled`。OpenClaw 当前只保证最终文本，其余 provider 按 adapter 实际能力提供增量事件。Node 桥按现有 ClawMessenger 消息格式聚合和限流后发回融云。连接短暂中断时，当前任务继续执行并把有限事件写入环形缓冲；重连后发送最终状态，不无限持久化 token 流。
 
-### 5.3 审批与控制
+### 5.3 权限与控制
 
-远程消息只能触发既有白名单动作。涉及文件写入、命令执行或权限提升的 provider 审批沿用本地智能体安全策略；ClawMessenger 卡片可以提交“允许/拒绝”结果，但不能把本地默认安全策略永久改为无限制。取消操作必须终止完整子进程树并产生 `cancelled` 终态。
+远程消息只能触发既有白名单动作。Multica 当前的四个 headless adapter 不暴露交互式审批接口：OpenCode 使用跳过权限参数，Codex 与 Hermes 在守护进程内处理审批请求。因此 v1 的 runtime capability 必须报告 `approval_events: false`，接入页面必须在注册前明确提示用户，不能把 CardKit 的权限按钮描述为真正的跨 provider 暂停审批。CardKit 权限消息仍按兼容协议解析并返回“不支持交互审批”的确定结果。取消操作通过现有进程所有权机制终止任务；在 Windows Job Object 无法取得所有权的受限环境中明确报告降级状态，不宣称绝对终止所有后代进程。
 
 ## 6. 配置、进程与日志
 
