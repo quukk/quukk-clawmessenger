@@ -5,6 +5,8 @@
  * See THIRD_PARTY_NOTICES.md.
  */
 
+import { isProxy } from 'node:util/types';
+
 export const MAX_RONGCLOUD_MESSAGE_BYTES = 64 * 1024;
 
 export const EXTERNAL_MESSAGE_TYPES = [
@@ -126,16 +128,137 @@ const rawContentKeys = new Set([
   'providers', 'messageId', 'sha256', 'chunkIndex', 'chunkCount', 'schema', 'card',
 ]);
 const invalidClone = Symbol('invalid-clone');
+const oversizedClone = Symbol('oversized-clone');
+const MAX_PASSIVE_JSON_ITEMS = 32_768;
+const MAX_PASSIVE_JSON_DEPTH = 32;
 const deviceControlCommands = new Set([
   'status', 'disable', 'stop', 'enable', 'start', 'delete', 'restart', 'rename_device',
 ]);
 
 function record(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (value === null || typeof value !== 'object' || Array.isArray(value) || isProxy(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function own(source: Record<string, unknown>, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(source, key);
+}
+
+interface PassiveCloneBudget {
+  items: number;
+  textBytes: number;
+  maxBytes: number;
+}
+
+type PassiveCloneResult = unknown | typeof invalidClone | typeof oversizedClone;
+
+function accountText(value: string, budget: PassiveCloneBudget): typeof oversizedClone | null {
+  if (value.length > budget.maxBytes) return oversizedClone;
+  budget.textBytes += Buffer.byteLength(value, 'utf8');
+  return budget.textBytes > budget.maxBytes ? oversizedClone : null;
+}
+
+function clonePassiveJson(
+  value: unknown,
+  budget: PassiveCloneBudget,
+  ancestors: Set<object>,
+  depth = 0,
+): PassiveCloneResult {
+  if (value === null || typeof value === 'boolean') return value;
+  if (typeof value === 'string') return accountText(value, budget) ?? value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : invalidClone;
+  if (typeof value !== 'object' || value === null || isProxy(value)) return invalidClone;
+  if (depth >= MAX_PASSIVE_JSON_DEPTH || ancestors.has(value)) return invalidClone;
+  budget.items += 1;
+  if (budget.items > MAX_PASSIVE_JSON_ITEMS) return oversizedClone;
+
+  ancestors.add(value);
+  if (Array.isArray(value)) {
+    if (value.length > MAX_PASSIVE_JSON_ITEMS) {
+      ancestors.delete(value);
+      return oversizedClone;
+    }
+    budget.items += value.length;
+    if (budget.items > MAX_PASSIVE_JSON_ITEMS) {
+      ancestors.delete(value);
+      return oversizedClone;
+    }
+    const result: unknown[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+        ancestors.delete(value);
+        return invalidClone;
+      }
+      const cloned = clonePassiveJson(descriptor.value, budget, ancestors, depth + 1);
+      if (cloned === invalidClone || cloned === oversizedClone) {
+        ancestors.delete(value);
+        return cloned;
+      }
+      result.push(cloned);
+    }
+    for (const key of Object.getOwnPropertyNames(value)) {
+      if (key === 'length' || /^(?:0|[1-9]\d*)$/.test(key)) continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+        ancestors.delete(value);
+        return invalidClone;
+      }
+    }
+    ancestors.delete(value);
+    return result;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    ancestors.delete(value);
+    return invalidClone;
+  }
+  const result: Record<string, unknown> = {};
+  const keys = Object.getOwnPropertyNames(value);
+  budget.items += keys.length;
+  if (budget.items > MAX_PASSIVE_JSON_ITEMS) {
+    ancestors.delete(value);
+    return oversizedClone;
+  }
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+      ancestors.delete(value);
+      return invalidClone;
+    }
+    if (!descriptor.enumerable || dangerousObjectKeys.has(key)) continue;
+    const keyBudget = accountText(key, budget);
+    if (keyBudget) {
+      ancestors.delete(value);
+      return keyBudget;
+    }
+    if (descriptor.value === undefined
+      || typeof descriptor.value === 'function'
+      || typeof descriptor.value === 'symbol') continue;
+    const cloned = clonePassiveJson(descriptor.value, budget, ancestors, depth + 1);
+    if (cloned === invalidClone || cloned === oversizedClone) {
+      ancestors.delete(value);
+      return cloned;
+    }
+    result[key] = cloned;
+  }
+  ancestors.delete(value);
+  return result;
+}
+
+type PassiveSnapshot =
+  | { ok: true; value: unknown; bytes: number }
+  | { ok: false; code: 'invalid' | 'too_large' };
+
+function passiveSnapshot(value: unknown, maxBytes = MAX_RONGCLOUD_MESSAGE_BYTES): PassiveSnapshot {
+  const cloned = clonePassiveJson(value, { items: 0, textBytes: 0, maxBytes }, new Set());
+  if (cloned === invalidClone) return { ok: false, code: 'invalid' };
+  if (cloned === oversizedClone) return { ok: false, code: 'too_large' };
+  const bytes = serializedBytes(cloned);
+  if (bytes === null) return { ok: false, code: 'invalid' };
+  return bytes > maxBytes ? { ok: false, code: 'too_large' } : { ok: true, value: cloned, bytes };
 }
 
 function serializedBytes(value: unknown): number | null {
@@ -321,14 +444,16 @@ function rebuildRawContent(
 }
 
 export function normalizeRongCloudMessage(raw: unknown): NormalizeMessageResult {
-  if (!record(raw)) return { ok: false, code: 'invalid_message' };
-  const bytes = serializedBytes(raw);
-  if (bytes === null) return { ok: false, code: 'invalid_message' };
-  if (bytes > MAX_RONGCLOUD_MESSAGE_BYTES) return { ok: false, code: 'message_too_large' };
+  const snapshot = passiveSnapshot(raw);
+  if (!snapshot.ok) {
+    return { ok: false, code: snapshot.code === 'too_large' ? 'message_too_large' : 'invalid_message' };
+  }
+  if (!record(snapshot.value)) return { ok: false, code: 'invalid_message' };
+  const safeRaw = snapshot.value;
 
-  const uid = alias(raw, ['messageUId', 'messageUID', 'messageUid', 'messageId'], identifier);
-  const sender = alias(raw, ['senderUserId', 'senderId'], identifier);
-  const objectName = alias(raw, ['messageType', 'objectName', 'messageName'], (value) => identifier(value, 128));
+  const uid = alias(safeRaw, ['messageUId', 'messageUID', 'messageUid', 'messageId'], identifier);
+  const sender = alias(safeRaw, ['senderUserId', 'senderId'], identifier);
+  const objectName = alias(safeRaw, ['messageType', 'objectName', 'messageName'], (value) => identifier(value, 128));
   if (!uid.ok || !sender.ok || !objectName.ok) {
     const conflict = (!uid.ok && uid.code === 'conflict')
       || (!sender.ok && sender.code === 'conflict')
@@ -336,24 +461,24 @@ export function normalizeRongCloudMessage(raw: unknown): NormalizeMessageResult 
     return { ok: false, code: conflict ? 'conflicting_alias' : 'invalid_identifier' };
   }
   if (uid.value === undefined) return { ok: false, code: 'missing_message_uid' };
-  const targetId = identifier(raw.targetId);
+  const targetId = identifier(safeRaw.targetId);
   if (!sender.value || !targetId || !objectName.value) return { ok: false, code: 'invalid_identifier' };
-  const normalizedConversationType = conversationType(raw.conversationType);
+  const normalizedConversationType = conversationType(safeRaw.conversationType);
   if (!normalizedConversationType) return { ok: false, code: 'invalid_conversation_type' };
-  const content = decodeContent(raw.content);
+  const content = decodeContent(safeRaw.content);
   if (!content) return { ok: false, code: 'invalid_content' };
   const attachments = normalizeAttachments(content.rawContent);
   const rawContent = content.rawContent
     ? rebuildRawContent(content.rawContent, attachments)
     : undefined;
 
-  const sentTime = raw.sentTime === undefined ? undefined : finiteNumber(raw.sentTime) ?? undefined;
-  const offline = typeof raw.isOffLineMessage === 'boolean'
-    ? raw.isOffLineMessage
-    : typeof raw.offline === 'boolean' ? raw.offline : undefined;
-  const direction = typeof raw.messageDirection === 'number' || typeof raw.messageDirection === 'string'
-    ? raw.messageDirection
-    : typeof raw.direction === 'number' || typeof raw.direction === 'string' ? raw.direction : undefined;
+  const sentTime = safeRaw.sentTime === undefined ? undefined : finiteNumber(safeRaw.sentTime) ?? undefined;
+  const offline = typeof safeRaw.isOffLineMessage === 'boolean'
+    ? safeRaw.isOffLineMessage
+    : typeof safeRaw.offline === 'boolean' ? safeRaw.offline : undefined;
+  const direction = typeof safeRaw.messageDirection === 'number' || typeof safeRaw.messageDirection === 'string'
+    ? safeRaw.messageDirection
+    : typeof safeRaw.direction === 'number' || typeof safeRaw.direction === 'string' ? safeRaw.direction : undefined;
 
   return {
     ok: true,
@@ -439,10 +564,14 @@ function validLegacySemantics(msgType: ExternalMessageType, value: Record<string
 }
 
 export function parseProtocolContent(input: unknown): ProtocolContentResult {
-  const bytes = serializedBytes(input);
-  if (bytes === null) return { kind: 'invalid', code: 'invalid_content' };
-  if (bytes > MAX_RONGCLOUD_MESSAGE_BYTES) return { kind: 'invalid', code: 'content_too_large' };
-  const unwrapped = unwrapProtocolValue(input);
+  const snapshot = passiveSnapshot(input);
+  if (!snapshot.ok) {
+    return {
+      kind: 'invalid',
+      code: snapshot.code === 'too_large' ? 'content_too_large' : 'invalid_content',
+    };
+  }
+  const unwrapped = unwrapProtocolValue(snapshot.value);
   if (!unwrapped) return { kind: 'invalid', code: 'invalid_content' };
   if (unwrapped.text !== undefined) return { kind: 'text', text: unwrapped.text };
   const value = unwrapped.value!;
@@ -500,28 +629,42 @@ export interface LegacyEnvelopeInput {
 }
 
 export function buildLegacyEnvelope(input: LegacyEnvelopeInput): Record<string, unknown> {
-  const requestId = input.requestId === undefined ? undefined : identifier(input.requestId);
-  const sourceImId = input.sourceImId === undefined ? undefined : identifier(input.sourceImId);
-  const destinationImId = input.destinationImId === undefined ? undefined : identifier(input.destinationImId);
-  if ((input.requestId !== undefined && !requestId)
-    || (input.sourceImId !== undefined && !sourceImId)
-    || (input.destinationImId !== undefined && !destinationImId)
-    || !Number.isSafeInteger(input.timestamp) || input.timestamp < 0) {
+  const snapshot = passiveSnapshot(input);
+  if (!snapshot.ok) {
+    if (snapshot.code === 'too_large') throw new RangeError('legacy content exceeds 64 KiB');
+    throw new TypeError('invalid active legacy content');
+  }
+  if (!record(snapshot.value)) throw new TypeError('invalid legacy envelope');
+  const safeInput = snapshot.value;
+  const msgType = safeInput.msgType;
+  if (msgType !== 'opencode_session_created'
+    && msgType !== 'device_status_report'
+    && msgType !== 'device_control_result') throw new TypeError('invalid legacy message type');
+  const requestId = safeInput.requestId === undefined ? undefined : identifier(safeInput.requestId);
+  const sourceImId = safeInput.sourceImId === undefined ? undefined : identifier(safeInput.sourceImId);
+  const destinationImId = safeInput.destinationImId === undefined ? undefined : identifier(safeInput.destinationImId);
+  if ((safeInput.requestId !== undefined && !requestId)
+    || (safeInput.sourceImId !== undefined && !sourceImId)
+    || (safeInput.destinationImId !== undefined && !destinationImId)
+    || !Number.isSafeInteger(safeInput.timestamp) || (safeInput.timestamp as number) < 0) {
     throw new TypeError('invalid legacy envelope');
   }
-  if ((input.msgType === 'device_status_report' || input.msgType === 'device_control_result')
+  if ((msgType === 'device_status_report' || msgType === 'device_control_result')
     && requestId === undefined) {
     throw new TypeError('legacy response requires request_id');
   }
-  const content = typeof input.content === 'string' ? input.content : JSON.stringify(input.content);
+  if (!own(safeInput, 'content')) throw new TypeError('invalid legacy content');
+  const content = typeof safeInput.content === 'string'
+    ? safeInput.content
+    : JSON.stringify(safeInput.content);
   if (content === undefined) throw new TypeError('invalid legacy content');
   const envelope: Record<string, unknown> = {
-    msg_type: input.msgType,
+    msg_type: msgType,
     ...(requestId ? { request_id: requestId } : {}),
     ...(sourceImId ? { source_im_id: sourceImId } : {}),
     ...(destinationImId ? { destination_im_id: destinationImId } : {}),
     content,
-    timestamp: input.timestamp,
+    timestamp: safeInput.timestamp,
   };
   const bytes = serializedBytes(envelope);
   if (bytes === null || bytes > MAX_RONGCLOUD_MESSAGE_BYTES) throw new RangeError('legacy envelope exceeds 64 KiB');

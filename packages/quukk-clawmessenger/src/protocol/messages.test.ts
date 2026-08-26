@@ -145,6 +145,39 @@ describe('normalizeRongCloudMessage', () => {
     });
   });
 
+  it('rejects active, cyclic and structurally huge envelopes before reading them', () => {
+    let getterReads = 0;
+    const getterEnvelope = { ...baseMessage, content: 'x' } as Record<string, unknown>;
+    Object.defineProperty(getterEnvelope, 'messageUId', {
+      enumerable: true,
+      get: () => {
+        getterReads += 1;
+        return 'active-message';
+      },
+    });
+    expect(normalizeRongCloudMessage(getterEnvelope)).toEqual({ ok: false, code: 'invalid_message' });
+    expect(getterReads).toBe(0);
+
+    let proxyReads = 0;
+    const proxyEnvelope = new Proxy({ ...baseMessage, content: 'x' }, {
+      get: (target, key, receiver) => {
+        proxyReads += 1;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    expect(normalizeRongCloudMessage(proxyEnvelope)).toEqual({ ok: false, code: 'invalid_message' });
+    expect(proxyReads).toBe(0);
+
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(normalizeRongCloudMessage({ ...baseMessage, content: cyclic }))
+      .toEqual({ ok: false, code: 'invalid_message' });
+    expect(normalizeRongCloudMessage({
+      ...baseMessage,
+      content: { values: new Array(100_000_000) },
+    })).toEqual({ ok: false, code: 'message_too_large' });
+  });
+
   it('rejects envelopes over 64 KiB before parsing nested content', () => {
     expect(normalizeRongCloudMessage({
       ...baseMessage,
@@ -248,6 +281,44 @@ describe('parseProtocolContent', () => {
       data: { card_state: { padding: 'x'.repeat(10 * 1024) } },
       timestamp: 1,
     })).toEqual({ kind: 'invalid', code: 'content_too_large' });
+  });
+
+  it('returns detached protocol values and rejects active or cyclic inputs without reading them', () => {
+    const direct = { msg_type: 'discussion_cancel', discussionId: 'discussion-1', reason: 'before' };
+    const parsed = parseProtocolContent(direct);
+    expect(parsed).toMatchObject({ kind: 'protocol', value: { reason: 'before' } });
+    if (parsed.kind !== 'protocol') throw new Error('expected protocol value');
+    expect(parsed.value).not.toBe(direct);
+    direct.reason = 'after';
+    expect(parsed.value.reason).toBe('before');
+
+    let getterReads = 0;
+    const getterProtocol: Record<string, unknown> = {};
+    Object.defineProperty(getterProtocol, 'msg_type', {
+      enumerable: true,
+      get: () => {
+        getterReads += 1;
+        return 'discussion_cancel';
+      },
+    });
+    expect(parseProtocolContent(getterProtocol)).toEqual({ kind: 'invalid', code: 'invalid_content' });
+    expect(getterReads).toBe(0);
+
+    let proxyReads = 0;
+    const proxyProtocol = new Proxy({ msg_type: 'discussion_cancel' }, {
+      get: (target, key, receiver) => {
+        proxyReads += 1;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    expect(parseProtocolContent(proxyProtocol)).toEqual({ kind: 'invalid', code: 'invalid_content' });
+    expect(proxyReads).toBe(0);
+
+    const cyclic: Record<string, unknown> = { msg_type: 'discussion_cancel' };
+    cyclic.self = cyclic;
+    expect(parseProtocolContent(cyclic)).toEqual({ kind: 'invalid', code: 'invalid_content' });
+    expect(parseProtocolContent({ msg_type: 'discussion_cancel', values: new Array(100_000_000) }))
+      .toEqual({ kind: 'invalid', code: 'content_too_large' });
   });
 
   it('ignores unknown and server-only message types instead of turning them into prompts', () => {
@@ -355,5 +426,33 @@ describe('slash commands and legacy builders', () => {
       content: { status: 'success' },
       timestamp: 125,
     })).toThrow(/request/i);
+  });
+
+  it('rejects active legacy builder content before invoking it', () => {
+    let getterReads = 0;
+    const activeContent: Record<string, unknown> = {};
+    Object.defineProperty(activeContent, 'status', {
+      enumerable: true,
+      get: () => {
+        getterReads += 1;
+        return 'success';
+      },
+    });
+    expect(() => buildLegacyEnvelope({
+      msgType: 'device_control_result', requestId: 'request-active', content: activeContent, timestamp: 1,
+    })).toThrow(/content/i);
+    expect(getterReads).toBe(0);
+
+    let proxyReads = 0;
+    const proxyContent = new Proxy({ status: 'success' }, {
+      get: (target, key, receiver) => {
+        proxyReads += 1;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    expect(() => buildLegacyEnvelope({
+      msgType: 'device_control_result', requestId: 'request-proxy', content: proxyContent, timestamp: 1,
+    })).toThrow(/content/i);
+    expect(proxyReads).toBe(0);
   });
 });
