@@ -1707,8 +1707,8 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		resp, deliveredCommentIDs, _, _, failure := h.buildClaimedTaskResponse(r, &task, rt, uuidToString(task.RuntimeID), rtWorkspaceID)
 		if failure != nil {
 			// Builder rejected this task (workspace isolation / chat-input);
-			// it has already cancelled the task where the failure requires it.
-			// Skip it — non-cancelling failures leave the task dispatched for
+			// it has already settled the task where the failure requires it.
+			// Skip it — non-settling failures leave the task dispatched for
 			// the reclaim path.
 			continue
 		}
@@ -2071,6 +2071,43 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			status:  http.StatusInternalServerError,
 			message: "failed to load task agent",
 		}
+	}
+	// The SQL claim narrows candidates and repeats the access predicate before
+	// changing task state, but Agent mutations do not stay locked through HTTP
+	// response assembly. Recheck the freshly loaded Agent here so a rebind or
+	// owner change that committed after the claim cannot reach the daemon.
+	if agent.RuntimeID != task.RuntimeID {
+		slog.Warn("daemon claim: agent runtime changed before delivery; refusing dispatch",
+			"task_id", uuidToString(task.ID),
+			"agent_id", uuidToString(task.AgentID),
+			"task_runtime_id", uuidToString(task.RuntimeID),
+			"agent_runtime_id", uuidToString(agent.RuntimeID),
+		)
+		return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
+			r.Context(), task,
+			"The agent moved to another runtime before this task could start. Retry the task to run it on the agent's current runtime.",
+			taskfailure.ReasonInvalidTaskIdentity,
+			"error_agent_runtime_changed", http.StatusConflict, "agent runtime changed before task delivery",
+		)
+	}
+	if runtime.Visibility == "private" && runtime.OwnerID.Valid &&
+		(!agent.OwnerID.Valid || agent.OwnerID != runtime.OwnerID) {
+		userMessage := "This private runtime cannot run the assigned agent because the agent and runtime have different owners."
+		if !agent.OwnerID.Valid {
+			userMessage = "This private runtime cannot run the assigned agent because the agent has no owner."
+		}
+		slog.Warn("daemon claim: private runtime no longer permits task agent; refusing dispatch",
+			"task_id", uuidToString(task.ID),
+			"agent_id", uuidToString(task.AgentID),
+			"runtime_id", runtimeID,
+			"agent_owner_valid", agent.OwnerID.Valid,
+		)
+		return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, h.failClaimedTaskBeforeLaunch(
+			r.Context(), task,
+			userMessage,
+			taskfailure.ReasonInvalidTaskIdentity,
+			"error_runtime_access_denied", http.StatusForbidden, "private runtime does not permit task agent",
+		)
 	}
 	useSkillRefs := requestHasClientCapability(r, protocol.DaemonCapabilitySkillBundlesV1)
 	var customEnv map[string]string
