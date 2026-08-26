@@ -11,7 +11,9 @@
 
 - `packages/quukk-clawmessenger`: publishable Node.js entry package for the local ClawMessenger bridge.
 - `apps/bridge`: private React/Vite workspace that builds local Bridge UI assets into the entry package.
-- This initial scaffold deliberately has no RongCloud, registration-server, daemon, or provider runtime implementation.
+- `server/internal/daemon/bridge*.go`: injected, bounded discovery for local OpenCode, OpenClaw, Codex, and Hermes runtimes, kept separate from the existing daemon lifecycle.
+- Agent probe output is retained up to 64 KiB so a noisy version command cannot grow daemon memory without bound.
+- RongCloud, task execution, registration transport, and Bridge HTTP endpoints remain intentionally unimplemented at this stage.
 
 ## External service prerequisite
 
@@ -23,5 +25,7 @@
 - `docs/superpowers/specs/2026-08-26-quukk-clawmessenger-fork-design.md`: records the initial workspace scaffold and its intentionally limited scope.
 - `pnpm-workspace.yaml`: adds the catalog-pinned Vite version required by the Bridge UI workspace.
 - `pnpm-lock.yaml`: records only the Task 1 workspace importers and their resolved tooling dependencies.
+- `server/pkg/agent/launch.go`: bounds synchronous probe output while preserving process ownership and timeout errors.
+- `server/pkg/agent/agent_test.go`: covers oversized version output and timeout precedence without executing an installed agent CLI.
 
 New fork-specific files are listed in this task's commit and do not replace upstream source files.

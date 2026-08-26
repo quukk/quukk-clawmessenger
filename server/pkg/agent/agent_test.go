@@ -1,7 +1,10 @@
 package agent
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +14,8 @@ import (
 	"testing"
 	"time"
 )
+
+const detectVersionOutputHelperEnv = "MULTICA_DETECT_VERSION_OUTPUT_HELPER"
 
 func TestNewReturnsClaudeBackend(t *testing.T) {
 	t.Parallel()
@@ -120,6 +125,64 @@ func TestDetectVersionFailsForMissingBinary(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing binary")
 	}
+}
+
+func TestDetectVersionRejectsOversizedOutput(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary: %v", err)
+	}
+	t.Setenv(detectVersionOutputHelperEnv, "oversized")
+
+	version, err := DetectVersion(context.Background(), NewCommand(self, []string{
+		"-test.run=^TestDetectVersionOutputLimitHelper$",
+		"--",
+	}))
+	if !errors.Is(err, bufio.ErrTooLong) {
+		t.Fatalf("DetectVersion error = %v, version bytes = %d, want output-limit classification", err, len(version))
+	}
+	if version != "" {
+		t.Fatalf("DetectVersion retained oversized output: %d bytes", len(version))
+	}
+	if strings.Contains(err.Error(), "secret-probe-output") || len(err.Error()) > 512 {
+		t.Fatalf("DetectVersion exposed probe output in error: %q", err)
+	}
+}
+
+func TestDetectVersionOutputLimitDoesNotMaskTimeout(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary: %v", err)
+	}
+	t.Setenv(detectVersionOutputHelperEnv, "timeout")
+	originalTimeout := detectVersionTimeout
+	detectVersionTimeout = 2 * time.Second
+	t.Cleanup(func() { detectVersionTimeout = originalTimeout })
+
+	version, err := DetectVersion(context.Background(), NewCommand(self, []string{
+		"-test.run=^TestDetectVersionOutputLimitHelper$",
+		"--",
+	}))
+	if err == nil || errors.Is(err, bufio.ErrTooLong) {
+		t.Fatalf("DetectVersion error = %v, want the execution timeout to take precedence", err)
+	}
+	if version != "" {
+		t.Fatalf("DetectVersion retained timed-out output: %d bytes", len(version))
+	}
+}
+
+func TestDetectVersionOutputLimitHelper(t *testing.T) {
+	mode := os.Getenv(detectVersionOutputHelperEnv)
+	if mode == "" {
+		t.Skip("helper process")
+	}
+	if _, err := os.Stdout.Write(bytes.Repeat([]byte("secret-probe-output\n"), 4<<10)); err != nil {
+		os.Exit(3)
+	}
+	if mode == "timeout" {
+		time.Sleep(time.Minute)
+	}
+	os.Exit(0)
 }
 
 // TestDetectVersionTimesOutOnHang guards MUL-3812: a CLI whose `--version`
