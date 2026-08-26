@@ -498,7 +498,7 @@ Persist three strict versioned documents: non-secret `config.json` (`serverUrl`,
 
 **Step 3: Add RED registration tests**
 
-Use a fake `fetch` to assert `GET /api/config/rongcloud`, four provider-specific `POST /api/ai/register` requests, and `POST /api/claw/refresh-token/{nodeId}`. Cover idempotent reuse of an existing node ID, partial success, exactly one retry for transient failures, no retry for validation/auth failures, strict response checks for business code, prefix, node type, non-empty token, AppKey, and this exact ordered capability tuple: `discussion_host`, `discussion_participant`, `artifact_markdown`, `artifact_html`, `discussion_roundtable`, `discussion_model_routing`.
+Use a fake `fetch` to assert `GET /api/config/rongcloud`, four provider-specific `POST /api/ai/register` requests, and `POST /api/claw/refresh-token/{nodeId}`. Register/refresh send `X-Node-Enrollment-Token`, derived as `qce_v1_` plus base64url HMAC-SHA256 using the decoded 32-byte Bridge secret and the full normalized server URL (including `/im`) plus runtime ID; the raw secret never crosses HTTP. Cover idempotent reuse of an existing node ID, partial success, exactly one retry for transient failures, no retry for validation/auth failures, strict response checks for business code, prefix, node type, non-empty token, AppKey, and this exact ordered capability tuple: `discussion_host`, `discussion_participant`, `artifact_markdown`, `artifact_html`, `discussion_roundtable`, `discussion_model_routing`.
 
 ```powershell
 & $pnpm --dir packages/quukk-clawmessenger exec vitest run src/registration/client.test.ts src/bindings/service.test.ts
@@ -506,7 +506,7 @@ Use a fake `fetch` to assert `GET /api/config/rongcloud`, four provider-specific
 
 **Step 4: Implement registration and binding service**
 
-Use `os.networkInterfaces()` to derive the existing service's MAC registration value; derive an injected stable, locally administered unicast fallback from the install ID when no hardware MAC is usable. Registration occurs only from an explicit `enableSelected(runtimeIds)` call whose IDs are resolved against one fresh trusted Go runtime snapshot; UI input never controls provider, path, node type, name, MAC, or capabilities. Permit at most one binding per provider. Write a new credential first, atomically switch the binding's `tokenRef` second, and remove the old credential last; persist each success independently. Disabling preserves identity/credential, explicit unregister removes them only locally, and refresh failure preserves the old credential.
+Use `os.networkInterfaces()` to derive the existing service's MAC registration value; derive an injected stable, locally administered unicast fallback from the install ID when no hardware MAC is usable. Registration occurs only from an explicit `enableSelected(runtimeIds)` call whose IDs are resolved against one fresh trusted Go runtime snapshot; UI input never controls provider, path, node type, name, MAC, capabilities, or enrollment proof. Permit at most one binding per provider and serialize every lifecycle operation for the same runtime while allowing different providers to progress independently. Write a new credential first, atomically switch the binding's `tokenRef` second, and remove the old credential last; persist each success independently. Disabling preserves identity/credential, explicit unregister removes them only locally, and refresh failure preserves the old credential.
 
 **Step 5: Run GREEN**
 
@@ -1017,6 +1017,7 @@ Exercise the actual Node service and Go Bridge HTTP boundary with fake runtime b
 - Session IDs survive restart.
 - One worker crash or registration failure does not affect others.
 - Cancel, reconnect, dedup, CardKit unsupported approval, diagnostics redaction, and graceful stop.
+- Enrollment proof never exposes the per-install Bridge secret; conflicting proof/identity responses fail closed, and every failure/log/snapshot remains free of token, AppKey, proof, MAC, install ID, prompt, and provider path details.
 
 No production network calls and no installed agent execution are allowed.
 
@@ -1043,6 +1044,8 @@ git diff --check
 git status --short
 ```
 
+Also run the ClawMessenger server security suites from the separately versioned server checkout. Publication remains blocked unless anonymous token routes are retired, public node responses/logs are redacted, enrollment is deployed in strict mode, OM/SaaS/config/download routes enforce node/owner authorization, and any previously exposed credentials have an approved rotation/revocation disposition.
+
 Capture exact failures; do not weaken a test merely to reach green.
 
 **Step 6: Request correctness and simplicity reviews**
@@ -1067,7 +1070,7 @@ git commit -m "test: verify Quukk ClawMessenger end to end"
 
 **Step 1: Recheck external release preconditions**
 
-Use the official npm registry to confirm `quukk-clawmessenger` and all six platform package names remain available. Verify current Multica license/NOTICE requirements against the retained upstream files and resolve the RongCloud 5.36.6 package-metadata versus bundled-license discrepancy before publishing.
+Use the official npm registry to confirm `quukk-clawmessenger` and all six platform package names remain available. Verify current Multica license/NOTICE requirements against the retained upstream files and resolve the RongCloud 5.36.6 package-metadata versus bundled-license discrepancy before publishing. Verify the production ClawMessenger server has no anonymous token retrieval/serialization/logging path, enrollment compatibility mode is disabled, owner/node authorization gates are active, shared edge size/rate limits are configured, and exposed-token rotation has been completed or explicitly dispositioned.
 
 **Step 2: Build from a clean commit**
 
@@ -1101,6 +1104,7 @@ Immediately before external mutation, confirm:
 - exact dist-tag is `next`;
 - all seven package names and tarball hashes match the audited manifest;
 - server Hermes support is deployed and verified;
+- server enrollment is in strict mode and all P0 token-disclosure/owner-auth gates are deployed and verified;
 - no package version has already been published.
 
 **Step 6: Publish in dependency order after the release checkpoint**

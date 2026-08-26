@@ -173,7 +173,7 @@ type RuntimeBinding = {
 };
 ```
 
-`runtimeId` 由 provider、规范化可执行文件路径和本机安装 ID 的摘要形成，用于本地稳定关联；它不会作为融云 token。服务端注册请求沿用现有 `/api/ai/register`：`name`、`mac_address`、`node_type`、`ai_type`、`capabilities`，存在旧 `node_id` 时带上以实现刷新。每个 provider 使用自己的 `node_type`，服务端允许值扩展为 `openclaw`、`opencode`、`codex`、`hermes`，并保留已有 `kimi` 兼容。
+`runtimeId` 由 provider、规范化可执行文件路径和本机安装 ID 的摘要形成，用于本地稳定关联；它不会作为融云 token。服务端注册请求沿用现有 `/api/ai/register`：`name`、`mac_address`、`node_type`、`ai_type`、`capabilities`，存在同服务器旧 `node_id` 时带上以实现精确复用。注册/刷新还携带 `X-Node-Enrollment-Token`：Node 用解码后的 32 字节 Bridge secret，对完整规范化服务地址（含 `/im` 基路径）和 runtime ID 做带域分隔的 HMAC-SHA256；原始 Bridge secret 不上网，服务端只保存派生凭据的 SHA-256。每个 provider 使用自己的 `node_type`，服务端允许值扩展为 `openclaw`、`opencode`、`codex`、`hermes`，并保留已有 `kimi` 兼容。
 
 注册结果必须同时校验业务码、`node_id` 前缀、`node_type`、非空 token 和 capability 集合。注册成功后，token 只写入本地受保护的凭据文件并以引用形式进入 binding 状态；`config.json` 和 `state.json` 都不包含 token 或 Bridge bearer。新凭据必须先持久化，再原子切换 binding 引用，最后删除旧凭据。重新启动优先复用未过期身份；token 失效时只刷新对应 binding，不影响其他运行时。
 
@@ -237,6 +237,8 @@ Node supervisor 只管理自己启动的 Go 守护进程和 RongCloud worker 子
 - 单个 binding 的注册、连接或 adapter 故障不会停止其他 binding。
 - 服务端不可用时 UI 仍可展示检测结果和诊断；已缓存身份可按 SDK 能力重连，但不会伪报在线。
 - 错误分为 `detection`、`authentication`、`registration`、`transport`、`runtime`、`policy`，用户文案提供下一步动作，详细堆栈只进入本地脱敏日志。
+- 新节点零交互注册是持有证明而非用户/设备认证：生产服务端必须将派生 enrollment proof 绑定到单一节点、拒绝冲突复用，并以共享边缘限流约束任意新节点铸造；compat 模式只用于显式迁移窗口，npm 发布时必须关闭。
+- 服务端任何公共节点投影、错误响应和日志都不得包含主/OM 融云 token、模型/OpenClaw secret 或原始 SDK 响应；匿名 token 路由必须退役，OM、SaaS、配置和下载接口必须执行 node/owner 鉴权。
 
 ## 8. 许可证与 fork 治理
 

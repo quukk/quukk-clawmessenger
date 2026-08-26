@@ -24,6 +24,12 @@
 ## External service prerequisite
 
 - `clawmessenger-server` commit `68496a3edf934c90b9af03a5c1c81422ab2d9ef7` adds Hermes to the server's supported AI node identity types. Deploy that server commit before enabling Hermes registration from the Quukk bridge; existing node types remain unchanged.
+- `clawmessenger-server` commit `8a29e4e24af00145c072ccca568a0e9049842d29` retires the anonymous user-token route, allowlists public node responses, redacts RongCloud token logs/errors, and adds no-store to sensitive responses. Enrollment enforcement and owner/node authorization remain mandatory follow-up server gates before npm publication.
+
+## Local identity and enrollment
+
+- `packages/quukk-clawmessenger/src/config`, `src/registration`, and `src/bindings` add strict versioned config/state/credential storage, protected per-install identity, fail-closed work-directory authorization, bounded atomic JSON recovery, four-provider registration, per-runtime enrollment proof, credentials-first token swaps, and provider-isolated lifecycle coordination.
+- The enrollment proof is derived locally from the decoded 32-byte Bridge secret, full normalized server base URL, and runtime ID. Only the domain-separated HMAC result crosses HTTPS; raw Bridge and RongCloud credentials remain outside request bodies, URLs, errors, logs, state, and ordinary config.
 
 ## Modified upstream files
 
