@@ -546,7 +546,11 @@ describe('CardKit shared wire fixture and provenance gate', () => {
     expect(notices).not.toContain('Future compatibility work may adapt');
     expect(notices).toContain('Copyright (c) 2026 Quukk');
     expect(notices).toContain('Copyright (c) 2024 quukk');
-    expect(notices.match(/Permission is hereby granted/g)).toHaveLength(2);
+    expect(notices).toContain('Copyright (c) 2016 RongCloud.');
+    expect(notices).toContain('declares `LGPL 2.1`');
+    expect(notices).toContain('This discrepancy is unresolved.');
+    expect(notices).toContain('Task 14 legal gate');
+    expect(notices.match(/Permission is hereby granted/g)).toHaveLength(3);
 
     for (const source of [
       'schema.ts', 'builders.ts', 'validate.ts', 'parse-marker.ts', 'templates.ts', 'action-router.ts',
