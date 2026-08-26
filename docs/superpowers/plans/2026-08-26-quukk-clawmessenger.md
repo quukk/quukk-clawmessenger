@@ -459,15 +459,17 @@ git commit -m "feat: expose loopback Bridge API"
 - Create: `packages/quukk-clawmessenger/src/config/atomic-json.ts`
 - Create: `packages/quukk-clawmessenger/src/config/store.ts`
 - Create: `packages/quukk-clawmessenger/src/config/store.test.ts`
+- Create: `packages/quukk-clawmessenger/src/registration/capabilities.ts`
 - Create: `packages/quukk-clawmessenger/src/registration/client.ts`
 - Create: `packages/quukk-clawmessenger/src/registration/client.test.ts`
 - Create: `packages/quukk-clawmessenger/src/bindings/service.ts`
 - Create: `packages/quukk-clawmessenger/src/bindings/service.test.ts`
 - Modify: `packages/quukk-clawmessenger/package.json`
+- Modify: `pnpm-lock.yaml`
 
 **Step 1: Add RED state tests**
 
-Test config precedence, `~/.quukk-clawmessenger` paths, atomic replacement, malformed-file quarantine, Unix mode requests, redaction, stable install ID, token references instead of inline tokens, and runtime-scoped sessions/dedup.
+Test config precedence, the exact `~/.quukk-clawmessenger` path matrix, bounded reads, atomic replacement and failure windows, malformed-config quarantine, fail-closed state/credential corruption, Unix mode requests, redaction, stable install ID and Bridge secret, credentials-first token-reference swaps, restart reconciliation, and empty authorized roots that deny every work directory. Sessions and deduplication remain Task 10 work.
 
 ```powershell
 & $pnpm --dir packages/quukk-clawmessenger exec vitest run src/config/store.test.ts
@@ -480,20 +482,23 @@ Add `zod` and model:
 ```ts
 export type RuntimeBinding = {
   runtimeId: string;
+  runtimePath: string;
   provider: 'opencode' | 'openclaw' | 'codex' | 'hermes';
   enabled: boolean;
   nodeId?: string;
   nodeName: string;
   tokenRef?: string;
   registrationState: 'unregistered' | 'registering' | 'online' | 'offline' | 'error';
+  lastErrorCode?: string;
+  updatedAt: string;
 };
 ```
 
-Implement temp-file write, file sync, atomic rename, directory sync where supported, `0600` files, and `0700` directories. Windows relies on the current user's profile ACL and must not invoke shell ACL commands.
+Persist three strict versioned documents: non-secret `config.json` (`serverUrl`, nullable `defaultWorkdir`, fail-closed `authorizedWorkRoots`, provider path overrides, log level), identity/binding `state.json`, and protected `credentials.json`. Credentials contain a stable random per-install `bridgeSecret` plus token records keyed by opaque references; no token or bearer is written into config/state. Implement bounded reads, same-directory temp-file write, file sync, atomic rename, directory sync where supported, `0600` files, and `0700` directories. Windows relies on the current user's profile ACL and must not invoke shell ACL commands or delete-before-rename.
 
 **Step 3: Add RED registration tests**
 
-Use a fake `fetch` to assert four provider-specific `node_type` requests, idempotent reuse of an existing node ID, partial success, bounded retry for transient failures, no retry for validation/auth failures, and strict response checks for business code, prefix, node type, non-empty token, and capabilities.
+Use a fake `fetch` to assert `GET /api/config/rongcloud`, four provider-specific `POST /api/ai/register` requests, and `POST /api/claw/refresh-token/{nodeId}`. Cover idempotent reuse of an existing node ID, partial success, exactly one retry for transient failures, no retry for validation/auth failures, strict response checks for business code, prefix, node type, non-empty token, AppKey, and this exact ordered capability tuple: `discussion_host`, `discussion_participant`, `artifact_markdown`, `artifact_html`, `discussion_roundtable`, `discussion_model_routing`.
 
 ```powershell
 & $pnpm --dir packages/quukk-clawmessenger exec vitest run src/registration/client.test.ts src/bindings/service.test.ts
@@ -501,7 +506,7 @@ Use a fake `fetch` to assert four provider-specific `node_type` requests, idempo
 
 **Step 4: Implement registration and binding service**
 
-Use `os.networkInterfaces()` to derive the existing service's MAC registration value; allow an injected stable fallback install identifier when no hardware MAC is usable. Registration occurs only from an explicit `enableSelected(runtimeIds)` call. Persist each successful result immediately so one failed provider does not roll back the others.
+Use `os.networkInterfaces()` to derive the existing service's MAC registration value; derive an injected stable, locally administered unicast fallback from the install ID when no hardware MAC is usable. Registration occurs only from an explicit `enableSelected(runtimeIds)` call whose IDs are resolved against one fresh trusted Go runtime snapshot; UI input never controls provider, path, node type, name, MAC, or capabilities. Permit at most one binding per provider. Write a new credential first, atomically switch the binding's `tokenRef` second, and remove the old credential last; persist each success independently. Disabling preserves identity/credential, explicit unregister removes them only locally, and refresh failure preserves the old credential.
 
 **Step 5: Run GREEN**
 
@@ -879,6 +884,7 @@ Use the `design-taste-frontend` skill before visual implementation. Test:
 - Independent progress and partial registration failure.
 - `probe_failed`, `found_not_runnable`, and post-task `needs_auth` guidance.
 - Permission-policy disclosure before registration.
+- Explicit authorization of at least one real working-directory root and a default work directory before the bridge is described as task-ready.
 - Rescan, disable, reregister, activity, diagnostics, and settings flows.
 - Multica name/attribution and adjacent Quukk ClawMessenger derivative label remain visible.
 

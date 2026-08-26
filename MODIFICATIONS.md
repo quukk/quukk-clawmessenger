@@ -17,7 +17,7 @@
 
 ## Authenticated Bridge transport
 
-- `server/internal/daemon/bridge_http.go` and `server/internal/daemon/bridge_http_test.go` add the loopback-only, per-process bearer-authenticated Bridge JSON/SSE API, bounded request decoding, runtime refresh, task streaming/cancellation, health reporting, and graceful shutdown.
+- `server/internal/daemon/bridge_http.go` and `server/internal/daemon/bridge_http_test.go` add the loopback-only, per-install bearer-authenticated Bridge JSON/SSE API, bounded request decoding, runtime refresh, task streaming/cancellation, health reporting, and graceful shutdown. The Node supervisor owns and protects the installation secret; the Go child receives it only through bounded startup stdin and retains it only in memory.
 - `server/cmd/multica/cmd_bridge.go` and `server/cmd/multica/cmd_bridge_test.go` add the hidden `multica daemon bridge` entrypoint with bounded strict stdin, fixed ephemeral IPv4 loopback binding, process identity generation, and a single post-refresh readiness record.
 - The serving lifecycle synchronously fences parent cancellation against discovery/readiness, seals new handler entries at shutdown, drains cooperative handlers and every started Bridge task within one deadline, and force-closes timed-out HTTP connections without waiting indefinitely for a non-cooperative Go handler. The command reuses the existing cross-platform shutdown context and rejects changed inherited flags before startup I/O.
 

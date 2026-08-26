@@ -94,7 +94,7 @@ ClawMessenger App / 小程序
 │  one RongCloud worker per enabled runtime    │
 └──────────────────────┬───────────────────────┘
                        │ loopback HTTP + SSE
-                       │ per-process bearer secret
+                       │ per-install bearer secret
 ┌──────────────────────▼───────────────────────┐
 │ Multica daemon (Go, forked)                  │
 │ detection · adapters · task lifecycle        │
@@ -141,7 +141,7 @@ ClawMessenger App / 小程序
 - `GET /healthz`：报告版本、启动时间和探测器状态。
 - `POST /shutdown`：刷新已鉴权的 `202` 后取消 Bridge 根上下文，用于跨平台正常关闭。
 
-所有端点要求 Node 为当次 Go 子进程随机生成并通过有界 stdin 传入的 bearer secret；该 secret 只驻留内存且不持久化，守护进程拒绝非 loopback 请求。Node 控制面负责维护用户授权的工作目录根目录，并只向 Go 提交这些根目录内已经规范化且真实存在的路径。默认测试注入 fake executable，不执行环境中的真实 CLI。
+所有端点要求 Node 使用安装时随机生成、保存在受保护凭据文件中的 bearer secret，并通过有界 stdin 传给 Go 子进程；该 secret 不进入命令行、环境变量、普通配置、状态、日志或诊断输出，Go 进程只在内存中持有它。守护进程拒绝非 loopback 请求。Node 控制面负责维护用户授权的工作目录根目录，并只向 Go 提交这些根目录内已经规范化且真实存在的路径。默认测试注入 fake executable，不执行环境中的真实 CLI。
 
 ### 4.2 provider 适配
 
@@ -161,18 +161,21 @@ ClawMessenger App / 小程序
 ```ts
 type RuntimeBinding = {
   runtimeId: string;
+  runtimePath: string;
   provider: 'opencode' | 'openclaw' | 'codex' | 'hermes';
   enabled: boolean;
   nodeId?: string;
   nodeName: string;
   tokenRef?: string;
   registrationState: 'unregistered' | 'registering' | 'online' | 'offline' | 'error';
+  lastErrorCode?: string;
+  updatedAt: string;
 };
 ```
 
 `runtimeId` 由 provider、规范化可执行文件路径和本机安装 ID 的摘要形成，用于本地稳定关联；它不会作为融云 token。服务端注册请求沿用现有 `/api/ai/register`：`name`、`mac_address`、`node_type`、`ai_type`、`capabilities`，存在旧 `node_id` 时带上以实现刷新。每个 provider 使用自己的 `node_type`，服务端允许值扩展为 `openclaw`、`opencode`、`codex`、`hermes`，并保留已有 `kimi` 兼容。
 
-注册结果必须同时校验业务码、`node_id` 前缀、`node_type`、非空 token 和 capability 集合。注册成功后，token 只写入本地受保护的凭据文件并以引用形式进入主配置。重新启动优先复用未过期身份；token 失效时只刷新对应 binding，不影响其他运行时。
+注册结果必须同时校验业务码、`node_id` 前缀、`node_type`、非空 token 和 capability 集合。注册成功后，token 只写入本地受保护的凭据文件并以引用形式进入 binding 状态；`config.json` 和 `state.json` 都不包含 token 或 Bridge bearer。新凭据必须先持久化，再原子切换 binding 引用，最后删除旧凭据。重新启动优先复用未过期身份；token 失效时只刷新对应 binding，不影响其他运行时。
 
 注销单个运行时会停止其融云连接并删除本地 token；远端身份删除不是 v1 的隐式行为，避免误删仍被其他客户端引用的账号。
 
@@ -217,6 +220,8 @@ Node 桥拥有 `sessions.json`，向 Go Bridge API 提交 runtime ID、conversat
 
 Windows 使用用户 ACL，Unix 文件权限为 `0600`、目录为 `0700`。JSON 采用临时文件 + fsync + 原子替换；进程崩溃不会留下半份凭据。每个 RongCloud worker 使用 `~/.quukk-clawmessenger/rongcloud/<runtimeId>/` 作为独立 SDK 存储空间。日志结构化记录 binding、provider、conversation 和 task ID，但永不记录融云 token、完整 prompt、授权票据或环境变量。`doctor --json` 默认脱敏。
 
+`config.json` 只保存非敏感设置；`state.json` 保存稳定安装 ID 与不含 token 的 runtime bindings；`credentials.json` 保存每安装 32 字节随机 Bridge secret 和按 opaque `tokenRef` 索引的融云 AppKey/token。`authorizedWorkRoots` 默认为空，用户在本地 UI/CLI 明确授权真实目录前，远程任务工作目录一律拒绝。
+
 配置优先级固定为：CLI 参数 > `QUUKK_CLAWMESSENGER_*` 环境变量 > 配置文件 > 内置默认值。默认 ClawMessenger 服务地址为 `https://newsradar.dreamdt.cn/im`，允许在设置页和 CLI 显式覆盖。启动时检测旧的单 provider 配置，只展示可导入项并要求用户确认；导入成功前不移动或删除旧文件。
 
 Node supervisor 只管理自己启动的 Go 守护进程和 RongCloud worker 子进程，并通过 readiness/health 一致的 PID、`started_at` 和随机实例 ID 三者共同校验，避免杀错复用 PID 的进程。`stop` 先通知所有 worker 正常断开，再调用 Go Bridge 的 loopback-only、Bearer 鉴权 `POST /shutdown`；该接口在刷新 `202` 后取消 Bridge 根上下文。超时后才终止已验证的子进程树。
@@ -225,7 +230,7 @@ Node supervisor 只管理自己启动的 Go 守护进程和 RongCloud worker 子
 
 - 本地服务只监听 loopback，并设置严格 Origin、Host、CSRF 和 Content-Security-Policy 校验。
 - 一次性浏览器票据短时有效、只可兑换一次；后续请求使用 HttpOnly、SameSite=Strict session cookie。
-- Node 与 Go 之间使用随机 bearer secret，只经有界 stdin 交给当次 Go 子进程，不经命令行参数或环境变量传递；Go API 固定监听 `tcp4 127.0.0.1:0`，每条路由先校验 loopback peer 再校验 bearer。
+- Node 与 Go 之间使用受保护凭据文件中的每安装随机 bearer secret，只经有界 stdin 交给 Go 子进程，不经命令行参数或环境变量传递；Go API 固定监听 `tcp4 127.0.0.1:0`，每条路由先校验 loopback peer 再校验 bearer。
 - 所有网络输入用 zod 或 Go 显式结构解析；未知 message type 可记录并忽略，不允许直接断言类型。
 - CLI 路径、工作目录、文件附件路径在边界规范化并校验；不接受 `..` 越界或隐式 shell 展开。
 - 注册与连接采用有上限的指数退避和抖动；认证错误停止重试并提示重新注册。
