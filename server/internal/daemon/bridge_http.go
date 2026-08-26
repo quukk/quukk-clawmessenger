@@ -64,6 +64,7 @@ type bridgeHTTPServeDeps struct {
 
 type bridgeHTTPStartupGate struct {
 	mu      sync.Mutex
+	parent  context.Context
 	root    context.Context
 	cancel  context.CancelFunc
 	stopped bool
@@ -72,12 +73,16 @@ type bridgeHTTPStartupGate struct {
 
 func newBridgeHTTPStartupGate(parent context.Context) *bridgeHTTPStartupGate {
 	root, cancel := context.WithCancel(context.WithoutCancel(parent))
-	return &bridgeHTTPStartupGate{root: root, cancel: cancel}
+	return &bridgeHTTPStartupGate{parent: parent, root: root, cancel: cancel}
 }
 
 func (g *bridgeHTTPStartupGate) stop() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.stopLocked()
+}
+
+func (g *bridgeHTTPStartupGate) stopLocked() {
 	if g.stopped {
 		return
 	}
@@ -85,11 +90,28 @@ func (g *bridgeHTTPStartupGate) stop() {
 	g.cancel()
 }
 
+func (g *bridgeHTTPStartupGate) live() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.liveLocked()
+}
+
+func (g *bridgeHTTPStartupGate) liveLocked() error {
+	if err := g.parent.Err(); err != nil {
+		g.stopLocked()
+		return err
+	}
+	if g.stopped || g.root.Err() != nil {
+		return context.Canceled
+	}
+	return nil
+}
+
 func (g *bridgeHTTPStartupGate) markReady(ready func() error) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.stopped || g.root.Err() != nil {
-		return context.Canceled
+	if err := g.liveLocked(); err != nil {
+		return err
 	}
 	if g.ready || ready == nil {
 		return errors.New("bridge readiness is unavailable")
@@ -101,17 +123,58 @@ func (g *bridgeHTTPStartupGate) markReady(ready func() error) error {
 	return nil
 }
 
-type bridgeHTTPHandlerTracker struct{ active sync.WaitGroup }
+type bridgeHTTPHandlerTracker struct {
+	mu     sync.Mutex
+	active int
+	sealed bool
+	done   chan struct{}
+}
+
+func newBridgeHTTPHandlerTracker() *bridgeHTTPHandlerTracker {
+	return &bridgeHTTPHandlerTracker{done: make(chan struct{})}
+}
 
 func (t *bridgeHTTPHandlerTracker) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.active.Add(1)
-		defer t.active.Done()
+		t.mu.Lock()
+		if t.sealed {
+			t.mu.Unlock()
+			return
+		}
+		t.active++
+		t.mu.Unlock()
+		defer func() {
+			t.mu.Lock()
+			t.active--
+			if t.sealed && t.active == 0 {
+				close(t.done)
+			}
+			t.mu.Unlock()
+		}()
 		next.ServeHTTP(w, r)
 	})
 }
 
-func (t *bridgeHTTPHandlerTracker) wait() { t.active.Wait() }
+func (t *bridgeHTTPHandlerTracker) seal() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.sealed {
+		return
+	}
+	t.sealed = true
+	if t.active == 0 {
+		close(t.done)
+	}
+}
+
+func (t *bridgeHTTPHandlerTracker) wait(ctx context.Context) error {
+	select {
+	case <-t.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 type bridgeHTTPHandler struct {
 	root       context.Context
@@ -474,6 +537,9 @@ func serveBridgeHTTPWithDeps(ctx context.Context, listener net.Listener, cfg Bri
 	gate := newBridgeHTTPStartupGate(ctx)
 	defer gate.stop()
 	defer listener.Close()
+	if err := gate.live(); err != nil {
+		return err
+	}
 	watchStop := make(chan struct{})
 	watchDone := make(chan struct{})
 	go func() {
@@ -504,7 +570,7 @@ func serveBridgeHTTPWithDeps(ctx context.Context, listener net.Listener, cfg Bri
 	if deps.wrapHandler != nil {
 		handler = deps.wrapHandler(handler)
 	}
-	handlers := &bridgeHTTPHandlerTracker{}
+	handlers := newBridgeHTTPHandlerTracker()
 	handler = handlers.wrap(handler)
 	server := newBridgeHTTPServer(handler)
 	if deps.beforeReady != nil {
@@ -527,6 +593,7 @@ func serveBridgeHTTPWithDeps(ctx context.Context, listener net.Listener, cfg Bri
 
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), deps.shutdownTimeout)
 	defer cancelCleanup()
+	handlers.seal()
 	httpDone := make(chan struct{})
 	tasksDone := make(chan error, 1)
 	go func() { tasksDone <- waitBridgeHTTPTasksTerminal(cleanupCtx, tasks, httpDone) }()
@@ -539,10 +606,15 @@ func serveBridgeHTTPWithDeps(ctx context.Context, listener net.Listener, cfg Bri
 	if !serveReturned {
 		serveErr = <-serveDone
 	}
-	handlers.wait()
-	close(httpDone)
+	handlersErr := handlers.wait(cleanupCtx)
+	if handlersErr == nil {
+		close(httpDone)
+	} else if !forcedClose {
+		forcedClose = true
+		closeErr = server.Close()
+	}
 	tasksErr := <-tasksDone
-	return bridgeHTTPServeError(serveErr, shutdownErr, closeErr, tasksErr, forcedClose)
+	return bridgeHTTPServeError(serveErr, shutdownErr, closeErr, handlersErr, tasksErr, forcedClose)
 }
 
 func waitBridgeHTTPTasksTerminal(ctx context.Context, manager *bridgeTaskManager, httpDone <-chan struct{}) error {
@@ -582,11 +654,11 @@ func bridgeHTTPTasksTerminal(manager *bridgeTaskManager) bool {
 	return true
 }
 
-func bridgeHTTPServeError(serveErr, shutdownErr, closeErr, tasksErr error, forcedClose bool) error {
+func bridgeHTTPServeError(serveErr, shutdownErr, closeErr, handlersErr, tasksErr error, forcedClose bool) error {
 	if forcedClose {
 		return context.DeadlineExceeded
 	}
-	for _, err := range []error{shutdownErr, closeErr, tasksErr} {
+	for _, err := range []error{shutdownErr, closeErr, handlersErr, tasksErr} {
 		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			return err
 		}

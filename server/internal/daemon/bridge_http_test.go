@@ -1091,6 +1091,106 @@ func TestBridgeHTTPServeTimeoutForceClosesAndJoinsBlockedHandler(t *testing.T) {
 	}
 }
 
+func TestBridgeHTTPServeTimeoutDoesNotWaitForHandlerIgnoringRequestCancellation(t *testing.T) {
+	bridge := newBridge("install", nil, bridgeDeps{
+		probeAgentCLIs:             func() map[string]AgentEntry { return map[string]AgentEntry{} },
+		resolveAgentExecutablePath: func(string) (string, error) { return "", errors.New("not found") },
+	})
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan struct{})
+	handlerEntered := make(chan struct{})
+	handlerRelease := make(chan struct{})
+	handlerExited := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHandler := func() { releaseOnce.Do(func() { close(handlerRelease) }) }
+	defer releaseHandler()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- serveBridgeHTTPWithDeps(ctx, listener, BridgeHTTPConfig{
+			Secret: bridgeHTTPTestSecret,
+			Ready: func() error {
+				close(ready)
+				return nil
+			},
+		}, bridge, bridgeHTTPServeDeps{
+			shutdownTimeout: 20 * time.Millisecond,
+			wrapHandler: func(next http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path != "/blocked-ignoring-cancel" {
+						next.ServeHTTP(w, r)
+						return
+					}
+					close(handlerEntered)
+					<-handlerRelease
+					close(handlerExited)
+				})
+			},
+		})
+	}()
+	<-ready
+	clientDone := make(chan error, 1)
+	go func() {
+		request, err := http.NewRequest(http.MethodGet, "http://"+listener.Addr().String()+"/blocked-ignoring-cancel", nil)
+		if err != nil {
+			clientDone <- err
+			return
+		}
+		_, err = http.DefaultClient.Do(request)
+		clientDone <- err
+	}()
+	<-handlerEntered
+	cancel()
+	select {
+	case err := <-serveDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("ServeBridgeHTTP error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		releaseHandler()
+		<-serveDone
+		t.Fatal("ServeBridgeHTTP waited beyond its lifecycle deadline for a handler that ignored cancellation")
+	}
+	select {
+	case <-handlerExited:
+		t.Fatal("test handler exited before its release barrier")
+	default:
+	}
+	select {
+	case <-clientDone:
+	case <-time.After(time.Second):
+		t.Fatal("server.Close did not release the blocked client connection")
+	}
+	releaseHandler()
+	select {
+	case <-handlerExited:
+	case <-time.After(time.Second):
+		t.Fatal("released test handler did not exit")
+	}
+}
+
+func TestBridgeHTTPHandlerTrackerRejectsBusinessEntriesAfterSeal(t *testing.T) {
+	tracker := newBridgeHTTPHandlerTracker()
+	businessCalls := 0
+	handler := tracker.wrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		businessCalls++
+	}))
+	tracker.seal()
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := tracker.wait(waitCtx); err != nil {
+		t.Fatalf("sealed empty tracker wait error = %v", err)
+	}
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://127.0.0.1/late", nil))
+	if businessCalls != 0 {
+		t.Fatalf("business handler calls after seal = %d, want 0", businessCalls)
+	}
+}
+
 func TestBridgeHTTPServeCancellationWinsPostRefreshPreReadyGate(t *testing.T) {
 	bridge := newBridge("install", nil, bridgeDeps{
 		probeAgentCLIs:             func() map[string]AgentEntry { return map[string]AgentEntry{} },
@@ -1130,6 +1230,57 @@ func TestBridgeHTTPServeCancellationWinsPostRefreshPreReadyGate(t *testing.T) {
 	}
 	if listener.closeCalls.Load() != 1 {
 		t.Fatalf("listener close calls = %d, want 1", listener.closeCalls.Load())
+	}
+}
+
+func TestBridgeHTTPServeAlreadyCancelledParentSkipsRefreshAndReadiness(t *testing.T) {
+	refreshCalls := atomic.Int32{}
+	bridge := newBridge("install", nil, bridgeDeps{
+		probeAgentCLIs: func() map[string]AgentEntry {
+			refreshCalls.Add(1)
+			return map[string]AgentEntry{}
+		},
+		resolveAgentExecutablePath: func(string) (string, error) { return "", errors.New("not found") },
+	})
+	listener := &bridgeCommandlessTestListener{addr: bridgeCommandlessTestAddr("127.0.0.1:10")}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	readyCalls := atomic.Int32{}
+	err := serveBridgeHTTPWithDeps(ctx, listener, BridgeHTTPConfig{
+		Secret: bridgeHTTPTestSecret,
+		Ready: func() error {
+			readyCalls.Add(1)
+			return nil
+		},
+	}, bridge, bridgeHTTPServeDeps{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("serve error = %v, want context canceled", err)
+	}
+	if refreshCalls.Load() != 0 {
+		t.Fatalf("Refresh calls = %d, want 0", refreshCalls.Load())
+	}
+	if readyCalls.Load() != 0 {
+		t.Fatalf("Ready calls = %d, want 0", readyCalls.Load())
+	}
+	if listener.closeCalls.Load() != 1 {
+		t.Fatalf("listener close calls = %d, want 1", listener.closeCalls.Load())
+	}
+}
+
+func TestBridgeHTTPStartupGateParentCancellationWinsBeforeReadyLock(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	gate := newBridgeHTTPStartupGate(parent)
+	cancel()
+	readyCalls := 0
+	err := gate.markReady(func() error {
+		readyCalls++
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("markReady error = %v, want context canceled", err)
+	}
+	if readyCalls != 0 {
+		t.Fatalf("Ready calls = %d, want 0", readyCalls)
 	}
 }
 
