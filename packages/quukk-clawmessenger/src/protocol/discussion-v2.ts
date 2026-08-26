@@ -168,7 +168,7 @@ const commandBaseKeys = [
   'msg_type', 'protocolVersion', 'discussionId', 'chatroomId', 'requestId',
   'stateVersion', 'round', 'timestamp',
 ] as const;
-const controlCharacters = /[\u0000-\u001f\u007f]/;
+const controlCharacters = /[\p{Cc}\p{Cf}]/u;
 
 function record(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -776,7 +776,7 @@ export type ClaimResult =
   | { status: 'wrong_target' | 'replay' | 'cancelled' | 'capacity' | 'disposed' | 'invalid' };
 
 export type CancelResult =
-  | { status: 'accepted'; abortedKeys: string[]; clearDiscussionId: string }
+  | { status: 'accepted'; abortedKeys: string[]; clearSenderId: string; clearDiscussionId: string }
   | { status: 'replay' | 'capacity' | 'disposed' | 'invalid' };
 
 export type RegisterAckResult = { status: 'accepted' | 'duplicate' | 'capacity' | 'disposed' | 'invalid' };
@@ -915,7 +915,12 @@ export class DiscussionV2Guard {
         && pending.discussionId === parsed.discussionId
         && cancels(cancellation, pending.stateVersion, pending.round)) this.pendingAcks.delete(pendingKey);
     }
-    return { status: 'accepted', abortedKeys, clearDiscussionId: parsed.discussionId };
+    return {
+      status: 'accepted',
+      abortedKeys,
+      clearSenderId: senderId,
+      clearDiscussionId: parsed.discussionId,
+    };
   }
 
   registerArtifactAck(value: ArtifactAckExpectation): RegisterAckResult {

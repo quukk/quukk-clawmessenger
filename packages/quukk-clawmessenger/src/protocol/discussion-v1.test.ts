@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import {
+  DISCUSSION_VERSION,
   DISCUSSION_TURN_TIMEOUT_MS,
   advanceAfterCompleted,
   advanceAfterTimeout,
@@ -19,6 +20,10 @@ const invalid = JSON.parse(
 ) as Array<{ name: string; value: unknown }>;
 
 describe('discussion v1 parser and builder', () => {
+  it('exports the locked v1 protocol version', () => {
+    expect(DISCUSSION_VERSION).toBe(1);
+  });
+
   it('parses the shared valid fixture and rebuilds only exact keys', () => {
     expect(parseDiscussionV1(valid.passTurn)).toEqual(valid.passTurn);
     expect(parseDiscussionV1(valid.endDiscussion)).toEqual(valid.endDiscussion);

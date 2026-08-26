@@ -107,6 +107,26 @@ const v2AndCardTypes = new Set<string>([
   'discussion_wire_chunk',
 ]);
 const controlCharacters = /[\p{Cc}\p{Cf}]/u;
+const dangerousObjectKeys = new Set(['__proto__', 'prototype', 'constructor']);
+const rawContentKeys = new Set([
+  'content', 'attachments', 'msg_type', 'service', 'version', 'action', 'payload', 'timestamp',
+  'request_id', 'requestId', 'source_im_id', 'sourceImId', 'destination_im_id', 'destinationImId',
+  'session_id', 'sessionId', 'chatroom_id', 'chatroomId', 'origin_message_uid', 'originMessageUId',
+  'card_id', 'cardId', 'button_id', 'buttonId', 'max_rounds', 'maxRounds', 'openclaw_max_rounds',
+  'command', 'type', 'cmd', 'title', 'name', 'status', 'code', 'message', 'data',
+  'opencode_session_id', 'protocolVersion', 'discussionId', 'chatroomId', 'stateVersion', 'round',
+  'topic', 'goal', 'roles', 'allowedDecisions', 'remainingRounds', 'eventSummary', 'currentArtifact',
+  'assignmentId', 'targetId', 'task', 'mode', 'model', 'role', 'speakingOrder', 'roundFocus',
+  'priorContributions', 'roundSummaries', 'userInterjections', 'attempt', 'reason', 'updateId',
+  'idempotencyKey', 'artifactId', 'artifactVersion', 'decision', 'seq', 'planSummary',
+  'memberPositions', 'agreements', 'disagreements', 'openQuestions', 'nextFocus', 'recommendation',
+  'artifactType', 'instructions', 'operation', 'baseVersion', 'isFinal', 'category', 'defaultModel',
+  'providers', 'messageId', 'sha256', 'chunkIndex', 'chunkCount', 'schema', 'card',
+]);
+const invalidClone = Symbol('invalid-clone');
+const deviceControlCommands = new Set([
+  'status', 'disable', 'stop', 'enable', 'start', 'delete', 'restart', 'rename_device',
+]);
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -159,9 +179,7 @@ function sameAliasValue(left: unknown, right: unknown): boolean {
 }
 
 function conversationType(value: unknown): RongCloudConversationType | null {
-  if (value === 1 || value === 'private') return 1;
-  if (value === 3 || value === 'group') return 3;
-  if (value === 4 || value === 'chatroom') return 4;
+  if (value === 1 || value === 3 || value === 4) return value;
   return null;
 }
 
@@ -242,6 +260,64 @@ function normalizeAttachments(rawContent: Record<string, unknown> | undefined): 
   return result;
 }
 
+function cloneSafeJson(value: unknown, depth = 0): unknown | typeof invalidClone {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : invalidClone;
+  if (depth >= 32 || typeof value !== 'object') return invalidClone;
+  if (Array.isArray(value)) {
+    const result: unknown[] = [];
+    for (const item of value) {
+      const cloned = cloneSafeJson(item, depth + 1);
+      if (cloned === invalidClone) return invalidClone;
+      result.push(cloned);
+    }
+    return result;
+  }
+  const result: Record<string, unknown> = {};
+  let keys: string[];
+  try {
+    keys = Object.keys(value);
+  } catch {
+    return invalidClone;
+  }
+  for (const key of keys) {
+    if (dangerousObjectKeys.has(key)) continue;
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      return invalidClone;
+    }
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) continue;
+    const cloned = cloneSafeJson(descriptor.value, depth + 1);
+    if (cloned !== invalidClone) result[key] = cloned;
+  }
+  return result;
+}
+
+function rebuildRawContent(
+  value: Record<string, unknown>,
+  attachments: NormalizedAttachment[],
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const key of rawContentKeys) {
+    if (!own(value, key) || key === 'attachments') continue;
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      continue;
+    }
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) continue;
+    const cloned = cloneSafeJson(descriptor.value);
+    if (cloned !== invalidClone) result[key] = cloned;
+  }
+  if (own(value, 'attachments')) {
+    result.attachments = attachments.map((attachment) => ({ ...attachment }));
+  }
+  return result;
+}
+
 export function normalizeRongCloudMessage(raw: unknown): NormalizeMessageResult {
   if (!record(raw)) return { ok: false, code: 'invalid_message' };
   const bytes = serializedBytes(raw);
@@ -264,6 +340,10 @@ export function normalizeRongCloudMessage(raw: unknown): NormalizeMessageResult 
   if (!normalizedConversationType) return { ok: false, code: 'invalid_conversation_type' };
   const content = decodeContent(raw.content);
   if (!content) return { ok: false, code: 'invalid_content' };
+  const attachments = normalizeAttachments(content.rawContent);
+  const rawContent = content.rawContent
+    ? rebuildRawContent(content.rawContent, attachments)
+    : undefined;
 
   const sentTime = raw.sentTime === undefined ? undefined : finiteNumber(raw.sentTime) ?? undefined;
   const offline = typeof raw.isOffLineMessage === 'boolean'
@@ -282,8 +362,8 @@ export function normalizeRongCloudMessage(raw: unknown): NormalizeMessageResult 
       conversationType: normalizedConversationType,
       objectName: objectName.value,
       ...(content.text === undefined ? {} : { text: content.text }),
-      attachments: normalizeAttachments(content.rawContent),
-      ...(content.rawContent ? { rawContent: content.rawContent } : {}),
+      attachments,
+      ...(rawContent ? { rawContent } : {}),
       ...(sentTime === undefined ? {} : { sentTime }),
       ...(offline === undefined ? {} : { offline }),
       ...(direction === undefined ? {} : { direction }),
@@ -356,9 +436,12 @@ export function parseProtocolContent(input: unknown): ProtocolContentResult {
     return { kind: 'protocol', msgType: msgType as ExternalMessageType, value };
   }
   const canonical = canonicalLegacy(value);
-  return canonical
-    ? { kind: 'protocol', msgType: msgType as ExternalMessageType, value: canonical }
-    : { kind: 'invalid', code: 'conflicting_alias' };
+  if (!canonical) return { kind: 'invalid', code: 'conflicting_alias' };
+  if (msgType === 'device_control'
+    && (typeof canonical.command !== 'string' || !deviceControlCommands.has(canonical.command))) {
+    return { kind: 'invalid', code: 'invalid_content' };
+  }
+  return { kind: 'protocol', msgType: msgType as ExternalMessageType, value: canonical };
 }
 
 export function parseSlashCommand(text: string): SlashCommandResult {

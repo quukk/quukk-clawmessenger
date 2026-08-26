@@ -6,9 +6,13 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import {
+  MAX_CHUNKS,
+  MAX_MESSAGE_BYTES,
   MAX_DISCUSSION_CHUNKS,
   MAX_DISCUSSION_MESSAGE_BYTES,
+  RAW_CHUNK_BYTES,
   RAW_DISCUSSION_CHUNK_BYTES,
+  WIRE_BYTE_LIMIT,
   WIRE_FRAME_BYTE_LIMIT,
   DiscussionWireReassembler,
   encodeDiscussionWire,
@@ -41,6 +45,13 @@ function mutateChunk(frame: Record<string, unknown>): Record<string, unknown> {
 }
 
 describe('discussion wire encoder', () => {
+  it('exports the locked provider contract constant names', () => {
+    expect(WIRE_BYTE_LIMIT).toBe(9_000);
+    expect(RAW_CHUNK_BYTES).toBe(5_700);
+    expect(MAX_MESSAGE_BYTES).toBe(8 * 1024 * 1024);
+    expect(MAX_CHUNKS).toBe(2_048);
+  });
+
   it('passes through a complete 9000-byte JSON frame and chunks 9001 bytes', () => {
     const exact = payloadAtBytes(WIRE_FRAME_BYTE_LIMIT);
     expect(encodeDiscussionWire(exact)).toEqual([JSON.stringify(exact)]);
@@ -151,7 +162,7 @@ describe('discussion wire reassembler', () => {
     expect(expiring.accept('sender', first[0])).toEqual({ status: 'incomplete' });
     now = 11;
     expect(expiring.accept('sender', first[1])).toEqual({ status: 'incomplete' });
-    expiring.clearDiscussion('discussion-5');
+    expiring.clearDiscussion('sender', 'discussion-5');
     expect(expiring.inflightCount).toBe(0);
 
     const capacity = new DiscussionWireReassembler({ maxInflightMessages: 1 });
@@ -181,5 +192,64 @@ describe('discussion wire reassembler', () => {
     const payload = { msg_type: 'discussion_cancel', discussionId: 'discussion-7' };
     expect(new DiscussionWireReassembler().accept('sender', payload))
       .toEqual({ status: 'passthrough', payload });
+  });
+
+  it('clears cancelled partials only for the scoped sender and discussion', () => {
+    const frames = parseFrames({ discussionId: 'discussion-scope', content: 'x'.repeat(10_000) });
+    const wire = new DiscussionWireReassembler();
+    expect(wire.accept('sender-a', frames[0])).toEqual({ status: 'incomplete' });
+    expect(wire.accept('sender-b', frames[0])).toEqual({ status: 'incomplete' });
+    wire.clearDiscussion('sender-a', 'discussion-scope');
+    expect(wire.inflightCount).toBe(1);
+    expect(wire.accept('sender-b', frames[1])).toMatchObject({ status: 'complete' });
+    expect(wire.accept('sender-a', frames[1])).toEqual({ status: 'incomplete' });
+  });
+
+  it('fails closed for cyclic or throwing-accessor wire objects', () => {
+    const [base] = parseFrames({ content: 'x'.repeat(10_000) });
+    const cyclic = { ...base } as Record<string, unknown> & { self?: unknown };
+    cyclic.self = cyclic;
+    expect(() => new DiscussionWireReassembler().accept('sender', cyclic)).not.toThrow();
+    expect(new DiscussionWireReassembler().accept('sender', cyclic)).toEqual({ status: 'invalid' });
+
+    const throwing = { ...base };
+    Object.defineProperty(throwing, 'data', {
+      enumerable: true,
+      get: () => { throw new Error('provider getter must not escape'); },
+    });
+    expect(() => new DiscussionWireReassembler().accept('sender', throwing)).not.toThrow();
+    expect(new DiscussionWireReassembler().accept('sender', throwing)).toEqual({ status: 'invalid' });
+  });
+
+  it('validates the actual serialized inbound frame bytes when raw evidence is available', () => {
+    const raw = Buffer.from(JSON.stringify({ accepted: true }), 'utf8');
+    const sha256 = createHash('sha256').update(raw).digest('hex');
+    const serialized = JSON.stringify({
+      msg_type: 'discussion_wire_chunk',
+      protocolVersion: 2,
+      messageId: `wire_${sha256}`,
+      sha256,
+      chunkIndex: 0,
+      chunkCount: 1,
+      data: raw.toString('base64'),
+    });
+    expect(new DiscussionWireReassembler().acceptSerialized('sender', serialized))
+      .toMatchObject({ status: 'complete', payload: { accepted: true } });
+    const padded = `${' '.repeat(WIRE_BYTE_LIMIT + 1 - Buffer.byteLength(serialized, 'utf8'))}${serialized}`;
+    expect(Buffer.byteLength(padded, 'utf8')).toBe(WIRE_BYTE_LIMIT + 1);
+    expect(new DiscussionWireReassembler().acceptSerialized('sender', padded)).toEqual({ status: 'invalid' });
+  });
+
+  it('uses dispose only for final teardown and keeps tombstones across partial resets', () => {
+    const frames = parseFrames({ discussionId: 'discussion-dispose', content: 'x'.repeat(10_000) });
+    const wire = new DiscussionWireReassembler();
+    expect(wire.accept('sender', frames[0])).toEqual({ status: 'incomplete' });
+    expect(wire.accept('sender', frames[1])).toMatchObject({ status: 'complete' });
+    wire.clearPartials();
+    expect(wire.accept('sender', frames[0])).toEqual({ status: 'replay' });
+    wire.dispose();
+    expect(wire.inflightCount).toBe(0);
+    expect(wire.inflightBytes).toBe(0);
+    expect(wire.accept('sender', frames[0])).toEqual({ status: 'invalid' });
   });
 });

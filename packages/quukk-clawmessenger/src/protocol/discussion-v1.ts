@@ -5,6 +5,7 @@
  * See THIRD_PARTY_NOTICES.md.
  */
 
+export const DISCUSSION_VERSION = 1;
 export const DISCUSSION_TURN_TIMEOUT_MS = 60_000;
 
 export type DiscussionV1Action = 'pass_turn' | 'end_discussion' | 'abort' | 'heartbeat';
@@ -154,7 +155,7 @@ export function parseDiscussionV1(raw: unknown): DiscussionV1Message | null {
     msg_type: 'discussion_token',
     service: 'openclaw_coord',
     discussion_id: raw.discussion_id,
-    version: 1,
+    version: DISCUSSION_VERSION,
     action: raw.action,
     payload,
     timestamp: raw.timestamp,

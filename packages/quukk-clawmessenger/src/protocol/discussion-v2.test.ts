@@ -55,6 +55,7 @@ describe('discussion v2 strict inputs', () => {
     expect(parseDiscussionV2Command({ ...fixture.assignment, extra: true })).toBeNull();
     expect(parseDiscussionV2Command({ ...fixture.assignment, protocolVersion: '2' })).toBeNull();
     expect(parseDiscussionV2Command({ ...fixture.assignment, stateVersion: Number.MAX_SAFE_INTEGER + 1 })).toBeNull();
+    expect(parseDiscussionV2Command({ ...fixture.assignment, requestId: 'request\u200bhidden' })).toBeNull();
   });
 
   it('enforces identifiers, text limits and exact roundtable option sets', () => {
@@ -254,12 +255,13 @@ describe('discussion v2 replay and cancellation guard', () => {
     expect(active.status === 'accepted' && guard.isCurrent(active.key)).toBe(true);
 
     expect(guard.cancel('owner-1', { ...fixture.cancel, stateVersion: 7, round: 3 })).toMatchObject({
-      status: 'accepted', abortedKeys: [], clearDiscussionId: 'discussion-42',
+      status: 'accepted', abortedKeys: [], clearSenderId: 'owner-1', clearDiscussionId: 'discussion-42',
     });
     expect(active.status === 'accepted' && guard.isCurrent(active.key)).toBe(true);
 
     const cancellation = guard.cancel('owner-1', { ...fixture.cancel, stateVersion: 7, round: 2 });
     expect(cancellation).toMatchObject({ status: 'accepted', clearDiscussionId: 'discussion-42' });
+    expect(cancellation).toMatchObject({ status: 'accepted', clearSenderId: 'owner-1' });
     expect(cancellation.status === 'accepted' && cancellation.abortedKeys).toContain(
       active.status === 'accepted' ? active.key : '',
     );

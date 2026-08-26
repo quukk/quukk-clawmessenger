@@ -8,10 +8,15 @@
 
 import { createHash } from 'node:crypto';
 
-export const WIRE_FRAME_BYTE_LIMIT = 9_000;
-export const RAW_DISCUSSION_CHUNK_BYTES = 5_700;
-export const MAX_DISCUSSION_MESSAGE_BYTES = 8 * 1024 * 1024;
-export const MAX_DISCUSSION_CHUNKS = 2_048;
+export const WIRE_BYTE_LIMIT = 9_000;
+export const RAW_CHUNK_BYTES = 5_700;
+export const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
+export const MAX_CHUNKS = 2_048;
+
+export const WIRE_FRAME_BYTE_LIMIT = WIRE_BYTE_LIMIT;
+export const RAW_DISCUSSION_CHUNK_BYTES = RAW_CHUNK_BYTES;
+export const MAX_DISCUSSION_MESSAGE_BYTES = MAX_MESSAGE_BYTES;
+export const MAX_DISCUSSION_CHUNKS = MAX_CHUNKS;
 
 export type DiscussionWireResult =
   | { status: 'passthrough'; payload: unknown }
@@ -29,6 +34,7 @@ export interface DiscussionWireOptions {
 }
 
 interface PartialMessage {
+  senderId: string;
   sha256: string;
   chunkCount: number;
   discussionId?: string;
@@ -124,6 +130,7 @@ export class DiscussionWireReassembler {
   readonly #partials = new Map<string, PartialMessage>();
   readonly #completed = new Map<string, number>();
   #storedBytes = 0;
+  #disposed = false;
 
   constructor(options: DiscussionWireOptions = {}) {
     this.#clock = options.clock ?? Date.now;
@@ -147,9 +154,9 @@ export class DiscussionWireReassembler {
     return this.#storedBytes;
   }
 
-  clearDiscussion(discussionId: string): void {
+  clearDiscussion(senderId: string, discussionId: string): void {
     for (const [key, partial] of this.#partials) {
-      if (partial.discussionId === discussionId) this.#remove(key);
+      if (partial.senderId === senderId && partial.discussionId === discussionId) this.#remove(key);
     }
   }
 
@@ -158,13 +165,62 @@ export class DiscussionWireReassembler {
     this.#storedBytes = 0;
   }
 
+  /** Final teardown only; transient reconnects must retain completed tombstones. */
+  dispose(): void {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    this.clearPartials();
+    this.#completed.clear();
+  }
+
   accept(senderId: string, value: unknown): DiscussionWireResult {
+    let wireFrame: boolean;
+    try {
+      wireFrame = record(value) && value.msg_type === 'discussion_wire_chunk';
+    } catch {
+      return { status: 'invalid' };
+    }
+    if (!wireFrame) {
+      return { status: 'passthrough', payload: value };
+    }
+    if (this.#disposed) return { status: 'invalid' };
+    let serialized: string;
+    let snapshot: unknown;
+    try {
+      serialized = JSON.stringify(value);
+      snapshot = JSON.parse(serialized);
+    } catch {
+      return { status: 'invalid' };
+    }
+    if (!record(snapshot)) return { status: 'invalid' };
+    return this.#acceptFrame(senderId, snapshot, Buffer.byteLength(serialized, 'utf8'));
+  }
+
+  /** Preferred Task 9 boundary when the provider's original frame string is available. */
+  acceptSerialized(senderId: string, serializedFrame: string): DiscussionWireResult {
+    if (typeof serializedFrame !== 'string'
+      || Buffer.byteLength(serializedFrame, 'utf8') > WIRE_FRAME_BYTE_LIMIT) return { status: 'invalid' };
+    let value: unknown;
+    try {
+      value = JSON.parse(serializedFrame);
+    } catch {
+      return { status: 'invalid' };
+    }
     if (!record(value) || value.msg_type !== 'discussion_wire_chunk') {
       return { status: 'passthrough', payload: value };
     }
+    if (this.#disposed) return { status: 'invalid' };
+    return this.#acceptFrame(senderId, value, Buffer.byteLength(serializedFrame, 'utf8'));
+  }
+
+  #acceptFrame(
+    senderId: string,
+    value: Record<string, unknown>,
+    serializedFrameBytes: number,
+  ): DiscussionWireResult {
     const now = this.#clock();
     this.#cleanup(now);
-    if (!this.#validFrame(senderId, value)) return { status: 'invalid' };
+    if (!this.#validFrame(senderId, value, serializedFrameBytes)) return { status: 'invalid' };
 
     const raw = canonicalBase64(value.data as string);
     if (!raw || raw.length < 1 || raw.length > RAW_DISCUSSION_CHUNK_BYTES) return { status: 'invalid' };
@@ -176,6 +232,7 @@ export class DiscussionWireReassembler {
       if (this.#partials.size >= this.#maxInflightMessages
         || this.#storedBytes + raw.length > this.#maxInflightBytes) return { status: 'invalid' };
       partial = {
+        senderId,
         sha256: value.sha256 as string,
         chunkCount: value.chunkCount as number,
         ...(value.discussionId === undefined ? {} : { discussionId: value.discussionId as string }),
@@ -231,7 +288,7 @@ export class DiscussionWireReassembler {
     return { status: 'complete', payload, serialized };
   }
 
-  #validFrame(senderId: string, value: Record<string, unknown>): boolean {
+  #validFrame(senderId: string, value: Record<string, unknown>, serializedFrameBytes: number): boolean {
     const required = ['msg_type', 'protocolVersion', 'messageId', 'sha256', 'chunkIndex', 'chunkCount', 'data'];
     const allowed = new Set([...required, 'discussionId']);
     return boundedId(senderId)
@@ -251,7 +308,9 @@ export class DiscussionWireReassembler {
       && value.chunkIndex < value.chunkCount
       && typeof value.data === 'string'
       && (value.discussionId === undefined || boundedId(value.discussionId))
-      && Buffer.byteLength(JSON.stringify(value), 'utf8') <= WIRE_FRAME_BYTE_LIMIT;
+      && Number.isSafeInteger(serializedFrameBytes)
+      && serializedFrameBytes >= 1
+      && serializedFrameBytes <= WIRE_FRAME_BYTE_LIMIT;
   }
 
   #remove(key: string): void {

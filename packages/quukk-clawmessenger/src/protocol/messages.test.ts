@@ -47,7 +47,7 @@ describe('normalizeRongCloudMessage', () => {
       messageId: 'message-2',
       senderId: 'user-2',
       targetId: 'room-1',
-      conversationType: 'chatroom',
+      conversationType: 4,
       objectName: 'RC:TxtMsg',
       sentTime: 123,
       isOffLineMessage: true,
@@ -89,6 +89,41 @@ describe('normalizeRongCloudMessage', () => {
       messageId: 'different-message',
       content: 'x',
     })).toEqual({ ok: false, code: 'conflicting_alias' });
+  });
+
+  it('accepts only numeric RongCloud conversation types 1, 3 and 4', () => {
+    for (const conversationType of ['private', 'group', 'chatroom', 0, 2, 5]) {
+      expect(normalizeRongCloudMessage({ ...baseMessage, conversationType, content: 'x' }))
+        .toEqual({ ok: false, code: 'invalid_conversation_type' });
+    }
+    for (const conversationType of [1, 3, 4]) {
+      expect(normalizeRongCloudMessage({ ...baseMessage, conversationType, content: 'x' }))
+        .toMatchObject({ ok: true, value: { conversationType } });
+    }
+  });
+
+  it('rebuilds raw content as a detached top-level allowlist', () => {
+    const content = {
+      content: 'hello',
+      data: { status: 'before' },
+      attachments: [{ kind: 'file', url: 'https://example.test/a.txt', name: 'a.txt' }],
+      unexpectedProviderState: { credential: 'must-not-survive' },
+    };
+    const result = normalizeRongCloudMessage({ ...baseMessage, content });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('expected normalized message');
+    expect(result.value.rawContent).toEqual({
+      content: 'hello',
+      data: { status: 'before' },
+      attachments: [{ kind: 'file', url: 'https://example.test/a.txt', name: 'a.txt' }],
+    });
+    expect(result.value.rawContent).not.toBe(content);
+    content.data.status = 'after';
+    content.attachments[0]!.name = 'changed.txt';
+    expect(result.value.rawContent).toMatchObject({
+      data: { status: 'before' },
+      attachments: [{ name: 'a.txt' }],
+    });
   });
 
   it('rejects envelopes over 64 KiB before parsing nested content', () => {
@@ -152,6 +187,17 @@ describe('parseProtocolContent', () => {
       chatroom_id: 'room-a',
       chatroomId: 'room-b',
     })).toEqual({ kind: 'invalid', code: 'conflicting_alias' });
+  });
+
+  it('allows only the existing device-control command vocabulary', () => {
+    for (const command of ['status', 'disable', 'stop', 'enable', 'start', 'delete', 'restart', 'rename_device']) {
+      expect(parseProtocolContent({ msg_type: 'device_control', command }))
+        .toEqual({ kind: 'protocol', msgType: 'device_control', value: { msg_type: 'device_control', command } });
+    }
+    expect(parseProtocolContent({ msg_type: 'device_control', command: 'run_arbitrary_process' }))
+      .toEqual({ kind: 'invalid', code: 'invalid_content' });
+    expect(parseProtocolContent({ msg_type: 'device_control', command: 'status', action: 'restart' }))
+      .toEqual({ kind: 'invalid', code: 'conflicting_alias' });
   });
 
   it('ignores unknown and server-only message types instead of turning them into prompts', () => {
