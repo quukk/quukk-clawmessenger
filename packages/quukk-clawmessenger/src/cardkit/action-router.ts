@@ -5,6 +5,8 @@
  * copied. See THIRD_PARTY_NOTICES.md.
  */
 
+import { isProxy } from 'node:util/types';
+
 import { parseSlashCommand } from '../protocol/messages.js';
 import type { CardModel } from './schema.js';
 import { permissionUnsupportedCard } from './templates.js';
@@ -54,15 +56,28 @@ export interface UnsupportedApprovalResult {
 const dangerousKeys = new Set(['__proto__', 'prototype', 'constructor']);
 
 function record(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (value === null || typeof value !== 'object' || Array.isArray(value) || isProxy(value)) return false;
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
 }
 
 function exactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
   const allowed = new Set([...required, ...optional]);
-  return required.every((key) => Object.prototype.hasOwnProperty.call(value, key))
-    && Object.keys(value).every((key) => allowed.has(key));
+  const keys = Object.keys(value);
+  return required.every((key) => keys.includes(key))
+    && keys.every((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      return allowed.has(key)
+        && descriptor !== undefined
+        && Object.prototype.hasOwnProperty.call(descriptor, 'value');
+    });
+}
+
+function ownValue(value: Record<string, unknown>, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor && Object.prototype.hasOwnProperty.call(descriptor, 'value')
+    ? descriptor.value
+    : undefined;
 }
 
 function identifier(value: unknown, max = 128): value is string {
@@ -78,6 +93,15 @@ function text(value: unknown, max = 1_000): value is string {
     && value.length >= 1
     && value.length <= max
     && !/[\p{Cc}\p{Cf}]/u.test(value);
+}
+
+function plainArray(value: unknown, maximum: number): value is unknown[] {
+  if (!Array.isArray(value) || isProxy(value) || value.length > maximum) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) return false;
+  }
+  return true;
 }
 
 function metadata(value: Record<string, unknown>): IntentMetadata | null {
@@ -96,6 +120,7 @@ function safePayloadShape(value: unknown, budget: { keys: number }, depth = 0): 
   if (typeof value === 'number') return Number.isFinite(value);
   if (typeof value === 'string') return value.length <= 4_096 && !/[\p{Cc}\p{Cf}]/u.test(value);
   if (depth > 8) return false;
+  if (typeof value === 'object' && value !== null && isProxy(value)) return false;
   if (Array.isArray(value)) {
     if (value.length > 64) return false;
     for (let index = 0; index < value.length; index += 1) {
@@ -131,9 +156,11 @@ export function routeCardAction(value: unknown): CardActionRoute {
       return invalidAction();
     }
     const meta = metadata(value);
-    if (!meta || !record(value.action) || typeof value.action.type !== 'string') return invalidAction(meta ?? undefined);
-    const cardAction = value.action;
-    if (cardAction.type === 'permission') {
+    const cardAction = ownValue(value, 'action');
+    if (!meta || !record(cardAction)) return invalidAction(meta ?? undefined);
+    const actionType = ownValue(cardAction, 'type');
+    if (typeof actionType !== 'string') return invalidAction(meta);
+    if (actionType === 'permission') {
       if (!exactKeys(cardAction, ['type', 'permissionId', 'reply'])
         || !identifier(cardAction.permissionId)
         || (cardAction.reply !== 'once' && cardAction.reply !== 'always' && cardAction.reply !== 'reject')) {
@@ -146,15 +173,14 @@ export function routeCardAction(value: unknown): CardActionRoute {
         ...meta,
       };
     }
-    if (cardAction.type === 'answer') {
+    if (actionType === 'answer') {
       if (!exactKeys(cardAction, ['type', 'questionId', 'value'])
         || !identifier(cardAction.questionId)
-        || !Array.isArray(cardAction.value)
-        || cardAction.value.length > 50
+        || !plainArray(cardAction.value, 50)
         || !cardAction.value.every((item) => text(item))) return invalidAction(meta);
       return { ok: true, kind: 'answer', ...meta, questionId: cardAction.questionId, value: [...cardAction.value] };
     }
-    if (cardAction.type === 'command') {
+    if (actionType === 'command') {
       if (!exactKeys(cardAction, ['type', 'name']) || typeof cardAction.name !== 'string') return invalidAction(meta);
       const parsed = parseSlashCommand(cardAction.name);
       if (parsed.kind !== 'command') return { ok: false, code: 'unsupported_command', status: 400, ...meta };
@@ -166,17 +192,17 @@ export function routeCardAction(value: unknown): CardActionRoute {
         ...(parsed.argument === undefined ? {} : { argument: parsed.argument }),
       };
     }
-    if (cardAction.type === 'session') {
+    if (actionType === 'session') {
       if (!exactKeys(cardAction, ['type', 'op', 'sessionId'])
         || (cardAction.op !== 'switch' && cardAction.op !== 'delete')
         || !identifier(cardAction.sessionId)) return invalidAction(meta);
       return { ok: true, kind: 'session', ...meta, op: cardAction.op, sessionId: cardAction.sessionId };
     }
-    if (cardAction.type === 'navigate') {
+    if (actionType === 'navigate') {
       if (!exactKeys(cardAction, ['type', 'target']) || !identifier(cardAction.target, 256)) return invalidAction(meta);
       return { ok: true, kind: 'navigate', ...meta, target: cardAction.target };
     }
-    if (cardAction.type === 'custom') {
+    if (actionType === 'custom') {
       if (!exactKeys(cardAction, ['type', 'kind', 'payload'])
         || !identifier(cardAction.kind)
         || !safePayloadShape(cardAction.payload, { keys: 0 })) return invalidAction(meta);
@@ -184,7 +210,7 @@ export function routeCardAction(value: unknown): CardActionRoute {
       if (!payload) return invalidAction(meta);
       return { ok: true, kind: 'custom', ...meta, customKind: cardAction.kind, payload };
     }
-    if (cardAction.type === 'none') {
+    if (actionType === 'none') {
       return exactKeys(cardAction, ['type'])
         ? { ok: true, kind: 'none', ...meta }
         : invalidAction(meta);

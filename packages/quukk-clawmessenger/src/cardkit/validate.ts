@@ -7,6 +7,8 @@
  * implementation. See THIRD_PARTY_NOTICES.md.
  */
 
+import { isProxy } from 'node:util/types';
+
 import {
   CARD_SCHEMA_VERSION,
   type CardAction,
@@ -29,7 +31,7 @@ const buttonLayouts = new Set(['inline', 'flow', 'stack']);
 const forbiddenTextControls = /[\p{Cc}\p{Cf}]/gu;
 
 function record(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (value === null || typeof value !== 'object' || Array.isArray(value) || isProxy(value)) return false;
   try {
     const prototype = Object.getPrototypeOf(value);
     return prototype === Object.prototype || prototype === null;
@@ -85,6 +87,19 @@ function httpsUrl(value: unknown): value is string {
 
 interface JsonBudget { keys: number }
 
+function plainArray(value: unknown, maximum: number): value is unknown[] {
+  try {
+    if (!Array.isArray(value) || isProxy(value) || value.length > maximum) return false;
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function cloneJson(
   value: unknown,
   budget: JsonBudget,
@@ -95,7 +110,7 @@ function cloneJson(
   if (typeof value === 'string') return allowedText(value, 4_096, true) ? value : invalid;
   if (depth > 8) return invalid;
   if (Array.isArray(value)) {
-    if (value.length > 64) return invalid;
+    if (!plainArray(value, 64)) return invalid;
     const output: unknown[] = [];
     for (let index = 0; index < value.length; index += 1) {
       let descriptor: PropertyDescriptor | undefined;
@@ -157,8 +172,7 @@ function sanitizeAction(value: unknown): CardAction | null {
     const questionId = read(value, 'questionId');
     const selected = read(value, 'value');
     return identifier(questionId)
-      && Array.isArray(selected)
-      && selected.length <= 50
+      && plainArray(selected, 50)
       && selected.every((item) => allowedText(item, 1_000))
       ? { type, questionId, value: [...selected] }
       : null;
@@ -221,7 +235,7 @@ function sanitizeButton(value: unknown): CardButton | null {
 }
 
 function boundedArray(value: unknown, maximum: number): value is unknown[] {
-  return Array.isArray(value) && value.length <= maximum;
+  return plainArray(value, maximum);
 }
 
 function stringItem(value: unknown, fields: readonly string[]): Record<string, string> | null {

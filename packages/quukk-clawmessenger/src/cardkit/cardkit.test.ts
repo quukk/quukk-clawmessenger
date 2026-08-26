@@ -170,6 +170,9 @@ describe('CardKit fresh-object validation', () => {
     expect(() => validateCard(getterCard)).not.toThrow();
     expect(validateCard(getterCard)).toMatchObject({ ok: false, code: 'invalid_card' });
 
+    expect(validateCard(new Proxy(completeCard(), {})))
+      .toMatchObject({ ok: false, code: 'invalid_card' });
+
     for (const src of ['javascript:alert(1)', 'data:text/plain,x', 'file:///tmp/x', '//example.test/x', 'http://example.test/x', 'https://user:pass@example.test/x']) {
       expect(validateCard(card('bad-url', 'Bad', [{ kind: 'image', src }])))
         .toMatchObject({ ok: false, code: 'invalid_card' });
@@ -331,6 +334,39 @@ describe('CardKit pure action routing', () => {
       .toMatchObject({ ok: false, code: 'unsupported_action' });
     expect(routeCardAction({ ...baseAction, cardId: 'bad\u200bid', action: { type: 'none' } }))
       .toMatchObject({ ok: false, code: 'invalid_action' });
+
+    expect(routeCardAction(new Proxy({ ...baseAction, action: { type: 'none' } }, {})))
+      .toMatchObject({ ok: false, code: 'invalid_action' });
+
+    let getterReads = 0;
+    const accessorAction: Record<string, unknown> = {};
+    Object.defineProperty(accessorAction, 'type', {
+      enumerable: true,
+      get: () => {
+        getterReads += 1;
+        return 'none';
+      },
+    });
+    expect(routeCardAction({ ...baseAction, action: accessorAction }))
+      .toMatchObject({ ok: false, code: 'invalid_action' });
+    expect(getterReads).toBe(0);
+
+    let answerReads = 0;
+    const accessorAnswers: string[] = [];
+    Object.defineProperty(accessorAnswers, '0', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        answerReads += 1;
+        return 'A';
+      },
+    });
+    accessorAnswers.length = 1;
+    expect(routeCardAction({
+      ...baseAction,
+      action: { type: 'answer', questionId: 'question-1', value: accessorAnswers },
+    })).toMatchObject({ ok: false, code: 'invalid_action' });
+    expect(answerReads).toBe(0);
   });
 
   it('bounds custom JSON by bytes, depth, keys and prototype safety', () => {
