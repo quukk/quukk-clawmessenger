@@ -13,6 +13,10 @@
 - `apps/bridge`: private React/Vite workspace that builds local Bridge UI assets into the entry package.
 - This initial scaffold deliberately has no RongCloud, registration-server, daemon, or provider runtime implementation.
 
+## External service prerequisite
+
+- `clawmessenger-server` commit `68496a3edf934c90b9af03a5c1c81422ab2d9ef7` adds Hermes to the server's supported AI node identity types. Deploy that server commit before enabling Hermes registration from the Quukk bridge; existing node types remain unchanged.
+
 ## Modified upstream files
 
 - `.gitignore`: excludes a repository-local Quukk ClawMessenger runtime-data directory.
