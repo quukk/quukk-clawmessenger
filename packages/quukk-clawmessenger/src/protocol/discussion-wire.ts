@@ -62,15 +62,15 @@ function boundedId(value: unknown, max = 128): value is string {
 }
 
 function positiveInteger(value: number | undefined, fallback: number, hardMax: number): number {
-  return value !== undefined && Number.isSafeInteger(value) && value > 0
-    ? Math.min(value, hardMax)
-    : fallback;
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value <= 0) throw new RangeError('invalid positive wire limit');
+  return Math.min(value, hardMax);
 }
 
 function capacity(value: number | undefined, fallback: number, hardMax: number): number {
-  return value !== undefined && Number.isSafeInteger(value) && value >= 0
-    ? Math.min(value, hardMax)
-    : fallback;
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value < 0) throw new RangeError('invalid wire capacity');
+  return Math.min(value, hardMax);
 }
 
 function canonicalBase64(value: string): Buffer | null {

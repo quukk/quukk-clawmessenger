@@ -188,6 +188,19 @@ describe('discussion wire reassembler', () => {
     expect(wire.accept('sender', oversizedCount)).toEqual({ status: 'invalid' });
   });
 
+  it('rejects invalid option values instead of widening them to defaults', () => {
+    for (const key of ['ttlMs', 'maxMessageBytes', 'maxChunks'] as const) {
+      for (const value of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+        expect(() => new DiscussionWireReassembler({ [key]: value })).toThrow(RangeError);
+      }
+    }
+    for (const key of ['maxInflightMessages', 'maxInflightBytes', 'maxCompleted'] as const) {
+      for (const value of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+        expect(() => new DiscussionWireReassembler({ [key]: value })).toThrow(RangeError);
+      }
+    }
+  });
+
   it('passes non-wire payloads through unchanged', () => {
     const payload = { msg_type: 'discussion_cancel', discussionId: 'discussion-7' };
     expect(new DiscussionWireReassembler().accept('sender', payload))
