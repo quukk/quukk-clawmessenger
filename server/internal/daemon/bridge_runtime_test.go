@@ -202,6 +202,74 @@ func TestBridgeRuntimeDiscoveryStatusesKeepFoundIdentity(t *testing.T) {
 	}
 }
 
+func TestBridgeRuntimeEmptyVersionIsProbeFailed(t *testing.T) {
+	for name, version := range map[string]string{
+		"empty":      "",
+		"whitespace": " \t\r\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			const path = "/found/opencode"
+			deps := bridgeTestDeps()
+			deps.resolveAgentExecutablePath = func(command string) (string, error) {
+				if command == "opencode" {
+					return path, nil
+				}
+				return "", errBridgeTestMissing
+			}
+			deps.detectVersion = func(context.Context, agent.Command) (string, error) {
+				return version, nil
+			}
+
+			runtime := runtimeByProvider(t, newBridge("install-a", nil, deps).Refresh(context.Background()), "opencode")
+			if runtime.Status != BridgeRuntimeProbeFailed {
+				t.Fatalf("empty version status = %q, want probe_failed", runtime.Status)
+			}
+			if runtime.Version != "" || runtime.Path != path || runtime.ID == "" {
+				t.Fatalf("empty version runtime = %+v, want found identity without a version", runtime)
+			}
+		})
+	}
+}
+
+func TestBridgeRuntimeStickyEmptyVersionKeepsReadyIdentity(t *testing.T) {
+	for name, version := range map[string]string{
+		"empty":      "",
+		"whitespace": " \t\r\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			const path = "/found/opencode"
+			deps := bridgeTestDeps()
+			deps.resolveAgentExecutablePath = func(command string) (string, error) {
+				if command == "opencode" {
+					return path, nil
+				}
+				return "", errBridgeTestMissing
+			}
+			probe := 0
+			deps.detectVersion = func(context.Context, agent.Command) (string, error) {
+				probe++
+				if probe == 1 {
+					return "1.2.3", nil
+				}
+				return version, nil
+			}
+
+			bridge := newBridge("install-a", nil, deps)
+			first := runtimeByProvider(t, bridge.Refresh(context.Background()), "opencode")
+			second := runtimeByProvider(t, bridge.Refresh(context.Background()), "opencode")
+			if first.Status != BridgeRuntimeReady {
+				t.Fatalf("initial status = %q, want ready", first.Status)
+			}
+			if second.Status != BridgeRuntimeProbeFailed {
+				t.Fatalf("empty sticky version status = %q, want probe_failed", second.Status)
+			}
+			if second.Version != first.Version || second.Path != first.Path || second.ID != first.ID {
+				t.Fatalf("empty sticky version lost prior runtime: first=%+v second=%+v", first, second)
+			}
+		})
+	}
+}
+
 func TestBridgeRuntimeExecFormatIsFoundNotRunnable(t *testing.T) {
 	path := "/found/codex"
 	execErr := &os.PathError{Op: "fork/exec", Path: path, Err: syscall.ENOEXEC}

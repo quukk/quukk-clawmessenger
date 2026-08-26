@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -202,6 +203,9 @@ func (b *Bridge) probeRuntime(ctx context.Context, spec bridgeRuntimeSpec, candi
 		if agent.IsExecFormatError(err) {
 			runtime.Status = BridgeRuntimeNotRunnable
 		}
+		return runtime
+	}
+	if strings.TrimSpace(version) == "" {
 		return runtime
 	}
 	runtime.Version = version

@@ -12,7 +12,7 @@
 - `packages/quukk-clawmessenger`: publishable Node.js entry package for the local ClawMessenger bridge.
 - `apps/bridge`: private React/Vite workspace that builds local Bridge UI assets into the entry package.
 - `server/internal/daemon/bridge*.go`: injected, bounded discovery for local OpenCode, OpenClaw, Codex, and Hermes runtimes, kept separate from the existing daemon lifecycle.
-- Agent probe output is retained up to 64 KiB so a noisy version command cannot grow daemon memory without bound.
+- Synchronous agent probe output shares a 64 KiB cap so noisy version and catalog commands safely fail instead of growing daemon memory without bound; Task 14/CI must watch for real catalog output above that limit.
 - RongCloud, task execution, registration transport, and Bridge HTTP endpoints remain intentionally unimplemented at this stage.
 
 ## External service prerequisite
