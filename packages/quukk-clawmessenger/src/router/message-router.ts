@@ -524,12 +524,14 @@ export class MessageRouter {
   readonly #bufferDrainTasks = new Map<string, string>();
   readonly #discussion = new Map<string, BindingDiscussionState>();
   readonly #inflightByBinding = new Map<string, InflightBindingOperations>();
+  readonly #outboundByBinding = new Map<string, Set<Promise<unknown>>>();
   readonly #bindingDisposals = new Map<string, Promise<void>>();
   readonly #disposedBindings = new Set<string>();
   readonly #bindingGenerations = new Map<string, number>();
   #bufferOrder = 0;
   #waiting = 0;
   #disposed = false;
+  #disposeAttempt?: Promise<void>;
 
   constructor(options: MessageRouterOptions) {
     this.#task = options.task;
@@ -695,10 +697,18 @@ export class MessageRouter {
       this.#discussion.delete(key);
     }
     await Promise.allSettled(cancellations);
+    const outbound = this.#outboundByBinding.get(key);
+    if (outbound !== undefined) await Promise.allSettled([...outbound]);
   }
 
-  async dispose(): Promise<void> {
-    if (this.#disposed) return;
+  dispose(): Promise<void> {
+    if (this.#disposeAttempt !== undefined) return this.#disposeAttempt;
+    const attempt = this.#disposeOnce();
+    this.#disposeAttempt = attempt;
+    return attempt;
+  }
+
+  async #disposeOnce(): Promise<void> {
     this.#disposed = true;
     const identities = new Map<string, WorkerIdentity>();
     for (const active of this.#active.values()) identities.set(active.bindingKey, active.identity);
@@ -2094,6 +2104,32 @@ export class MessageRouter {
     }
   }
 
+  #trackOutbound<T>(identity: WorkerIdentity, operation: Promise<T>): Promise<T> {
+    const key = bindingKey(identity);
+    let outbound = this.#outboundByBinding.get(key);
+    if (outbound === undefined) {
+      outbound = new Set();
+      this.#outboundByBinding.set(key, outbound);
+    }
+    outbound.add(operation);
+    const complete = (): void => {
+      outbound.delete(operation);
+      if (outbound.size === 0 && this.#outboundByBinding.get(key) === outbound) {
+        this.#outboundByBinding.delete(key);
+      }
+    };
+    void operation.then(complete, complete);
+    return operation;
+  }
+
+  #sendWorker(identity: WorkerIdentity, input: RouterWorkerSend): Promise<string | undefined> {
+    return this.#trackOutbound(identity, this.#worker.send(identity, input));
+  }
+
+  #receiptWorker(identity: WorkerIdentity, input: RouterReceipt): Promise<void> {
+    return this.#trackOutbound(identity, this.#worker.receipt(identity, input));
+  }
+
   async #admitOnly(
     identity: WorkerIdentity,
     message: NormalizedRongCloudMessage,
@@ -2143,7 +2179,7 @@ export class MessageRouter {
         && (buffer.active.suppressed
           || !this.#bindingGenerationCurrent(identity, buffer.generation))) return;
       try {
-        await this.#worker.send(identity, messages[index]!);
+        await this.#sendWorker(identity, messages[index]!);
         if (expectedGeneration !== undefined
           && !this.#bindingGenerationCurrent(identity, expectedGeneration)) return;
         if (buffer !== undefined
@@ -2336,10 +2372,10 @@ export class MessageRouter {
     const admitted = await this.#state.admitMessage(claim.key, claim.claimId).catch(() => false);
     if (!admitted) return;
     if (!this.#bindingGenerationCurrent(identity, generation)) return;
-    await this.#worker.send(identity, response).catch(() => undefined);
+    await this.#sendWorker(identity, response).catch(() => undefined);
     if (!this.#bindingGenerationCurrent(identity, generation)) return;
     if (update !== undefined && result.status === 'success') {
-      await this.#worker.send(identity, update).catch(() => undefined);
+      await this.#sendWorker(identity, update).catch(() => undefined);
       if (!this.#bindingGenerationCurrent(identity, generation)) return;
     }
     await this.#sendReceipt(identity, this.#receipt(message, message.messageUid), generation);
@@ -2750,7 +2786,7 @@ export class MessageRouter {
       return;
     }
     try {
-      await this.#worker.send(identity, response);
+      await this.#sendWorker(identity, response);
     } catch {
       await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
       return;
@@ -2773,7 +2809,7 @@ export class MessageRouter {
     const admitted = await this.#state.admitMessage(claim.key, claim.claimId).catch(() => false);
     if (!admitted) return;
     if (!this.#bindingGenerationCurrent(identity, generation)) return;
-    await this.#worker.send(identity, response).catch(() => undefined);
+    await this.#sendWorker(identity, response).catch(() => undefined);
     if (!this.#bindingGenerationCurrent(identity, generation)) return;
     await this.#sendReceipt(identity, this.#receipt(message, message.messageUid), generation);
   }
@@ -2784,7 +2820,7 @@ export class MessageRouter {
     generation: number,
   ): Promise<void> {
     if (!this.#bindingGenerationCurrent(identity, generation)) return;
-    await this.#worker.receipt(identity, receipt).catch(() => undefined);
+    await this.#receiptWorker(identity, receipt).catch(() => undefined);
   }
 
   #textResponse(conversation: ConversationIdentity, content: string): RouterWorkerSend {
@@ -3036,7 +3072,7 @@ export class MessageRouter {
         return;
       }
 
-      await this.#worker.receipt(identity, this.#receipt(message, candidate.effectiveMessageUid))
+      await this.#receiptWorker(identity, this.#receipt(message, candidate.effectiveMessageUid))
         .catch(() => this.#logFailure(active, 'receipt_failed'));
       if (!this.#bindingGenerationCurrent(identity, generation)) {
         active.suppressed = true;
@@ -3044,7 +3080,7 @@ export class MessageRouter {
         active.resolveDone();
         return;
       }
-      await this.#worker.send(identity, {
+      await this.#sendWorker(identity, {
         conversationType: candidate.conversation.conversationType,
         targetId: replyTargetId(candidate.conversation),
         messageType: 'text',
@@ -3230,7 +3266,7 @@ export class MessageRouter {
         const chunk = chunks[index]!;
         const message = this.#textResponse(active.conversation, chunk);
         try {
-          await this.#worker.send(active.identity, message);
+          await this.#sendWorker(active.identity, message);
           active.deliveredTextCharacters += chunk.length;
           if (!this.#bindingGenerationCurrent(active.identity, active.generation)) return;
         } catch (error) {
@@ -3284,7 +3320,7 @@ export class MessageRouter {
       const messages = [...textMessages, ...cardMessages];
       for (let index = 0; index < messages.length; index += 1) {
         try {
-          await this.#worker.send(active.identity, messages[index]!);
+          await this.#sendWorker(active.identity, messages[index]!);
           if (!this.#bindingGenerationCurrent(active.identity, active.generation)) return;
         } catch (error) {
           const code = workerErrorCode(error);
@@ -3413,7 +3449,7 @@ export class MessageRouter {
       }
       this.#bufferDrainTasks.set(bindKey, entry.taskId);
       try {
-        await this.#worker.send(entry.identity, message);
+        await this.#sendWorker(entry.identity, message);
       } catch (error) {
         const code = workerErrorCode(error);
         if (this.#bufferDrainTasks.get(bindKey) === entry.taskId) {
@@ -3486,7 +3522,7 @@ export class MessageRouter {
     const bounded = Buffer.byteLength(content, 'utf8') <= 32 * 1024
       ? content
       : Buffer.from(content, 'utf8').subarray(0, 32 * 1024).toString('utf8');
-    await this.#worker.send(identity, {
+    await this.#sendWorker(identity, {
       conversationType: conversation.conversationType,
       targetId: replyTargetId(conversation),
       messageType: 'text',

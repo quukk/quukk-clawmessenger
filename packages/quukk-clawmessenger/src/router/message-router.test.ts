@@ -966,6 +966,130 @@ describe('MessageRouter plain task admission', () => {
     expect(fixture.state.releaseCalls).toBe(1);
   });
 
+  it('does not finish binding disposal until an already-started send completes', async () => {
+    const fixture = await routerHarness();
+    const originalSend = fixture.worker.send.bind(fixture.worker);
+    const order: string[] = [];
+    let sendEntered!: () => void;
+    let releaseSend!: () => void;
+    const sendWasEntered = new Promise<void>((resolve) => { sendEntered = resolve; });
+    const sendGate = new Promise<void>((resolve) => { releaseSend = resolve; });
+    fixture.worker.send = async (identity, input) => {
+      order.push('send-started');
+      sendEntered();
+      await sendGate;
+      const result = await originalSend(identity, input);
+      order.push('send-finished');
+      return result;
+    };
+
+    const routing = fixture.router.onWorkerEvent(
+      IDENTITY_A,
+      inbound(IDENTITY_A, message('', 'invalid')),
+    );
+    await sendWasEntered;
+    let disposalSettled = false;
+    const disposal = fixture.router.disposeBinding(IDENTITY_A).then(() => {
+      disposalSettled = true;
+      order.push('dispose-finished');
+    });
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    const settledBeforeSend = disposalSettled;
+    releaseSend();
+    await Promise.all([routing, disposal]);
+
+    expect(settledBeforeSend).toBe(false);
+    expect(order).toEqual(['send-started', 'send-finished', 'dispose-finished']);
+    expect(fixture.sent).toHaveLength(1);
+    expect(fixture.receipts).toEqual([]);
+  });
+
+  it('does not finish global disposal until an already-started receipt completes', async () => {
+    const fixture = await routerHarness();
+    const originalReceipt = fixture.worker.receipt.bind(fixture.worker);
+    const order: string[] = [];
+    let receiptEntered!: () => void;
+    let releaseReceipt!: () => void;
+    const receiptWasEntered = new Promise<void>((resolve) => { receiptEntered = resolve; });
+    const receiptGate = new Promise<void>((resolve) => { releaseReceipt = resolve; });
+    fixture.worker.receipt = async (identity, input) => {
+      order.push('receipt-started');
+      receiptEntered();
+      await receiptGate;
+      await originalReceipt(identity, input);
+      order.push('receipt-finished');
+    };
+
+    const routing = fixture.router.onWorkerEvent(
+      IDENTITY_A,
+      inbound(IDENTITY_A, message('dispose-pending-receipt')),
+    );
+    await receiptWasEntered;
+    let disposalSettled = false;
+    const disposal = fixture.router.dispose().then(() => {
+      disposalSettled = true;
+      order.push('dispose-finished');
+    });
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    const settledBeforeReceipt = disposalSettled;
+    releaseReceipt();
+    await Promise.all([routing, disposal]);
+
+    expect(settledBeforeReceipt).toBe(false);
+    expect(order).toEqual(['receipt-started', 'receipt-finished', 'dispose-finished']);
+    expect(fixture.receipts).toHaveLength(1);
+    expect(fixture.sent).toEqual([]);
+  });
+
+  it('shares one global disposal promise while task cancellation is still pending', async () => {
+    const fixture = await routerHarness();
+    let nextEntered!: () => void;
+    let resolveNext!: (value: IteratorResult<BridgeTaskEvent>) => void;
+    const nextWasEntered = new Promise<void>((resolve) => { nextEntered = resolve; });
+    fixture.setEvents(() => ({
+      [Symbol.asyncIterator]() {
+        return {
+          next: () => {
+            nextEntered();
+            return new Promise<IteratorResult<BridgeTaskEvent>>((resolve) => { resolveNext = resolve; });
+          },
+          return: async () => {
+            resolveNext({ done: true, value: undefined });
+            return { done: true as const, value: undefined };
+          },
+        };
+      },
+    }));
+    let cancelEntered!: () => void;
+    let releaseCancel!: () => void;
+    const cancelWasEntered = new Promise<void>((resolve) => { cancelEntered = resolve; });
+    const cancelGate = new Promise<void>((resolve) => { releaseCancel = resolve; });
+    fixture.task.cancelTask = async (taskId) => {
+      fixture.cancellations.push(taskId);
+      cancelEntered();
+      await cancelGate;
+    };
+
+    const routing = fixture.router.onWorkerEvent(
+      IDENTITY_A,
+      inbound(IDENTITY_A, message('dispose-shared-attempt')),
+    );
+    await nextWasEntered;
+    const first = fixture.router.dispose();
+    const second = fixture.router.dispose();
+    await cancelWasEntered;
+    let secondSettled = false;
+    void second.then(() => { secondSettled = true; });
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    const settledBeforeCancel = secondSettled;
+    releaseCancel();
+    await Promise.all([routing, first, second]);
+
+    expect(second).toBe(first);
+    expect(settledBeforeCancel).toBe(false);
+    expect(fixture.cancellations).toEqual(['task_1_1']);
+  });
+
   it('cancels a plain task id that arrives after binding disposal without admitting or emitting', async () => {
     const fixture = await routerHarness();
     let startEntered!: () => void;
