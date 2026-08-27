@@ -8,8 +8,17 @@ This fork retains the complete upstream Multica `LICENSE` and `NOTICE` without m
 
 This product includes adaptations from Codex ClawMessenger, pinned to commit `3f3a2e4d6a8cb143a0088350aed2e1b4d1675473`.
 
-Source repository: https://github.com/quukk/codex-clawmessenger
-Source package: https://www.npmjs.com/package/@quukk/codex-clawmessenger
+Repository URL recorded by the pinned local source: https://github.com/quukk/codex-clawmessenger
+
+- Exact public package: https://www.npmjs.com/package/@quukk/codex-clawmessenger/v/0.1.2
+- Registry tarball: https://registry.npmjs.org/@quukk/codex-clawmessenger/-/codex-clawmessenger-0.1.2.tgz
+- Registry integrity: `sha512-uxxhcg578MXs6xhLSWctWmITB9c76E0BCg4nTOWut9iTM+bZYCxmiTO38kUTDr+MqSGhDQxUEwepRK5MV2yHPw==`
+
+The repository URL and pinned commit were not publicly retrievable during the 2026-08-28 release
+audit. The exact commit exists in the local source checkout, but npm publication remains blocked
+until that commit is available from a durable public tag or source archive. The public npm
+tarball above is an additional immutable artifact; it does not replace the source-publication
+gate.
 
 Adapted local files include the provider-neutral message contracts, discussion v2 contracts, discussion wire codec, CardKit schema/builders/validator, and the byte-for-byte discussion wire fixture. Exact per-file and fixture provenance is recorded in source headers and `packages/quukk-clawmessenger/src/protocol/fixtures/README.md`.
 
@@ -39,8 +48,18 @@ SOFTWARE.
 
 This product includes adaptations from OpenClaw ClawMessenger, pinned to commit `a50f2393213f6f1c42da139491d2fe20937e7c7a`.
 
-Source repository: https://github.com/quukk/clawmessenger
-Source package: https://www.npmjs.com/package/claw_messenger
+Repository URL recorded by the pinned package: https://github.com/quukk/clawmessenger
+
+- Exact public package: https://www.npmjs.com/package/claw_messenger/v/1.4.1-beta.2
+- Registry tarball: https://registry.npmjs.org/claw_messenger/-/claw_messenger-1.4.1-beta.2.tgz
+- Registry integrity: `sha512-wciJzSa/pIwKm+oDog434M5xR0dHmazcF0yOF8MGDVOCy788fmt60HvnEGO5P05bpvmgjPPlHnjQI0PeVZfg7A==`
+
+The package repository URL and pinned commit were not publicly retrievable during the 2026-08-28
+release audit, and the local checkout's configured origin uses a different, misspelled repository
+name. The exact commit exists locally, but npm publication remains blocked until that commit is
+available from a durable public tag or source archive and the canonical repository URL is
+corrected. The public npm tarball above is an additional immutable artifact; it does not replace
+the source-publication gate.
 
 Adapted local files include discussion v1/v2 contracts, the discussion wire codec, CardKit schema/builders/validator/marker/templates, and manually adapted fixtures. `src/cardkit/action-router.ts` is a new provider-neutral implementation based only on the public MIT CardAction schema and this project's contract; no upstream action-router implementation was copied. Exact mappings are recorded in source headers and the fixture provenance README.
 
