@@ -371,6 +371,22 @@ describe('runCli', () => {
     );
   });
 
+  it('accepts an epoch-zero clock when the ticket has exactly 30 seconds remaining', async () => {
+    const test = harness();
+    test.runtime.control.mockResolvedValue({
+      command: 'launch_ticket',
+      value: { ticket: CANONICAL_TICKET, expiresAt: 30_000 },
+    });
+
+    const exitCode = await runCli(['setup'], { ...test.options, now: () => 0 });
+
+    expect(exitCode).toBe(0);
+    expect(test.stderr).toEqual([]);
+    expect(test.browser.open).toHaveBeenCalledWith(
+      `http://127.0.0.1:43210/setup#ticket=${CANONICAL_TICKET}`,
+    );
+  });
+
   it('rejects non-exact launch-ticket response objects without exposing extra fields', async () => {
     const test = harness();
     const secretSentinel = 'SECRET-LAUNCH-RESPONSE';
@@ -470,16 +486,8 @@ describe('runCli', () => {
   });
 
   it.each([
-    { runtimeExit: 1, expectedExit: 1 },
-    { runtimeExit: 2, expectedExit: 2 },
-    { runtimeExit: 3, expectedExit: 3 },
-    { runtimeExit: 4, expectedExit: 4 },
-    { runtimeExit: 5, expectedExit: 5 },
-    { runtimeExit: 9, expectedExit: 1 },
-  ])('keeps one ready JSON object and safely maps foreground exit $runtimeExit', async ({
-    runtimeExit,
-    expectedExit,
-  }) => {
+    1, 2, 3, 4, 5, 9,
+  ])('latches the first ready JSON result despite later foreground exit %s', async (runtimeExit) => {
     const test = harness();
     test.runtime.runForeground.mockImplementation(async (_input, foreground) => {
       await foreground.onReady(READY_IDENTITY);
@@ -491,7 +499,7 @@ describe('runCli', () => {
       test.options,
     );
 
-    expect(exitCode).toBe(expectedExit);
+    expect(exitCode).toBe(0);
     expect(test.stderr).toEqual([]);
     expect(test.stdout).toEqual([JSON.stringify({
       schemaVersion: 1,
@@ -529,7 +537,25 @@ describe('runCli', () => {
     })]);
   });
 
-  it('keeps one ready JSON object when a foreground runtime later throws a fixed failure', async () => {
+  it.each([
+    {
+      argv: ['start', '--foreground', '--no-open'],
+      expected: 'quukk-clawmessenger: start ready',
+    },
+    {
+      argv: ['start', '--foreground', '--no-open', '--json'],
+      expected: JSON.stringify({
+        schemaVersion: 1,
+        ok: true,
+        command: 'start',
+        state: 'ready',
+        alreadyRunning: false,
+      }),
+    },
+  ])('latches the first ready result when the foreground runtime later throws for $argv', async ({
+    argv,
+    expected,
+  }) => {
     const test = harness();
     test.runtime.runForeground.mockImplementation(async (_input, foreground) => {
       await foreground.onReady(READY_IDENTITY);
@@ -538,21 +564,97 @@ describe('runCli', () => {
       });
     });
 
-    const exitCode = await runCli(
-      ['start', '--foreground', '--no-open', '--json'],
-      test.options,
-    );
+    const exitCode = await runCli(argv, test.options);
 
-    expect(exitCode).toBe(4);
+    expect(exitCode).toBe(0);
     expect(test.stderr).toEqual([]);
-    expect(test.stdout).toEqual([JSON.stringify({
-      schemaVersion: 1,
-      ok: true,
-      command: 'start',
-      state: 'ready',
-      alreadyRunning: false,
-    })]);
+    expect(test.stdout).toEqual([expected]);
     expect(test.stdout[0]).not.toContain('SECRET-FOREGROUND-DETAIL');
+  });
+
+  it.each([
+    {
+      argv: ['start', '--foreground'],
+      expectedStdout: [] as string[],
+      expectedStderr: ['quukk-clawmessenger: browser_open_failed'],
+    },
+    {
+      argv: ['start', '--foreground', '--json'],
+      expectedStdout: [JSON.stringify({
+        schemaVersion: 1,
+        ok: false,
+        command: 'start',
+        error: { code: 'browser_open_failed' },
+      })],
+      expectedStderr: [] as string[],
+    },
+  ])('keeps the first browser failure when the foreground runtime later throws for $argv', async ({
+    argv,
+    expectedStdout,
+    expectedStderr,
+  }) => {
+    const test = harness();
+    test.runtime.control.mockResolvedValue({
+      command: 'launch_ticket',
+      value: { ticket: CANONICAL_TICKET, expiresAt: NOW + 30_000 },
+    });
+    test.browser.open.mockRejectedValue(new Error('SECRET-BROWSER-LATCH'));
+    test.runtime.runForeground.mockImplementation(async (_input, foreground) => {
+      await foreground.onReady(READY_IDENTITY);
+      throw Object.assign(new Error('SECRET-PROCESS-LATCH'), {
+        code: 'process_unverified',
+      });
+    });
+
+    const exitCode = await runCli(argv, test.options);
+
+    expect(exitCode).toBe(5);
+    expect(test.stdout).toEqual(expectedStdout);
+    expect(test.stderr).toEqual(expectedStderr);
+    expect([...test.stdout, ...test.stderr]).toHaveLength(1);
+    expect(`${test.stdout.join(' ')} ${test.stderr.join(' ')}`).not.toContain('SECRET-');
+  });
+
+  it.each([
+    {
+      argv: ['start', '--foreground'],
+      expectedStdout: [] as string[],
+      expectedStderr: ['quukk-clawmessenger: browser_open_failed'],
+    },
+    {
+      argv: ['start', '--foreground', '--json'],
+      expectedStdout: [JSON.stringify({
+        schemaVersion: 1,
+        ok: false,
+        command: 'start',
+        error: { code: 'browser_open_failed' },
+      })],
+      expectedStderr: [] as string[],
+    },
+  ])('locks the first onReady failure when readiness is reported twice for $argv', async ({
+    argv,
+    expectedStdout,
+    expectedStderr,
+  }) => {
+    const test = harness();
+    test.runtime.control.mockResolvedValue({
+      command: 'launch_ticket',
+      value: { ticket: CANONICAL_TICKET, expiresAt: NOW + 30_000 },
+    });
+    test.browser.open.mockRejectedValue(new Error('SECRET-FIRST-READY-FAILURE'));
+    test.runtime.runForeground.mockImplementation(async (_input, foreground) => {
+      await foreground.onReady(READY_IDENTITY);
+      await foreground.onReady(READY_IDENTITY);
+      return 0;
+    });
+
+    const exitCode = await runCli(argv, test.options);
+
+    expect(exitCode).toBe(5);
+    expect(test.stdout).toEqual(expectedStdout);
+    expect(test.stderr).toEqual(expectedStderr);
+    expect([...test.stdout, ...test.stderr]).toHaveLength(1);
+    expect(`${test.stdout.join(' ')} ${test.stderr.join(' ')}`).not.toContain('SECRET-');
   });
 
   it('emits exactly once when a foreground runtime reports ready concurrently', async () => {

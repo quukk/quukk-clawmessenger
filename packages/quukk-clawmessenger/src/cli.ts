@@ -752,12 +752,13 @@ async function openBrowser(
     await options.runtime.control(identity, 'launch_ticket'),
   );
   const now = options.now?.() ?? Date.now();
+  const remaining = response.success ? response.data.value.expiresAt - now : Number.NaN;
   if (
     !response.success
     || !Number.isSafeInteger(now)
-    || now <= 0
-    || response.data.value.expiresAt <= now
-    || response.data.value.expiresAt > now + 30_000
+    || !Number.isSafeInteger(remaining)
+    || remaining <= 0
+    || remaining > 30_000
   ) throw new CliFailure('operation_unavailable');
   const pathname = command === 'setup' ? '/setup' : '/';
   const url = `http://${identity.address}${pathname}#ticket=${response.data.value.ticket}`;
@@ -775,17 +776,19 @@ async function startCommand(parsed: ParsedCli, options: RunCliOptions): Promise<
     configOverrides: parsed.configOverrides,
   };
   if (parsed.foreground) {
-    let readyFailure: CliFailure | undefined;
     let readySeen = false;
-    let emitted = false;
-    const emitFixedFailureOnce = (failure: CliFailure): number => {
-      if (emitted) return exitCode(failure.code);
-      emitted = true;
-      return emitFailure(options.io, parsed, failure.code);
+    let terminalExit: number | undefined;
+    const emitTerminalFailure = (failure: CliFailure): number => {
+      if (terminalExit !== undefined) return terminalExit;
+      terminalExit = exitCode(failure.code);
+      emitFailure(options.io, parsed, failure.code);
+      return terminalExit;
     };
-    const emitReadyFailure = (failure: CliFailure): void => {
-      readyFailure = failure;
-      emitFixedFailureOnce(failure);
+    const emitTerminalSuccess = (): number => {
+      if (terminalExit !== undefined) return terminalExit;
+      terminalExit = 0;
+      emitStartSuccess(parsed, options.io, false);
+      return terminalExit;
     };
     let runtimeExit: number;
     try {
@@ -793,45 +796,37 @@ async function startCommand(parsed: ParsedCli, options: RunCliOptions): Promise<
         daemonChild: parsed.daemonChild,
         onReady: async (value) => {
           if (readySeen) {
-            emitReadyFailure(new CliFailure('runtime_response_invalid'));
+            emitTerminalFailure(new CliFailure('runtime_response_invalid'));
             return;
           }
           readySeen = true;
           const identity = ReadyDaemonIdentitySchema.safeParse(value);
           if (!identity.success) {
-            emitReadyFailure(new CliFailure('runtime_response_invalid'));
+            emitTerminalFailure(new CliFailure('runtime_response_invalid'));
             return;
           }
           if (!parsed.noOpen) {
             try {
               await openBrowser(parsed.command as 'start', identity.data, options);
             } catch (error) {
-              emitReadyFailure(fixedFailure(error));
+              emitTerminalFailure(fixedFailure(error));
               return;
             }
           }
-          if (readyFailure !== undefined || emitted) return;
-          emitted = true;
-          emitStartSuccess(parsed, options.io, false);
+          emitTerminalSuccess();
         },
       });
     } catch (error) {
-      const failure = fixedFailure(error);
-      return emitFixedFailureOnce(failure);
+      return emitTerminalFailure(fixedFailure(error));
     }
-    if (readyFailure !== undefined) return exitCode(readyFailure.code);
+    if (terminalExit !== undefined) return terminalExit;
     if (!Number.isInteger(runtimeExit) || runtimeExit < 0 || runtimeExit > 255) {
-      return emitFixedFailureOnce(new CliFailure('runtime_response_invalid'));
+      return emitTerminalFailure(new CliFailure('runtime_response_invalid'));
     }
     if (runtimeExit !== 0) {
-      const failure = fixedForegroundFailure(runtimeExit);
-      if (!readySeen) return emitFixedFailureOnce(failure);
-      return exitCode(failure.code);
+      return emitTerminalFailure(fixedForegroundFailure(runtimeExit));
     }
-    if (!readySeen) {
-      return emitFixedFailureOnce(new CliFailure('runtime_response_invalid'));
-    }
-    return 0;
+    return emitTerminalFailure(new CliFailure('runtime_response_invalid'));
   }
   const result = checkedStartResult(await options.runtime.start(input));
   if (result.alreadyRunning && hasOverrides(parsed.configOverrides)) {
