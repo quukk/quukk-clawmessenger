@@ -1,5 +1,7 @@
 // @vitest-environment node
 
+import { access } from 'node:fs/promises';
+
 import { describe, expect, it } from 'vitest';
 
 import type { EnableResponse, RuntimesResponse } from '../../src/http/routes.js';
@@ -8,6 +10,8 @@ import {
   E2E_RUNTIME_IDS,
   type E2EHarness,
 } from './fake-runtime.js';
+import { FakeRegistrationServer } from './fake-registration.js';
+import { expectNoSentinels } from './redaction-assertions.js';
 
 function sensitiveSentinels(harness: E2EHarness): string[] {
   const identity = harness.store.bridgeIdentity();
@@ -24,8 +28,7 @@ function sensitiveSentinels(harness: E2EHarness): string[] {
 }
 
 function expectRedacted(material: unknown, harness: E2EHarness): void {
-  const serialized = JSON.stringify(material);
-  for (const sentinel of sensitiveSentinels(harness)) expect(serialized).not.toContain(sentinel);
+  expectNoSentinels(material, sensitiveSentinels(harness));
 }
 
 describe('Quukk setup E2E', () => {
@@ -41,6 +44,12 @@ describe('Quukk setup E2E', () => {
       ]);
       expect(detected.runtimes.every((runtime) =>
         !Object.hasOwn(runtime, 'token') && !Object.hasOwn(runtime, 'tokenRef'))).toBe(true);
+      expect(detected.runtimes.map(({ provider, path }) => ({ provider, path }))).toEqual(
+        (['opencode', 'openclaw', 'codex', 'hermes'] as const).map((provider) => ({
+          provider,
+          path: harness.runtime.runtimePath(provider),
+        })),
+      );
 
       const one = await harness.api.post<EnableResponse>('/api/bindings/enable', {
         runtimeIds: [E2E_RUNTIME_IDS.opencode],
@@ -72,7 +81,8 @@ describe('Quukk setup E2E', () => {
         `${runtimeId}:${nodeId}`)).size).toBe(4);
       expect(new Set(harness.workers.credentialDigests()).size).toBe(4);
 
-      expectRedacted([detected, one, all, harness.workers.snapshots()], harness);
+      // Runtime executable paths are intentionally shown by the trusted setup UI.
+      expectRedacted([one, all, harness.workers.snapshots()], harness);
       expect(harness.registration.rawSecretSeen()).toBe(false);
     } finally {
       await harness.close();
@@ -146,5 +156,40 @@ describe('Quukk setup E2E', () => {
     } finally {
       await harness.close();
     }
+  });
+
+  it('detects a raw bridge secret in the registration query string', async () => {
+    const registration = new FakeRegistrationServer();
+    try {
+      const serverUrl = await registration.start();
+      const secret = 'QUERY-RAW-BRIDGE-SECRET-SENTINEL';
+      registration.forbidRawSecret(secret);
+      const response = await fetch(`${serverUrl}/api/ai/register?leak=${encodeURIComponent(secret)}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Node-Enrollment-Token': `qce_v1_${'A'.repeat(43)}`,
+        },
+        body: JSON.stringify({ node_type: 'opencode' }),
+      });
+      expect(response.status).toBe(200);
+      expect(registration.rawSecretSeen()).toBe(true);
+    } finally {
+      await registration.close();
+    }
+  });
+
+  it('closes registration and removes its owned temporary home when setup fails', async () => {
+    let acquired: { homeDirectory: string; registration: FakeRegistrationServer } | undefined;
+    await expect(createE2EHarness({
+      afterRegistrationStarted(context) {
+        acquired = context;
+        throw new Error('injected_setup_failure');
+      },
+    })).rejects.toThrow('injected_setup_failure');
+
+    expect(acquired).toBeDefined();
+    expect(acquired!.registration.isRunning()).toBe(false);
+    await expect(access(acquired!.homeDirectory)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });

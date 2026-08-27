@@ -15,6 +15,7 @@ import {
   temporaryE2EHome,
   type E2EHarness,
 } from './fake-runtime.js';
+import { expectNoSentinels, parseJsonLogRecords } from './redaction-assertions.js';
 
 function message(uid: string, text: string): NormalizedRongCloudMessage {
   return {
@@ -83,12 +84,12 @@ describe('Quukk restart E2E', () => {
 
       const diagnostics = await second.api.get<DiagnosticsResponse>('/api/diagnostics');
       const activity = await second.api.get<ActivityResponse>('/api/activity');
-      const publicMaterial = JSON.stringify([
+      const publicMaterial = [
         diagnostics,
         activity,
         second.workers.snapshots(),
         second.workers.outbound(),
-      ]);
+      ];
       const identity = second.store.bridgeIdentity();
       const sentinels = [
         identity.secret,
@@ -101,13 +102,13 @@ describe('Quukk restart E2E', () => {
         'PROMPT-SENTINEL-OPENCLAW',
         ...(['opencode', 'openclaw', 'codex', 'hermes'] as const).map((provider) => runtime.runtimePath(provider)),
       ];
-      for (const sentinel of sentinels) expect(publicMaterial).not.toContain(sentinel);
+      expectNoSentinels(publicMaterial, sentinels);
       expect(registration.rawSecretSeen()).toBe(false);
 
       const logPath = second.logPath;
       await second.shutdownViaControl();
       const logs = await readFile(logPath, 'utf8');
-      for (const sentinel of sentinels) expect(logs).not.toContain(sentinel);
+      expectNoSentinels(parseJsonLogRecords(logs), sentinels);
       expect(runtime.shutdownRequests()).toBe(2);
       second = undefined;
     } finally {

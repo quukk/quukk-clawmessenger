@@ -10,6 +10,14 @@ export const E2E_MAC_SENTINEL = '02:11:22:33:44:55';
 type RegistrationRecord = { provider: Provider; nodeId: string };
 type ProofOwner = RegistrationRecord & { token: string };
 
+function containsString(value: unknown, sentinel: string, seen = new Set<object>()): boolean {
+  if (typeof value === 'string') return value.includes(sentinel);
+  if (typeof value !== 'object' || value === null || seen.has(value)) return false;
+  seen.add(value);
+  return Object.entries(value).some(([key, entry]) =>
+    key.includes(sentinel) || containsString(entry, sentinel, seen));
+}
+
 function json(response: ServerResponse, status: number, value: unknown): void {
   const responseBody = JSON.stringify(value);
   response.writeHead(status, {
@@ -122,7 +130,18 @@ export class FakeRegistrationServer {
     return this.#rawSecretSeen;
   }
 
+  isRunning(): boolean {
+    return this.#server !== undefined;
+  }
+
+  #observeRawSecret(value: unknown): void {
+    if (this.#forbiddenSecret !== undefined
+      && containsString(value, this.#forbiddenSecret)) this.#rawSecretSeen = true;
+  }
+
   async #handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    this.#observeRawSecret(request.url ?? '');
+    this.#observeRawSecret(request.headers);
     const pathname = new URL(request.url ?? '/', 'http://127.0.0.1').pathname;
     if (request.method === 'GET' && pathname === '/im/api/config/rongcloud') {
       json(response, 200, { code: 200, data: { appKey: this.appKey } });
@@ -134,12 +153,9 @@ export class FakeRegistrationServer {
     }
 
     const input = await body(request);
+    this.#observeRawSecret(input);
     const provider = input.node_type;
     const proof = request.headers['x-node-enrollment-token'];
-    const material = JSON.stringify({ headers: request.headers, body: input });
-    if (this.#forbiddenSecret !== undefined && material.includes(this.#forbiddenSecret)) {
-      this.#rawSecretSeen = true;
-    }
     if (typeof provider !== 'string' || !PROVIDERS.includes(provider as Provider)
       || typeof proof !== 'string' || !/^qce_v1_[A-Za-z0-9_-]{43}$/.test(proof)) {
       json(response, 400, { code: 400 });

@@ -539,83 +539,108 @@ export async function removeE2EHome(directory: string): Promise<void> {
   await rm(target, { recursive: true, force: true });
 }
 
-export async function createE2EHarness(options: {
+type E2EHarnessOptions = {
   homeDirectory?: string;
   runtime?: FakeBridgeRuntime;
   registration?: FakeRegistrationServer;
   allReady?: boolean;
   trace?: string[];
-} = {}): Promise<E2EHarness> {
+  afterRegistrationStarted?(context: {
+    homeDirectory: string;
+    registration: FakeRegistrationServer;
+  }): void | Promise<void>;
+};
+
+async function disposeSetup(disposers: Array<() => Promise<void>>): Promise<void> {
+  for (const dispose of disposers.reverse()) {
+    await dispose().catch(() => undefined);
+  }
+}
+
+export async function createE2EHarness(options: E2EHarnessOptions = {}): Promise<E2EHarness> {
+  const disposers: Array<() => Promise<void>> = [];
   const ownsHome = options.homeDirectory === undefined;
   const homeDirectory = options.homeDirectory ?? await temporaryE2EHome();
-  const trace = options.trace ?? [];
-  const runtime = options.runtime ?? new FakeBridgeRuntime(homeDirectory, trace);
-  if (options.allReady) runtime.setAllReady();
-  const registration = options.registration ?? new FakeRegistrationServer();
-  const ownsRegistration = options.registration === undefined;
-  const serverUrl = await registration.start();
-  const workdir = join(homeDirectory, 'authorized-work');
-  const staticRoot = join(homeDirectory, 'ui');
-  await Promise.all([mkdir(workdir, { recursive: true }), mkdir(staticRoot, { recursive: true })]);
-  await writeFile(join(staticRoot, 'index.html'), '<!doctype html><title>Quukk E2E</title>', 'utf8');
-
-  const paths = localPaths(homeDirectory);
-  await mkdir(dirname(paths.daemonPid), { recursive: true });
-  serviceSequence += 1;
-  const starting: StartingDaemonIdentity = {
-    schema_version: 1,
-    state: 'starting',
-    pid: process.pid,
-    version: '0.1.0-beta.1',
-    instance_id: `svc_${serviceSequence.toString(16).padStart(32, '0')}`,
-    started_at: STARTED_AT,
-  };
-  const identityStore = new DaemonIdentityStore({ filePath: paths.daemonPid });
-  if (!await identityStore.claim(starting)) throw new Error('e2e_identity_conflict');
-
-  let store!: LocalStore;
-  let workers!: FakeRongCloudWorkers;
-  let bridgeClient: BridgeClient | undefined;
-  const factories: ProductionServiceFactories = {
-    openStore: async ({ homeDirectory: root }) => {
-      store = await LocalStore.open({ homeDirectory: root });
-      return store;
-    },
-    openLogger: (loggerOptions) => LocalLogger.open(loggerOptions),
-    createBridge: () => ({
-      ensureStarted: async () => {
-        const running = await runtime.start(store.bridgeIdentity().secret);
-        bridgeClient ??= running.client;
-        if (bridgeClient !== running.client) throw new Error('e2e_bridge_client_changed');
-        return { ...running, recovered: false };
-      },
-      stop: async () => {
-        trace.push('bridge.stop.begin');
-        if (bridgeClient !== undefined) await bridgeClient.shutdown();
-        await runtime.close();
-        trace.push('bridge.stop.end');
-      },
-    }),
-    createRegistrationClient: () => registration.client(),
-    openBindings: (bindingOptions) => BindingService.open({
-      ...bindingOptions,
-      store: bindingOptions.store as LocalStore,
-    }),
-    createRouterState: (stateOptions) => new RouterStateStore(stateOptions),
-    createWorkers: (workerOptions) => {
-      workers = new FakeRongCloudWorkers(workerOptions, trace);
-      return workers;
-    },
-    createRouter: (routerOptions) => new MessageRouter({
-      ...routerOptions,
-      state: routerOptions.state as RouterStateStore,
-    }),
-    createHttp: (httpOptions) => new LocalHttpServer(httpOptions),
-  };
-
-  let service: QuukkService;
+  if (ownsHome) disposers.push(() => removeE2EHome(homeDirectory));
   try {
-    service = await startProductionService({
+    const trace = options.trace ?? [];
+    const runtime = options.runtime ?? new FakeBridgeRuntime(homeDirectory, trace);
+    if (options.runtime === undefined) disposers.push(() => runtime.close());
+    if (options.allReady) runtime.setAllReady();
+    const registration = options.registration ?? new FakeRegistrationServer();
+    const ownsRegistration = options.registration === undefined;
+    if (ownsRegistration) disposers.push(() => registration.close());
+    const serverUrl = await registration.start();
+    await options.afterRegistrationStarted?.({ homeDirectory, registration });
+    const workdir = join(homeDirectory, 'authorized-work');
+    const staticRoot = join(homeDirectory, 'ui');
+    await Promise.all([mkdir(workdir, { recursive: true }), mkdir(staticRoot, { recursive: true })]);
+    await writeFile(join(staticRoot, 'index.html'), '<!doctype html><title>Quukk E2E</title>', 'utf8');
+
+    const paths = localPaths(homeDirectory);
+    await mkdir(dirname(paths.daemonPid), { recursive: true });
+    serviceSequence += 1;
+    const starting: StartingDaemonIdentity = {
+      schema_version: 1,
+      state: 'starting',
+      pid: process.pid,
+      version: '0.1.0-beta.1',
+      instance_id: `svc_${serviceSequence.toString(16).padStart(32, '0')}`,
+      started_at: STARTED_AT,
+    };
+    const identityStore = new DaemonIdentityStore({ filePath: paths.daemonPid });
+    if (!await identityStore.claim(starting)) throw new Error('e2e_identity_conflict');
+    disposers.push(async () => { await identityStore.removeIfMatches(starting); });
+
+    let store!: LocalStore;
+    let workers!: FakeRongCloudWorkers;
+    let bridgeClient: BridgeClient | undefined;
+    const factories: ProductionServiceFactories = {
+      openStore: async ({ homeDirectory: root }) => {
+        store = await LocalStore.open({ homeDirectory: root });
+        return store;
+      },
+      openLogger: (loggerOptions) => LocalLogger.open(loggerOptions),
+      createBridge: () => ({
+        ensureStarted: async () => {
+          const running = await runtime.start(store.bridgeIdentity().secret);
+          bridgeClient ??= running.client;
+          if (bridgeClient !== running.client) throw new Error('e2e_bridge_client_changed');
+          return { ...running, recovered: false };
+        },
+        stop: async () => {
+          trace.push('bridge.stop.begin');
+          if (bridgeClient !== undefined) await bridgeClient.shutdown();
+          await runtime.close();
+          trace.push('bridge.stop.end');
+        },
+      }),
+      createRegistrationClient: () => registration.client(),
+      openBindings: (bindingOptions) => BindingService.open({
+        ...bindingOptions,
+        store: bindingOptions.store as LocalStore,
+      }),
+      createRouterState: (stateOptions) => new RouterStateStore(stateOptions),
+      createWorkers: (workerOptions) => {
+        workers = new FakeRongCloudWorkers(workerOptions, trace);
+        return workers;
+      },
+      createRouter: (routerOptions) => {
+        const router = new MessageRouter({
+          ...routerOptions,
+          state: routerOptions.state as RouterStateStore,
+        });
+        const dispatch = router.onWorkerEvent.bind(router);
+        router.onWorkerEvent = (identity, event) => workers.trackDispatch(
+          event,
+          () => dispatch(identity, event),
+        );
+        return router;
+      },
+      createHttp: (httpOptions) => new LocalHttpServer(httpOptions),
+    };
+
+    const service = await startProductionService({
       identity: starting,
       identityStore,
       homeDirectory,
@@ -631,43 +656,42 @@ export async function createE2EHarness(options: {
       startupTimeoutMs: 10_000,
       shutdownTimeoutMs: 10_000,
     });
+    disposers.push(() => service.stop());
+    const identity = await service.status(new AbortController().signal);
+    const origin = `http://${identity.identity.address}`;
+    const controlCredential = deriveControlCredential(store.bridgeIdentity().secret, starting.instance_id);
+    registration.forbidRawSecret(store.bridgeIdentity().secret);
+    const api = await BrowserApi.connect(origin, controlCredential);
+    let closed = false;
+    const stop = () => service.stop();
+    return {
+      homeDirectory,
+      workdir,
+      logPath: paths.bridgeLog,
+      api,
+      service,
+      store,
+      runtime,
+      registration,
+      workers,
+      trace: () => trace.slice(),
+      stop,
+      async shutdownViaControl() {
+        const response = await internalControl(origin, controlCredential, 'shutdown');
+        await service.stop();
+        return response;
+      },
+      async close() {
+        if (closed) return;
+        closed = true;
+        await service.stop().catch(() => undefined);
+        await runtime.close().catch(() => undefined);
+        if (ownsRegistration) await registration.close().catch(() => undefined);
+        if (ownsHome) await removeE2EHome(homeDirectory);
+      },
+    };
   } catch (error) {
-    await runtime.close().catch(() => undefined);
-    if (ownsRegistration) await registration.close().catch(() => undefined);
-    if (ownsHome) await removeE2EHome(homeDirectory).catch(() => undefined);
+    await disposeSetup(disposers);
     throw error;
   }
-  const identity = await service.status(new AbortController().signal);
-  const origin = `http://${identity.identity.address}`;
-  const controlCredential = deriveControlCredential(store.bridgeIdentity().secret, starting.instance_id);
-  registration.forbidRawSecret(store.bridgeIdentity().secret);
-  const api = await BrowserApi.connect(origin, controlCredential);
-  let closed = false;
-  const stop = () => service.stop();
-  return {
-    homeDirectory,
-    workdir,
-    logPath: paths.bridgeLog,
-    api,
-    service,
-    store,
-    runtime,
-    registration,
-    workers,
-    trace: () => trace.slice(),
-    stop,
-    async shutdownViaControl() {
-      const response = await internalControl(origin, controlCredential, 'shutdown');
-      await service.stop();
-      return response;
-    },
-    async close() {
-      if (closed) return;
-      closed = true;
-      await service.stop().catch(() => undefined);
-      await runtime.close().catch(() => undefined);
-      if (ownsRegistration) await registration.close().catch(() => undefined);
-      if (ownsHome) await removeE2EHome(homeDirectory);
-    },
-  };
 }

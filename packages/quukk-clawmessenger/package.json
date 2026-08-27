@@ -9,6 +9,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",
+    "typecheck:e2e": "tsc -p test/e2e/tsconfig.json",
     "test": "vitest run",
     "postinstall": "node scripts/postinstall.mjs"
   },

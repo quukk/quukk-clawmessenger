@@ -9,6 +9,7 @@ import {
   E2E_RUNTIME_IDS,
   type E2EHarness,
 } from './fake-runtime.js';
+import { expectNoSentinels } from './redaction-assertions.js';
 
 function message(uid: string, text: string): NormalizedRongCloudMessage {
   return {
@@ -47,7 +48,6 @@ async function enablePair(harness: Awaited<ReturnType<typeof createE2EHarness>>)
 
 function expectSafeMaterial(harness: E2EHarness, material: unknown, prompts: readonly string[]): void {
   const identity = harness.store.bridgeIdentity();
-  const serialized = JSON.stringify(material);
   const sentinels = [
     identity.secret,
     identity.installId,
@@ -59,7 +59,11 @@ function expectSafeMaterial(harness: E2EHarness, material: unknown, prompts: rea
     ...(['opencode', 'openclaw', 'codex', 'hermes'] as const)
       .map((provider) => harness.runtime.runtimePath(provider)),
   ];
-  for (const sentinel of sentinels) expect(serialized).not.toContain(sentinel);
+  expectNoSentinels(material, sentinels);
+}
+
+async function drainMicrotasks(turns = 4): Promise<void> {
+  for (let turn = 0; turn < turns; turn += 1) await Promise.resolve();
 }
 
 describe('Quukk message-routing E2E', () => {
@@ -88,8 +92,16 @@ describe('Quukk message-routing E2E', () => {
         }),
       ]));
 
-      harness.workers.emitMessage(E2E_RUNTIME_IDS.opencode, message('same-message-uid', 'PROMPT-DUPLICATE'));
-      await vi.waitFor(() => expect(harness.runtime.taskStarts()).toHaveLength(2));
+      const delayedDuplicate = harness.workers.holdNextDispatch();
+      const duplicateSettled = harness.workers.emitMessage(
+        E2E_RUNTIME_IDS.opencode,
+        message('same-message-uid', 'PROMPT-DUPLICATE'),
+      );
+      await drainMicrotasks();
+      expect(harness.runtime.taskStarts()).toHaveLength(2);
+      delayedDuplicate.release();
+      await duplicateSettled;
+      await drainMicrotasks();
       expect(harness.runtime.taskStarts()).toHaveLength(2);
       expectSafeMaterial(harness, [
         harness.runtime.taskStarts(),

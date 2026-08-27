@@ -23,6 +23,25 @@ type WorkerRecord = {
 
 export type FakeOutbound = { identity: WorkerIdentity; input: RouterWorkerSend };
 
+export type DispatchGate = {
+  promise: Promise<void>;
+  release(): void;
+};
+
+function dispatchGate(): DispatchGate {
+  let resolveGate!: () => void;
+  let released = false;
+  const promise = new Promise<void>((resolvePromise) => { resolveGate = resolvePromise; });
+  return {
+    promise,
+    release() {
+      if (released) return;
+      released = true;
+      resolveGate();
+    },
+  };
+}
+
 function cloneBinding(binding: SupervisorBinding): SupervisorBinding {
   return { ...binding };
 }
@@ -37,6 +56,8 @@ export class FakeRongCloudWorkers {
   readonly #records = new Map<string, WorkerRecord>();
   readonly #outbound: FakeOutbound[] = [];
   readonly #receipts: Array<{ identity: WorkerIdentity; input: RouterReceipt }> = [];
+  readonly #dispatches = new WeakMap<object, Promise<void>>();
+  #nextDispatchGate?: DispatchGate;
   #nextMessage = 0;
 
   constructor(options: RongCloudWorkerSupervisorOptions, trace: string[]) {
@@ -144,10 +165,28 @@ export class FakeRongCloudWorkers {
     return this.#receipts.map(({ identity, input }) => ({ identity: { ...identity }, input: { ...input } }));
   }
 
-  emitMessage(runtimeId: string, message: NormalizedRongCloudMessage): void {
+  holdNextDispatch(): DispatchGate {
+    if (this.#nextDispatchGate !== undefined) throw new Error('dispatch_gate_already_pending');
+    const held = dispatchGate();
+    this.#nextDispatchGate = held;
+    return held;
+  }
+
+  trackDispatch(event: WorkerEvent, operation: () => Promise<void>): Promise<void> {
+    const held = this.#nextDispatchGate;
+    this.#nextDispatchGate = undefined;
+    const dispatched = held === undefined
+      ? operation()
+      : held.promise.then(operation);
+    this.#dispatches.set(event, dispatched);
+    void dispatched.catch(() => undefined);
+    return dispatched;
+  }
+
+  emitMessage(runtimeId: string, message: NormalizedRongCloudMessage): Promise<void> {
     const current = this.#records.get(runtimeId);
     if (current === undefined || current.state !== 'online') throw fixedWorkerError();
-    this.#emit(current, {
+    return this.#emit(current, {
       type: 'message',
       runtimeId,
       instanceId: current.instanceId,
@@ -180,10 +219,11 @@ export class FakeRongCloudWorkers {
     return current;
   }
 
-  #emit(record: WorkerRecord, event: WorkerEvent): void {
+  #emit(record: WorkerRecord, event: WorkerEvent): Promise<void> {
     this.#options.onEvent?.({
       runtimeId: record.binding.runtimeId,
       nodeId: record.binding.nodeId,
     }, event);
+    return this.#dispatches.get(event) ?? Promise.resolve();
   }
 }
