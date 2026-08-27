@@ -1,9 +1,18 @@
 import { spawn as spawnProcess } from 'node:child_process';
+import { randomBytes as cryptoRandomBytes } from 'node:crypto';
+import {
+  request as nodeHttpRequest,
+  type ClientRequest,
+  type IncomingMessage,
+  type RequestOptions,
+} from 'node:http';
+import { isAbsolute, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
 import { z } from 'zod';
 
 import {
+  CredentialFileSchema,
   DEFAULT_CONFIG,
   PROVIDERS,
   StoredConfigSchema,
@@ -11,10 +20,14 @@ import {
   type Provider,
   type RuntimeDiscoveryStatus,
 } from './config/schema.js';
+import { readJsonFile } from './config/atomic-json.js';
+import { localPaths } from './config/paths.js';
 import {
+  DaemonIdentityStore,
   ReadyDaemonIdentitySchema,
   StartingDaemonIdentitySchema,
   type DaemonIdentity,
+  type DaemonIdentityPersistence,
   type ReadyDaemonIdentity,
   type StartingDaemonIdentity,
 } from './process/service-identity.js';
@@ -24,6 +37,12 @@ import {
   type ControlStatusResponse,
   type RuntimesResponse,
 } from './http/routes.js';
+import { deriveControlCredential } from './http/security.js';
+import {
+  startProductionService,
+  type ComposeProductionServiceOptions,
+  type QuukkService,
+} from './service.js';
 import { VERSION } from './version.js';
 
 const COMMANDS = ['setup', 'start', 'stop', 'status', 'logs', 'doctor', 'rescan'] as const;
@@ -986,4 +1005,826 @@ export async function runCli(
     const failure = fixedFailure(error);
     return emitFailure(options.io, parsedForOutput, failure.code);
   }
+}
+
+type ProductionHttpRequest = (
+  options: RequestOptions,
+  callback: (response: IncomingMessage) => void,
+) => ClientRequest;
+
+type ProductionReadJson = <T>(
+  filePath: string,
+  schema: z.ZodType<T>,
+  maximumBytes: number,
+) => Promise<T>;
+
+export interface ProductionCliServicePort {
+  status(signal: AbortSignal): Promise<ControlStatusResponse>;
+  stop(): Promise<void>;
+}
+
+export interface ProductionSignalPort {
+  once(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+  off(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+}
+
+export interface ProductionDaemonChild {
+  stdin: { end(data: string, encoding: 'utf8'): unknown } | null;
+  once(event: 'error', listener: (error: Error) => void): unknown;
+  off(event: 'error', listener: (error: Error) => void): unknown;
+  unref(): void;
+}
+
+export type ProductionDaemonSpawn = (
+  executable: string,
+  argv: readonly string[],
+  options: {
+    shell: false;
+    detached: true;
+    windowsHide: true;
+    stdio: ['pipe', 'ignore', 'ignore'];
+    env: NodeJS.ProcessEnv;
+  },
+) => ProductionDaemonChild;
+
+export interface ProductionCliRuntimeDependencies {
+  identityStore?: DaemonIdentityPersistence;
+  processId?: number;
+  now?: () => number;
+  randomBytes?: (size: number) => Buffer;
+  readStdin?: (maximumBytes: number) => Promise<Buffer>;
+  readJson?: ProductionReadJson;
+  request?: ProductionHttpRequest;
+  startService?: (
+    options: ComposeProductionServiceOptions,
+  ) => Promise<ProductionCliServicePort>;
+  signals?: ProductionSignalPort;
+  spawn?: ProductionDaemonSpawn;
+  sleep?: (milliseconds: number) => Promise<unknown>;
+  monotonicNow?: () => number;
+  kill?: (pid: number, signal: 0) => unknown;
+}
+
+export interface ProductionCliRuntimeOptions {
+  homeDirectory: string;
+  processEnvironment: NodeJS.ProcessEnv;
+  execPath: string;
+  packagedBinPath: string;
+  dependencies?: ProductionCliRuntimeDependencies;
+}
+
+class ProductionCliFailure extends Error {
+  constructor(readonly code: string) {
+    super(code);
+    this.name = 'ProductionCliFailure';
+  }
+}
+
+const CONTROL_RESPONSE_LIMIT = 1 << 20;
+const CREDENTIAL_FILE_LIMIT = 4 << 20;
+const CHILD_INPUT_LIMIT = 64 << 10;
+const START_WAIT_MS = 65_000;
+const SHUTDOWN_WAIT_MS = 20_000;
+const POLL_MS = 100;
+
+const ChildConfigOverridesSchema = z.strictObject({
+  serverUrl: z.string().optional(),
+  defaultWorkdir: z.string().nullable().optional(),
+  authorizedWorkRoots: z.array(z.string()).optional(),
+  providerPathOverrides: z.strictObject({
+    opencode: z.string().optional(),
+    openclaw: z.string().optional(),
+    codex: z.string().optional(),
+    hermes: z.string().optional(),
+  }).optional(),
+  logLevel: z.enum(['silent', 'error', 'warn', 'info', 'debug']).optional(),
+});
+const ChildStartInputSchema = z.strictObject({
+  foreground: z.literal(false),
+  noOpen: z.boolean(),
+  configOverrides: ChildConfigOverridesSchema,
+});
+
+const RawLaunchTicketResponseSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  ticket: z.string().refine((value) => canonicalLaunchTicket(value) !== undefined),
+  expiresAt: z.number().int().positive().safe(),
+});
+const RawShutdownResponseSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  accepted: z.literal(true),
+});
+
+function productionFailure(code: string): ProductionCliFailure {
+  return new ProductionCliFailure(code);
+}
+
+function normalizedProductionFailure(error: unknown): ProductionCliFailure {
+  if (error instanceof ProductionCliFailure) return error;
+  const code = typeof error === 'object' && error !== null && 'code' in error
+    ? String((error as { code?: unknown }).code)
+    : undefined;
+  if (
+    code === 'identity_conflict'
+    || code === 'identity_corrupt'
+    || code === 'identity_invalid'
+    || code === 'process_unverified'
+    || code === 'stale_unverified'
+  ) return productionFailure(code);
+  if (code === 'operation_timeout' || code === 'shutdown_timeout') {
+    return productionFailure(code);
+  }
+  return productionFailure('operation_unavailable');
+}
+
+function normalizedChildOverrides(value: z.infer<typeof ChildConfigOverridesSchema>): ConfigOverrides {
+  const stored = StoredConfigSchema.safeParse({ ...DEFAULT_CONFIG, ...value });
+  if (!stored.success) throw productionFailure('invalid_config');
+  const result: ConfigOverrides = {};
+  if (value.serverUrl !== undefined) result.serverUrl = stored.data.serverUrl;
+  if (value.defaultWorkdir !== undefined) result.defaultWorkdir = stored.data.defaultWorkdir;
+  if (value.authorizedWorkRoots !== undefined) {
+    result.authorizedWorkRoots = stored.data.authorizedWorkRoots;
+  }
+  if (value.providerPathOverrides !== undefined) {
+    result.providerPathOverrides = stored.data.providerPathOverrides;
+  }
+  if (value.logLevel !== undefined) result.logLevel = stored.data.logLevel;
+  return result;
+}
+
+function parseChildStartInput(bytes: Buffer): StartInput {
+  if (
+    !Buffer.isBuffer(bytes)
+    || bytes.byteLength < 2
+    || bytes.byteLength > CHILD_INPUT_LIMIT
+    || bytes.at(-1) !== 0x0a
+    || bytes.subarray(0, -1).includes(0x0a)
+    || bytes.subarray(0, -1).includes(0x0d)
+  ) throw productionFailure('invalid_config');
+  let value: unknown;
+  try {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, -1));
+    if (text !== text.trim() || !text.startsWith('{') || !text.endsWith('}')) {
+      throw productionFailure('invalid_config');
+    }
+    value = JSON.parse(text) as unknown;
+  } catch {
+    throw productionFailure('invalid_config');
+  }
+  const parsed = ChildStartInputSchema.safeParse(value);
+  if (!parsed.success) throw productionFailure('invalid_config');
+  return {
+    foreground: false,
+    noOpen: parsed.data.noOpen,
+    configOverrides: normalizedChildOverrides(parsed.data.configOverrides),
+  };
+}
+
+async function defaultReadStdin(maximumBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of process.stdin) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+    total += bytes.byteLength;
+    if (total > maximumBytes) throw productionFailure('invalid_config');
+    chunks.push(bytes);
+  }
+  return Buffer.concat(chunks);
+}
+
+function rawResponseHeaders(response: IncomingMessage, name: string): string[] {
+  const expected = name.toLowerCase();
+  const values: string[] = [];
+  for (let index = 0; index < response.rawHeaders.length; index += 2) {
+    if (response.rawHeaders[index]?.toLowerCase() === expected) {
+      values.push(response.rawHeaders[index + 1] ?? '');
+    }
+  }
+  return values;
+}
+
+async function readStrictControlResponse(
+  response: IncomingMessage,
+  expectedStatus: number,
+): Promise<unknown> {
+  const contentTypes = rawResponseHeaders(response, 'content-type');
+  const contentLengths = rawResponseHeaders(response, 'content-length');
+  if (
+    response.statusCode !== expectedStatus
+    || contentTypes.length !== 1
+    || contentTypes[0] !== 'application/json; charset=utf-8'
+    || contentLengths.length !== 1
+    || !/^(?:0|[1-9]\d*)$/.test(contentLengths[0]!)
+    || rawResponseHeaders(response, 'transfer-encoding').length !== 0
+    || rawResponseHeaders(response, 'content-encoding').length !== 0
+  ) throw productionFailure('process_unverified');
+  const declared = Number(contentLengths[0]);
+  if (!Number.isSafeInteger(declared) || declared < 1 || declared > CONTROL_RESPONSE_LIMIT) {
+    throw productionFailure('process_unverified');
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    for await (const chunk of response) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+      total += bytes.byteLength;
+      if (total > declared || total > CONTROL_RESPONSE_LIMIT) {
+        throw productionFailure('process_unverified');
+      }
+      chunks.push(bytes);
+    }
+  } catch (error) {
+    if (error instanceof ProductionCliFailure) throw error;
+    throw productionFailure('process_unverified');
+  }
+  if (
+    total !== declared
+    || response.complete !== true
+    || Object.keys(response.trailers).length !== 0
+  ) throw productionFailure('process_unverified');
+  try {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw productionFailure('process_unverified');
+  }
+}
+
+function defaultProductionRequest(
+  options: RequestOptions,
+  callback: (response: IncomingMessage) => void,
+): ClientRequest {
+  return nodeHttpRequest(options, callback);
+}
+
+function defaultProductionDaemonSpawn(
+  executable: string,
+  argv: readonly string[],
+  options: Parameters<ProductionDaemonSpawn>[2],
+): ProductionDaemonChild {
+  return spawnProcess(executable, [...argv], options) as unknown as ProductionDaemonChild;
+}
+
+function daemonEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const output: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(source)) {
+    const lower = key.toLowerCase();
+    if (
+      lower.startsWith('npm_')
+      || lower === 'node_options'
+      || lower === 'node_tls_reject_unauthorized'
+    ) continue;
+    if (typeof value === 'string') output[key] = value;
+  }
+  return output;
+}
+
+function errorCodeOf(error: unknown): string | undefined {
+  return typeof error === 'object' && error !== null && 'code' in error
+    ? String((error as { code?: unknown }).code)
+    : undefined;
+}
+
+function explicitlyUnreachable(error: unknown): boolean {
+  return error instanceof ProductionCliFailure && error.code === 'connect_unreachable';
+}
+
+function controlTransportFailure(error: unknown): ProductionCliFailure {
+  const code = errorCodeOf(error);
+  return productionFailure(
+    code === 'ECONNREFUSED' || code === 'EHOSTUNREACH' || code === 'ENETUNREACH'
+      ? 'connect_unreachable'
+      : 'process_unverified',
+  );
+}
+
+function controlRequest(
+  request: ProductionHttpRequest,
+  identity: ReadyDaemonIdentity,
+  credential: string,
+  command: 'status' | 'launch_ticket' | 'rescan' | 'shutdown',
+  timeoutMs = 5_000,
+): Promise<unknown> {
+  const body = Buffer.from(JSON.stringify({ command }), 'utf8');
+  const port = portOf(identity);
+  return new Promise<unknown>((resolvePromise, rejectPromise) => {
+    let settled = false;
+    let outgoing: ClientRequest | undefined;
+    const finish = (error: unknown, value?: unknown): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error === undefined) resolvePromise(value);
+      else rejectPromise(error);
+    };
+    const timer = setTimeout(() => {
+      try {
+        outgoing?.destroy();
+      } catch {
+        // The fixed timeout classification is authoritative.
+      }
+      finish(productionFailure('operation_timeout'));
+    }, timeoutMs);
+    try {
+      outgoing = request({
+        protocol: 'http:',
+        hostname: '127.0.0.1',
+        port,
+        method: 'POST',
+        path: '/internal/control',
+        agent: false,
+        headers: {
+          Host: `127.0.0.1:${port}`,
+          Authorization: `Bearer ${credential}`,
+          'Content-Type': 'application/json; charset=utf-8',
+          'Content-Length': String(body.byteLength),
+          Connection: 'close',
+        },
+      }, (response) => {
+        const expectedStatus = command === 'launch_ticket' ? 201 : command === 'shutdown' ? 202 : 200;
+        void readStrictControlResponse(response, expectedStatus).then(
+          (value) => finish(undefined, value),
+          () => finish(productionFailure('process_unverified')),
+        );
+      });
+      outgoing.once('error', (error) => finish(controlTransportFailure(error)));
+      outgoing.end(body);
+    } catch (error) {
+      finish(controlTransportFailure(error));
+    }
+  });
+}
+
+function createStartingIdentity(
+  processId: number,
+  now: () => number,
+  randomBytes: (size: number) => Buffer,
+): StartingDaemonIdentity {
+  const bytes = randomBytes(16);
+  const milliseconds = now();
+  const parsed = StartingDaemonIdentitySchema.safeParse({
+    schema_version: 1,
+    state: 'starting',
+    pid: processId,
+    version: VERSION,
+    instance_id: Buffer.isBuffer(bytes) && bytes.byteLength === 16
+      ? `svc_${bytes.toString('hex')}`
+      : '',
+    started_at: Number.isSafeInteger(milliseconds) && milliseconds >= 0
+      ? new Date(milliseconds).toISOString()
+      : '',
+  });
+  if (!parsed.success) throw productionFailure('identity_invalid');
+  return parsed.data;
+}
+
+export function createProductionCliRuntime(
+  options: ProductionCliRuntimeOptions,
+): CliRuntimePort {
+  if (
+    !isAbsolute(options.homeDirectory)
+    || !isAbsolute(options.execPath)
+    || !isAbsolute(options.packagedBinPath)
+  ) throw new RangeError('invalid_production_cli_options');
+  const homeDirectory = resolve(options.homeDirectory);
+  const paths = localPaths(homeDirectory);
+  const processEnvironment = { ...options.processEnvironment };
+  const dependencies = options.dependencies ?? {};
+  const identityStore = dependencies.identityStore
+    ?? new DaemonIdentityStore({ filePath: paths.daemonPid });
+  const processId = dependencies.processId ?? process.pid;
+  const now = dependencies.now ?? Date.now;
+  const randomBytes = dependencies.randomBytes ?? cryptoRandomBytes;
+  const readStdin = dependencies.readStdin ?? defaultReadStdin;
+  const readJson = dependencies.readJson ?? readJsonFile;
+  const request = dependencies.request ?? defaultProductionRequest;
+  const spawn = dependencies.spawn ?? defaultProductionDaemonSpawn;
+  const sleep = dependencies.sleep
+    ?? ((milliseconds: number) => new Promise<void>((resolvePromise) => {
+      setTimeout(resolvePromise, milliseconds);
+    }));
+  const monotonicNow = dependencies.monotonicNow ?? (() => performance.now());
+  const kill = dependencies.kill ?? ((pid: number, signal: 0) => process.kill(pid, signal));
+  const startService = dependencies.startService
+    ?? (startProductionService as (value: ComposeProductionServiceOptions) => Promise<QuukkService>);
+  const signals = dependencies.signals ?? process;
+
+  const readStoredIdentity = async (): Promise<{
+    identity?: DaemonIdentity;
+    contentDigest?: string;
+  }> => {
+    let snapshot: Awaited<ReturnType<DaemonIdentityPersistence['read']>>;
+    try {
+      snapshot = await identityStore.read();
+    } catch (error) {
+      if (
+        typeof error === 'object'
+        && error !== null
+        && 'code' in error
+        && String((error as { code?: unknown }).code) === 'identity_corrupt'
+      ) throw productionFailure('identity_corrupt');
+      throw error;
+    }
+    if (snapshot.identity === undefined && snapshot.contentDigest === undefined) {
+      return {};
+    }
+    if (!/^[0-9a-f]{64}$/.test(snapshot.contentDigest ?? '')) {
+      throw productionFailure('identity_invalid');
+    }
+    if (snapshot.identity?.state === 'starting') {
+      const parsed = StartingDaemonIdentitySchema.safeParse(snapshot.identity);
+      if (parsed.success) {
+        return { identity: parsed.data, contentDigest: snapshot.contentDigest };
+      }
+    }
+    if (snapshot.identity?.state === 'ready') {
+      const parsed = ReadyDaemonIdentitySchema.safeParse(snapshot.identity);
+      if (parsed.success) {
+        return { identity: parsed.data, contentDigest: snapshot.contentDigest };
+      }
+    }
+    throw productionFailure('identity_invalid');
+  };
+
+  const inspect = async (): Promise<DaemonInspection> => {
+    let snapshot: Awaited<ReturnType<typeof readStoredIdentity>>;
+    try {
+      snapshot = await readStoredIdentity();
+    } catch (error) {
+      if (errorCodeOf(error) === 'identity_corrupt') {
+        return { kind: 'corrupt', errorCode: 'identity_corrupt' };
+      }
+      throw error;
+    }
+    if (snapshot.identity === undefined) return { kind: 'not_running' };
+    if (snapshot.identity.state === 'starting') {
+      return { kind: 'starting', identity: snapshot.identity };
+    }
+    return {
+      kind: 'ready',
+      identity: snapshot.identity,
+      contentDigest: snapshot.contentDigest!,
+    };
+  };
+
+  const readCredential = async (identity: ReadyDaemonIdentity): Promise<string> => {
+    try {
+      const credentials = await readJson(
+        paths.credentials,
+        CredentialFileSchema,
+        CREDENTIAL_FILE_LIMIT,
+      );
+      return deriveControlCredential(credentials.bridgeSecret, identity.instance_id);
+    } catch {
+      throw productionFailure('process_unverified');
+    }
+  };
+
+  const authenticateStatus = async (
+    identity: ReadyDaemonIdentity,
+    timeoutMs: number,
+    credential?: string,
+  ): Promise<ControlStatusResponse> => {
+    const presented = credential ?? await readCredential(identity);
+    const raw = await controlRequest(request, identity, presented, 'status', timeoutMs);
+    const parsed = ControlStatusResponseSchema.safeParse(raw);
+    if (!parsed.success || !sameIdentity(identity, parsed.data.identity)) {
+      throw productionFailure('process_unverified');
+    }
+    return parsed.data;
+  };
+
+  const recoverExactStale = async (
+    identity: ReadyDaemonIdentity,
+    contentDigest: string,
+    completedUnreachableAttempts = 0,
+  ): Promise<boolean> => {
+    if (
+      !ReadyDaemonIdentitySchema.safeParse(identity).success
+      || !/^[0-9a-f]{64}$/.test(contentDigest)
+      || !Number.isInteger(completedUnreachableAttempts)
+      || completedUnreachableAttempts < 0
+      || completedUnreachableAttempts > 3
+    ) throw productionFailure('stale_unverified');
+    for (let attempt = completedUnreachableAttempts; attempt < 3; attempt += 1) {
+      if (attempt === 1) await sleep(100);
+      if (attempt === 2) await sleep(250);
+      try {
+        await authenticateStatus(identity, 1_000);
+        throw productionFailure('stale_unverified');
+      } catch (error) {
+        if (!explicitlyUnreachable(error)) throw productionFailure('stale_unverified');
+      }
+    }
+    try {
+      kill(identity.pid, 0);
+      throw productionFailure('stale_unverified');
+    } catch (error) {
+      if (error instanceof ProductionCliFailure) throw error;
+      if (errorCodeOf(error) !== 'ESRCH') throw productionFailure('stale_unverified');
+    }
+    let quarantined = false;
+    try {
+      quarantined = await identityStore.quarantineStaleIfExact({
+        expected: identity,
+        contentDigest,
+      });
+    } catch {
+      throw productionFailure('stale_unverified');
+    }
+    if (!quarantined) throw productionFailure('stale_unverified');
+    return true;
+  };
+
+  const waitForShutdown = async (
+    identity: ReadyDaemonIdentity,
+    credential: string,
+  ): Promise<void> => {
+    const started = monotonicNow();
+    if (!Number.isFinite(started) || started < 0) throw productionFailure('shutdown_timeout');
+    while (true) {
+      const elapsed = monotonicNow() - started;
+      if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed > SHUTDOWN_WAIT_MS) {
+        throw productionFailure('shutdown_timeout');
+      }
+      let oldAuthenticationFailed = false;
+      try {
+        await authenticateStatus(
+          identity,
+          Math.max(1, Math.min(1_000, SHUTDOWN_WAIT_MS - Math.trunc(elapsed))),
+          credential,
+        );
+      } catch {
+        oldAuthenticationFailed = true;
+      }
+      let oldIdentityGone = false;
+      try {
+        const current = await readStoredIdentity();
+        oldIdentityGone = current.identity === undefined
+          || current.identity.state !== 'ready'
+          || !sameIdentity(identity, current.identity);
+      } catch {
+        oldIdentityGone = false;
+      }
+      if (oldAuthenticationFailed && oldIdentityGone) return;
+      const afterProbe = monotonicNow() - started;
+      if (!Number.isFinite(afterProbe) || afterProbe >= SHUTDOWN_WAIT_MS) {
+        throw productionFailure('shutdown_timeout');
+      }
+      await sleep(POLL_MS);
+    }
+  };
+
+  const control: CliRuntimePort['control'] = async (identity, command) => {
+    const parsedIdentity = ReadyDaemonIdentitySchema.safeParse(identity);
+    if (!parsedIdentity.success) throw productionFailure('process_unverified');
+    const credential = await readCredential(parsedIdentity.data);
+    let authenticated: ControlStatusResponse;
+    try {
+      authenticated = await authenticateStatus(parsedIdentity.data, 5_000, credential);
+    } catch (error) {
+      if (errorCodeOf(error) === 'operation_timeout') throw error;
+      throw productionFailure('process_unverified');
+    }
+    if (command === 'status') {
+      return { command, value: authenticated };
+    }
+    let raw: unknown;
+    try {
+      raw = await controlRequest(request, parsedIdentity.data, credential, command);
+    } catch (error) {
+      if (errorCodeOf(error) === 'operation_timeout') throw error;
+      throw productionFailure('process_unverified');
+    }
+    if (command === 'launch_ticket') {
+      const parsed = RawLaunchTicketResponseSchema.safeParse(raw);
+      if (!parsed.success) throw productionFailure('process_unverified');
+      return { command, value: { ticket: parsed.data.ticket, expiresAt: parsed.data.expiresAt } };
+    }
+    if (command === 'rescan') {
+      const parsed = RuntimesResponseSchema.safeParse(raw);
+      if (!parsed.success) throw productionFailure('process_unverified');
+      return { command, value: parsed.data };
+    }
+    const parsed = RawShutdownResponseSchema.safeParse(raw);
+    if (!parsed.success) throw productionFailure('process_unverified');
+    await waitForShutdown(parsedIdentity.data, credential);
+    return { command, value: { accepted: true } };
+  };
+
+  const spawnBackground = (input: StartInput): (() => void) => {
+    if (input.foreground !== false || typeof input.noOpen !== 'boolean') {
+      throw productionFailure('invalid_config');
+    }
+    const rawOverrides = ChildConfigOverridesSchema.safeParse(input.configOverrides);
+    if (!rawOverrides.success) throw productionFailure('invalid_config');
+    const framedInput: StartInput = {
+      foreground: false,
+      noOpen: input.noOpen,
+      configOverrides: normalizedChildOverrides(rawOverrides.data),
+    };
+    const frame = `${JSON.stringify(framedInput)}\n`;
+    if (Buffer.byteLength(frame, 'utf8') > CHILD_INPUT_LIMIT) {
+      throw productionFailure('invalid_config');
+    }
+    let child: ProductionDaemonChild;
+    try {
+      child = spawn(options.execPath, [
+        options.packagedBinPath,
+        'start',
+        '--foreground',
+        '--no-open',
+        '--daemon-child',
+      ], {
+        shell: false,
+        detached: true,
+        windowsHide: true,
+        stdio: ['pipe', 'ignore', 'ignore'],
+        env: daemonEnvironment(processEnvironment),
+      });
+    } catch {
+      throw productionFailure('operation_unavailable');
+    }
+    let failure: ProductionCliFailure | undefined;
+    const failed = (): void => { failure = productionFailure('operation_unavailable'); };
+    try {
+      child.once('error', failed);
+      if (child.stdin === null) throw productionFailure('operation_unavailable');
+      child.stdin.end(frame, 'utf8');
+      child.unref();
+    } catch {
+      throw productionFailure('operation_unavailable');
+    }
+    return () => {
+      if (failure !== undefined) throw failure;
+    };
+  };
+
+  const startBackground = async (input: StartInput): Promise<StartResult> => {
+    const started = monotonicNow();
+    if (!Number.isFinite(started) || started < 0) throw productionFailure('operation_timeout');
+    let spawned = false;
+    let checkChild = (): void => {};
+    let snapshot = await readStoredIdentity();
+    while (true) {
+      checkChild();
+      if (snapshot.identity === undefined) {
+        if (!spawned) {
+          checkChild = spawnBackground(input);
+          spawned = true;
+        }
+      } else if (snapshot.identity.state === 'ready') {
+        try {
+          await authenticateStatus(snapshot.identity, 1_000);
+          return { identity: snapshot.identity, alreadyRunning: !spawned };
+        } catch (error) {
+          if (!explicitlyUnreachable(error)) {
+            if (errorCodeOf(error) === 'operation_timeout') throw error;
+            throw productionFailure('process_unverified');
+          }
+          await recoverExactStale(snapshot.identity, snapshot.contentDigest!, 1);
+          spawned = false;
+          checkChild = (): void => {};
+          snapshot = {};
+          continue;
+        }
+      }
+      const elapsed = monotonicNow() - started;
+      if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed >= START_WAIT_MS) {
+        throw productionFailure('operation_timeout');
+      }
+      await sleep(POLL_MS);
+      checkChild();
+      snapshot = await readStoredIdentity();
+    }
+  };
+
+  return {
+    inspect,
+    start: startBackground,
+    async runForeground(input, foreground): Promise<number> {
+      const identity = createStartingIdentity(processId, now, randomBytes);
+      if (!(await identityStore.claim(identity))) throw productionFailure('identity_conflict');
+      let service: ProductionCliServicePort | undefined;
+      try {
+        const effectiveInput = foreground.daemonChild
+          ? parseChildStartInput(await readStdin(CHILD_INPUT_LIMIT))
+          : input;
+        service = await startService({
+          identity,
+          identityStore,
+          homeDirectory,
+          processEnvironment,
+          configEnvironment: processEnvironment,
+          configOverrides: effectiveInput.configOverrides,
+        });
+        const ready = ControlStatusResponseSchema.safeParse(
+          await service.status(new AbortController().signal),
+        );
+        if (
+          !ready.success
+          || ready.data.state !== 'ready'
+          || ready.data.identity.pid !== identity.pid
+          || ready.data.identity.version !== identity.version
+          || ready.data.identity.instance_id !== identity.instance_id
+          || ready.data.identity.started_at !== identity.started_at
+        ) throw productionFailure('process_unverified');
+
+        let stopPromise: Promise<void> | undefined;
+        let settleStop!: () => void;
+        let rejectStop!: (error: ProductionCliFailure) => void;
+        const stopped = new Promise<void>((resolvePromise, rejectPromise) => {
+          settleStop = resolvePromise;
+          rejectStop = rejectPromise;
+        });
+        const requestStop = (): void => {
+          stopPromise ??= Promise.resolve()
+            .then(() => service!.stop())
+            .then(settleStop, (error) => rejectStop(normalizedProductionFailure(error)));
+          void stopPromise.catch(() => undefined);
+        };
+        signals.once('SIGINT', requestStop);
+        signals.once('SIGTERM', requestStop);
+        let monitoring = false;
+        try {
+          await foreground.onReady(ready.data.identity);
+          if (stopPromise === undefined) {
+            monitoring = true;
+            void (async () => {
+              while (monitoring && stopPromise === undefined) {
+                try {
+                  const current = await readStoredIdentity();
+                  if (
+                    current.identity === undefined
+                    || current.identity.state !== 'ready'
+                    || !sameIdentity(ready.data.identity, current.identity)
+                  ) {
+                    requestStop();
+                    return;
+                  }
+                } catch {
+                  // A transient/corrupt read is never proof that the owned service stopped.
+                }
+                if (monitoring && stopPromise === undefined) await sleep(POLL_MS);
+              }
+            })();
+          }
+          await stopped;
+          return 0;
+        } finally {
+          monitoring = false;
+          signals.off('SIGINT', requestStop);
+          signals.off('SIGTERM', requestStop);
+        }
+      } catch (error) {
+        if (service === undefined) {
+          await identityStore.removeIfMatches(identity).catch(() => false);
+        } else {
+          await service.stop().catch(() => undefined);
+        }
+        throw normalizedProductionFailure(error);
+      }
+    },
+    control,
+    async recoverStaleForStart(stale): Promise<boolean> {
+      const identity = ReadyDaemonIdentitySchema.safeParse(stale.identity);
+      if (!identity.success || !/^[0-9a-f]{64}$/.test(stale.contentDigest)) {
+        throw productionFailure('stale_unverified');
+      }
+      return recoverExactStale(identity.data, stale.contentDigest);
+    },
+    async *readLogs(): AsyncIterable<string> {},
+    async doctor(): Promise<CliDiagnostics> {
+      const value = await inspect();
+      if (value.kind === 'not_running') return { schemaVersion: 1, state: 'offline' };
+      if (value.kind === 'corrupt') {
+        return { schemaVersion: 1, state: 'corrupt', errorCode: 'identity_corrupt' };
+      }
+      if (value.kind === 'starting') {
+        return {
+          schemaVersion: 1,
+          state: 'starting',
+          service: {
+            pid: value.identity.pid,
+            version: value.identity.version,
+            startedAt: value.identity.started_at,
+          },
+        };
+      }
+      const status = await control(value.identity, 'status');
+      return {
+        schemaVersion: 1,
+        state: 'ready',
+        service: {
+          pid: value.identity.pid,
+          version: value.identity.version,
+          startedAt: value.identity.started_at,
+          port: portOf(value.identity),
+          controlState: status.command === 'status' ? status.value.state : 'ready',
+        },
+        runtimes: [],
+      };
+    },
+  };
 }

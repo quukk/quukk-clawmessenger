@@ -1,13 +1,17 @@
 import { EventEmitter } from 'node:events';
+import { Readable } from 'node:stream';
 import { resolve } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  createProductionCliRuntime,
   createSystemBrowserPort,
   runCli,
   type CliRuntimePort,
 } from './cli.js';
+import { localPaths } from './config/paths.js';
+import { deriveControlCredential } from './http/security.js';
 import { VERSION } from './version.js';
 
 const NOW = 2_000_000_000_000;
@@ -1281,5 +1285,720 @@ describe('createSystemBrowserPort', () => {
     expect(error).toMatchObject({ code: 'browser_open_failed', message: 'browser_open_failed' });
     expect(JSON.stringify(error)).not.toContain(secretSentinel);
     expect(JSON.stringify(error)).not.toContain(url);
+  });
+});
+
+describe('createProductionCliRuntime', () => {
+  const HOME = resolve('production-cli-home');
+  const EXECUTABLE = resolve('runtime', 'node.exe');
+  const PACKAGED_BIN = resolve('package', 'bin', 'quukk-clawmessenger.js');
+  const BRIDGE_SECRET = CANONICAL_TICKET;
+
+  function identityStore(snapshot: unknown = {}) {
+    return {
+      read: vi.fn(async () => snapshot),
+      claim: vi.fn(async () => true),
+      markReady: vi.fn(),
+      quarantineStaleIfExact: vi.fn(async () => true),
+      removeIfMatches: vi.fn(async () => true),
+    };
+  }
+
+  function productionOptions(
+    store: ReturnType<typeof identityStore>,
+    dependencies: Record<string, unknown> = {},
+  ) {
+    return {
+      homeDirectory: HOME,
+      processEnvironment: {},
+      execPath: EXECUTABLE,
+      packagedBinPath: PACKAGED_BIN,
+      dependencies: {
+        identityStore: store,
+        processId: READY_IDENTITY.pid,
+        now: () => Date.parse(READY_IDENTITY.started_at),
+        randomBytes: () => Buffer.alloc(16, 0xaa),
+        ...dependencies,
+      },
+    };
+  }
+
+  type FakeControlResponse = {
+    statusCode: number;
+    body: Buffer;
+    rawHeaders?: string[];
+    complete?: boolean;
+    trailers?: Record<string, string>;
+  };
+
+  function controlFrame(
+    value: unknown,
+    statusCode = 200,
+    overrides: Partial<FakeControlResponse> = {},
+  ): FakeControlResponse {
+    const body = Buffer.from(JSON.stringify(value), 'utf8');
+    return {
+      statusCode,
+      body,
+      rawHeaders: [
+        'Content-Type', 'application/json; charset=utf-8',
+        'Content-Length', String(body.byteLength),
+        'Connection', 'close',
+      ],
+      complete: true,
+      trailers: {},
+      ...overrides,
+    };
+  }
+
+  function requestSequence(frames: readonly FakeControlResponse[]) {
+    const bodies: string[] = [];
+    let index = 0;
+    const request = vi.fn((_options: unknown, callback: (response: unknown) => void) => {
+      const outgoing = new EventEmitter() as EventEmitter & {
+        end(body: Buffer): void;
+        destroy(error?: Error): void;
+      };
+      outgoing.end = vi.fn((body: Buffer) => {
+        bodies.push(Buffer.from(body).toString('utf8'));
+        const frame = frames[index++];
+        if (frame === undefined) throw new Error('unexpected_control_request');
+        const response = Readable.from([frame.body]) as Readable & {
+          statusCode: number;
+          rawHeaders: string[];
+          complete: boolean;
+          trailers: Record<string, string>;
+        };
+        response.statusCode = frame.statusCode;
+        response.rawHeaders = frame.rawHeaders ?? [];
+        response.complete = frame.complete ?? false;
+        response.trailers = frame.trailers ?? {};
+        queueMicrotask(() => callback(response));
+      });
+      outgoing.destroy = vi.fn();
+      return outgoing;
+    });
+    return { request, bodies };
+  }
+
+  function failingRequest(code: string, bodies: string[] = []) {
+    return vi.fn((_options: unknown, _callback: (response: unknown) => void) => {
+      const outgoing = new EventEmitter() as EventEmitter & {
+        end(body: Buffer): void;
+        destroy(error?: Error): void;
+      };
+      outgoing.end = vi.fn((body: Buffer) => {
+        bodies.push(Buffer.from(body).toString('utf8'));
+        queueMicrotask(() => outgoing.emit('error', Object.assign(new Error(code), { code })));
+      });
+      outgoing.destroy = vi.fn();
+      return outgoing;
+    });
+  }
+
+  function daemonChild() {
+    const child = new EventEmitter() as EventEmitter & {
+      stdin: { end: ReturnType<typeof vi.fn> };
+      unref: ReturnType<typeof vi.fn>;
+    };
+    child.stdin = { end: vi.fn() };
+    child.unref = vi.fn();
+    return child;
+  }
+
+  it.each([
+    [{}, { kind: 'not_running' }],
+    [{ identity: STARTING_IDENTITY, contentDigest: '1'.repeat(64) }, {
+      kind: 'starting', identity: STARTING_IDENTITY,
+    }],
+    [{ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) }, {
+      kind: 'ready', identity: READY_IDENTITY, contentDigest: '2'.repeat(64),
+    }],
+  ])('projects identity-store inspection without any other production operation', async (snapshot, expected) => {
+    const store = identityStore(snapshot);
+    const forbidden = vi.fn(() => { throw new Error('forbidden_production_operation'); });
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readStdin: forbidden,
+      startService: forbidden,
+      spawn: forbidden,
+      request: forbidden,
+      readJson: forbidden,
+      kill: forbidden,
+    }) as never);
+
+    await expect(runtime.inspect()).resolves.toEqual(expected);
+
+    expect(store.read).toHaveBeenCalledOnce();
+    expect(forbidden).not.toHaveBeenCalled();
+  });
+
+  it('claims before stdin/service I/O and leaves a losing foreground contender inert', async () => {
+    const events: string[] = [];
+    const store = identityStore();
+    store.claim.mockImplementation(async () => {
+      events.push('claim');
+      return false;
+    });
+    const readStdin = vi.fn(async () => {
+      events.push('stdin');
+      return Buffer.from('{}\n');
+    });
+    const startService = vi.fn(async () => {
+      events.push('service');
+      throw new Error('service_must_not_start');
+    });
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readStdin,
+      startService,
+    }) as never);
+
+    await expect(runtime.runForeground(
+      { foreground: true, noOpen: true, configOverrides: {} },
+      { daemonChild: true, onReady: vi.fn() },
+    )).rejects.toMatchObject({ code: 'identity_conflict' });
+
+    expect(events).toEqual(['claim']);
+    expect(readStdin).not.toHaveBeenCalled();
+    expect(startService).not.toHaveBeenCalled();
+    expect(store.removeIfMatches).not.toHaveBeenCalled();
+  });
+
+  it('accepts one strict child StartInput frame, reports ready once, and shares signal shutdown', async () => {
+    const events: string[] = [];
+    const store = identityStore();
+    store.claim.mockImplementation(async () => {
+      events.push('claim');
+      return true;
+    });
+    const childInput = {
+      foreground: false,
+      noOpen: false,
+      configOverrides: { logLevel: 'warn' as const },
+    };
+    const readStdin = vi.fn(async () => {
+      events.push('stdin');
+      return Buffer.from(`${JSON.stringify(childInput)}\n`, 'utf8');
+    });
+    const signals = new EventEmitter();
+    const stop = vi.fn(async () => { events.push('stop'); });
+    const status = vi.fn(async () => ({
+      schemaVersion: 1 as const,
+      identity: READY_IDENTITY,
+      state: 'ready' as const,
+    }));
+    const startService = vi.fn(async () => {
+      events.push('service');
+      return { status, stop };
+    });
+    const onReady = vi.fn(async () => {
+      events.push('ready');
+      signals.emit('SIGTERM');
+    });
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readStdin,
+      startService,
+      signals,
+    }) as never);
+
+    await expect(runtime.runForeground(
+      { foreground: true, noOpen: true, configOverrides: {} },
+      { daemonChild: true, onReady },
+    )).resolves.toBe(0);
+
+    expect(events).toEqual(['claim', 'stdin', 'service', 'ready', 'stop']);
+    expect(readStdin).toHaveBeenCalledWith(64 << 10);
+    expect(startService).toHaveBeenCalledWith(expect.objectContaining({
+      identity: expect.objectContaining({
+        schema_version: 1,
+        state: 'starting',
+        pid: READY_IDENTITY.pid,
+        version: VERSION,
+        instance_id: `svc_${'aa'.repeat(16)}`,
+        started_at: READY_IDENTITY.started_at,
+      }),
+      identityStore: store,
+      homeDirectory: HOME,
+      processEnvironment: {},
+      configEnvironment: {},
+      configOverrides: { logLevel: 'warn' },
+    }));
+    expect(status).toHaveBeenCalledOnce();
+    expect(onReady).toHaveBeenCalledOnce();
+    expect(onReady).toHaveBeenCalledWith(READY_IDENTITY);
+    expect(stop).toHaveBeenCalledOnce();
+    expect(store.removeIfMatches).not.toHaveBeenCalled();
+    expect(signals.listenerCount('SIGINT')).toBe(0);
+    expect(signals.listenerCount('SIGTERM')).toBe(0);
+  });
+
+  it('observes control shutdown identity removal through the same one-shot service stop path', async () => {
+    const store = identityStore({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
+    const signals = new EventEmitter();
+    const stop = vi.fn(async () => undefined);
+    const startService = vi.fn(async () => ({
+      status: vi.fn(async () => ({
+        schemaVersion: 1 as const, identity: READY_IDENTITY, state: 'ready' as const,
+      })),
+      stop,
+    }));
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      startService,
+      signals,
+      sleep: vi.fn(async () => undefined),
+    }) as never);
+    const onReady = vi.fn(async () => {
+      store.read.mockResolvedValue({});
+      setImmediate(() => signals.emit('SIGTERM'));
+    });
+
+    await expect(runtime.runForeground(
+      { foreground: true, noOpen: true, configOverrides: {} },
+      { daemonChild: false, onReady },
+    )).resolves.toBe(0);
+
+    expect(store.read).toHaveBeenCalled();
+    expect(stop).toHaveBeenCalledOnce();
+    expect(onReady).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['missing LF', Buffer.from('{}', 'utf8')],
+    ['multiple LF', Buffer.from('{}\n\n', 'utf8')],
+    ['fatal UTF-8', Buffer.from([0xc3, 0x28, 0x0a])],
+    ['oversized', Buffer.alloc((64 << 10) + 1, 0x20)],
+    ['foreground true', Buffer.from(`${JSON.stringify({
+      foreground: true, noOpen: true, configOverrides: {},
+    })}\n`, 'utf8')],
+    ['unknown top-level key', Buffer.from(`${JSON.stringify({
+      foreground: false, noOpen: true, configOverrides: {}, extra: 'SECRET-EXTRA-SENTINEL',
+    })}\n`, 'utf8')],
+    ['secret key', Buffer.from(`${JSON.stringify({
+      foreground: false, noOpen: true, configOverrides: {}, secret: 'SECRET-STDIN-SENTINEL',
+    })}\n`, 'utf8')],
+    ['unknown config key', Buffer.from(`${JSON.stringify({
+      foreground: false, noOpen: true, configOverrides: { token: 'TOKEN-STDIN-SENTINEL' },
+    })}\n`, 'utf8')],
+  ])('rejects %s child stdin and removes only the exact winning claim', async (_label, frame) => {
+    const events: string[] = [];
+    const store = identityStore();
+    store.claim.mockImplementation(async () => {
+      events.push('claim');
+      return true;
+    });
+    const readStdin = vi.fn(async () => {
+      events.push('stdin');
+      return frame;
+    });
+    const startService = vi.fn(async () => {
+      events.push('service');
+      throw new Error('service_must_not_start');
+    });
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readStdin,
+      startService,
+    }) as never);
+
+    const error = await runtime.runForeground(
+      { foreground: true, noOpen: true, configOverrides: {} },
+      { daemonChild: true, onReady: vi.fn() },
+    ).catch((value: unknown) => value);
+
+    expect(error).toMatchObject({ code: 'invalid_config', message: 'invalid_config' });
+    expect(events).toEqual(['claim', 'stdin']);
+    expect(startService).not.toHaveBeenCalled();
+    expect(store.removeIfMatches).toHaveBeenCalledOnce();
+    expect(store.removeIfMatches).toHaveBeenCalledWith(expect.objectContaining({
+      state: 'starting', instance_id: `svc_${'aa'.repeat(16)}`,
+    }));
+    expect(JSON.stringify(error)).not.toMatch(/SECRET|TOKEN/);
+  });
+
+  it('normalizes foreground service acquisition failure and removes the exact claim', async () => {
+    const store = identityStore();
+    const startService = vi.fn(async () => { throw new Error('SECRET-SERVICE-FAILURE'); });
+    const runtime = createProductionCliRuntime(productionOptions(store, { startService }) as never);
+
+    const error = await runtime.runForeground(
+      { foreground: true, noOpen: true, configOverrides: { logLevel: 'error' } },
+      { daemonChild: false, onReady: vi.fn() },
+    ).catch((value: unknown) => value);
+
+    expect(error).toMatchObject({ code: 'operation_unavailable', message: 'operation_unavailable' });
+    expect(JSON.stringify(error)).not.toContain('SECRET-SERVICE-FAILURE');
+    expect(store.removeIfMatches).toHaveBeenCalledOnce();
+  });
+
+  it('spawns the exact packaged child only from not-running and sends config through one stdin frame', async () => {
+    const store = identityStore();
+    store.read
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({ identity: STARTING_IDENTITY, contentDigest: '1'.repeat(64) })
+      .mockResolvedValueOnce({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
+    const child = daemonChild();
+    const spawn = vi.fn(() => child);
+    const transport = requestSequence([
+      controlFrame({ schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' }),
+    ]);
+    const environment = {
+      PATH: 'D:\\safe-bin',
+      OPENCODE_API_KEY: 'PROVIDER-AUTH-SENTINEL',
+      QUUKK_EXISTING_SETTING: 'keep-me',
+      npm_config_token: 'NPM-SECRET-SENTINEL',
+      NpM_Package_Config: 'NPM-MIXED-SENTINEL',
+      node_options: '--require NODE-OPTIONS-SENTINEL',
+      Node_Tls_Reject_Unauthorized: '0',
+    };
+    const runtime = createProductionCliRuntime({
+      ...productionOptions(store, {
+        spawn,
+        sleep: vi.fn(async () => undefined),
+        readJson: vi.fn(async () => ({
+          schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {},
+        })),
+        request: transport.request,
+      }),
+      processEnvironment: environment,
+    } as never);
+    const input = {
+      foreground: false,
+      noOpen: false,
+      configOverrides: { serverUrl: 'https://example.test/im', logLevel: 'debug' as const },
+    };
+
+    await expect(runtime.start(input)).resolves.toEqual({
+      identity: READY_IDENTITY, alreadyRunning: false,
+    });
+
+    expect(spawn).toHaveBeenCalledWith(EXECUTABLE, [
+      PACKAGED_BIN, 'start', '--foreground', '--no-open', '--daemon-child',
+    ], {
+      shell: false,
+      detached: true,
+      windowsHide: true,
+      stdio: ['pipe', 'ignore', 'ignore'],
+      env: {
+        PATH: 'D:\\safe-bin',
+        OPENCODE_API_KEY: 'PROVIDER-AUTH-SENTINEL',
+        QUUKK_EXISTING_SETTING: 'keep-me',
+      },
+    });
+    expect(child.stdin.end).toHaveBeenCalledOnce();
+    expect(child.stdin.end).toHaveBeenCalledWith(`${JSON.stringify(input)}\n`, 'utf8');
+    expect(child.unref).toHaveBeenCalledOnce();
+    expect(store.claim).not.toHaveBeenCalled();
+    expect(transport.bodies).toEqual(['{"command":"status"}']);
+    const spawnSerialization = JSON.stringify(spawn.mock.calls);
+    expect(spawnSerialization).not.toMatch(/NPM-SECRET|NPM-MIXED|NODE-OPTIONS|Node_Tls/i);
+    expect(spawnSerialization).not.toContain('https://example.test/im');
+  });
+
+  it('authenticates an existing ready winner without spawning or trusting PID alone', async () => {
+    const store = identityStore({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
+    const transport = requestSequence([
+      controlFrame({ schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' }),
+    ]);
+    const spawn = vi.fn();
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      spawn,
+      readJson: vi.fn(async () => ({
+        schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {},
+      })),
+      request: transport.request,
+    }) as never);
+
+    await expect(runtime.start({
+      foreground: false, noOpen: true, configOverrides: {},
+    })).resolves.toEqual({ identity: READY_IDENTITY, alreadyRunning: true });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(store.quarantineStaleIfExact).not.toHaveBeenCalled();
+  });
+
+  it('requires three one-second unreachable probes and ESRCH before exact stale quarantine', async () => {
+    const store = identityStore({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
+    const bodies: string[] = [];
+    const request = failingRequest('ECONNREFUSED', bodies);
+    const sleep = vi.fn(async () => undefined);
+    const kill = vi.fn(() => { throw Object.assign(new Error('gone'), { code: 'ESRCH' }); });
+    const readJson = vi.fn(async () => ({
+      schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {},
+    }));
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      request,
+      sleep,
+      kill,
+      readJson,
+    }) as never);
+
+    await expect(runtime.recoverStaleForStart({
+      identity: READY_IDENTITY,
+      contentDigest: '2'.repeat(64),
+      pidProbe: 'esrch',
+      controlAttempts: 3,
+    })).resolves.toBe(true);
+
+    expect(bodies).toEqual(Array(3).fill('{"command":"status"}'));
+    expect(readJson).toHaveBeenCalledTimes(3);
+    expect(sleep.mock.calls).toEqual([[100], [250]]);
+    expect(kill).toHaveBeenCalledOnce();
+    expect(kill).toHaveBeenCalledWith(READY_IDENTITY.pid, 0);
+    expect(store.quarantineStaleIfExact).toHaveBeenCalledOnce();
+    expect(store.quarantineStaleIfExact).toHaveBeenCalledWith({
+      expected: READY_IDENTITY, contentDigest: '2'.repeat(64),
+    });
+  });
+
+  it.each([
+    ['live PID', undefined],
+    ['EPERM PID', 'EPERM'],
+  ])('never quarantines stale identity after %s', async (_label, killCode) => {
+    const store = identityStore();
+    const kill = vi.fn(() => {
+      if (killCode !== undefined) throw Object.assign(new Error(killCode), { code: killCode });
+      return true;
+    });
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      request: failingRequest('ECONNREFUSED'),
+      sleep: vi.fn(async () => undefined),
+      kill,
+      readJson: vi.fn(async () => ({
+        schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {},
+      })),
+    }) as never);
+
+    await expect(runtime.recoverStaleForStart({
+      identity: READY_IDENTITY,
+      contentDigest: '2'.repeat(64),
+      pidProbe: 'esrch',
+      controlAttempts: 3,
+    })).rejects.toMatchObject({ code: 'stale_unverified' });
+    expect(store.quarantineStaleIfExact).not.toHaveBeenCalled();
+  });
+
+  it('uses a fresh bounded credential read and an exact loopback status request', async () => {
+    const store = identityStore({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
+    const credentials = { schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {} };
+    const readJson = vi.fn(async () => credentials);
+    const responseBody = Buffer.from(JSON.stringify({
+      schemaVersion: 1,
+      identity: READY_IDENTITY,
+      state: 'ready',
+    }), 'utf8');
+    let requestBody: Buffer | undefined;
+    const request = vi.fn((_requestOptions: unknown, callback: (response: unknown) => void) => {
+      const outgoing = new EventEmitter() as EventEmitter & {
+        end(body: Buffer): void;
+        destroy(error?: Error): void;
+      };
+      outgoing.end = vi.fn((body: Buffer) => {
+        requestBody = Buffer.from(body);
+        const response = Readable.from([responseBody]) as Readable & {
+          statusCode: number;
+          rawHeaders: string[];
+          complete: boolean;
+          trailers: Record<string, string>;
+        };
+        response.statusCode = 200;
+        response.rawHeaders = [
+          'Content-Type', 'application/json; charset=utf-8',
+          'Content-Length', String(responseBody.byteLength),
+          'Connection', 'close',
+        ];
+        response.complete = true;
+        response.trailers = {};
+        queueMicrotask(() => callback(response));
+      });
+      outgoing.destroy = vi.fn();
+      return outgoing;
+    });
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readJson,
+      request,
+    }) as never);
+
+    await expect(runtime.control(READY_IDENTITY, 'status')).resolves.toEqual({
+      command: 'status',
+      value: { schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' },
+    });
+
+    expect(readJson).toHaveBeenCalledWith(
+      localPaths(HOME).credentials,
+      expect.anything(),
+      4 << 20,
+    );
+    expect(request).toHaveBeenCalledWith({
+      protocol: 'http:',
+      hostname: '127.0.0.1',
+      port: 43210,
+      method: 'POST',
+      path: '/internal/control',
+      agent: false,
+      headers: {
+        Host: '127.0.0.1:43210',
+        Authorization: `Bearer ${deriveControlCredential(BRIDGE_SECRET, READY_IDENTITY.instance_id)}`,
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': String(Buffer.byteLength('{"command":"status"}', 'utf8')),
+        Connection: 'close',
+      },
+    }, expect.any(Function));
+    expect(requestBody?.toString('utf8')).toBe('{"command":"status"}');
+    expect(JSON.stringify(request.mock.calls)).not.toContain(BRIDGE_SECRET);
+  });
+
+  it('authenticates status before every non-status command and reuses no unverified response', async () => {
+    const store = identityStore({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
+    const readJson = vi.fn(async () => ({
+      schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {},
+    }));
+    const statusValue = { schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' };
+    const runtimesValue = runtimeResponse();
+    const transport = requestSequence([
+      controlFrame(statusValue),
+      controlFrame(runtimesValue),
+    ]);
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readJson,
+      request: transport.request,
+    }) as never);
+
+    await expect(runtime.control(READY_IDENTITY, 'rescan')).resolves.toEqual({
+      command: 'rescan', value: runtimesValue,
+    });
+
+    expect(readJson).toHaveBeenCalledOnce();
+    expect(transport.bodies).toEqual(['{"command":"status"}', '{"command":"rescan"}']);
+    expect(transport.request).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not send a non-status command when authenticated status mismatches', async () => {
+    const store = identityStore();
+    const replacement = {
+      ...READY_IDENTITY,
+      pid: READY_IDENTITY.pid + 1,
+      instance_id: `svc_${'b'.repeat(32)}`,
+    };
+    const transport = requestSequence([
+      controlFrame({ schemaVersion: 1, identity: replacement, state: 'ready' }),
+    ]);
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readJson: vi.fn(async () => ({
+        schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {},
+      })),
+      request: transport.request,
+    }) as never);
+
+    await expect(runtime.control(READY_IDENTITY, 'shutdown')).rejects.toMatchObject({
+      code: 'process_unverified', message: 'process_unverified',
+    });
+    expect(transport.bodies).toEqual(['{"command":"status"}']);
+  });
+
+  it('waits after shutdown for both old authentication failure and exact old identity disappearance', async () => {
+    const replacement = {
+      ...READY_IDENTITY,
+      pid: READY_IDENTITY.pid + 1,
+      instance_id: `svc_${'c'.repeat(32)}`,
+    };
+    const store = identityStore();
+    store.read
+      .mockResolvedValueOnce({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) })
+      .mockResolvedValueOnce({ identity: replacement, contentDigest: '3'.repeat(64) });
+    const frames = [
+      controlFrame({ schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' }),
+      controlFrame({ schemaVersion: 1, accepted: true }, 202),
+      controlFrame({ schemaVersion: 1, identity: READY_IDENTITY, state: 'stopping' }),
+    ];
+    const successful = requestSequence(frames);
+    let requestCount = 0;
+    const refused = failingRequest('ECONNREFUSED', successful.bodies);
+    const request = vi.fn((options: unknown, callback: (response: unknown) => void) => {
+      requestCount += 1;
+      return requestCount <= frames.length
+        ? successful.request(options, callback)
+        : refused(options, callback);
+    });
+    let clock = 0;
+    const sleep = vi.fn(async (milliseconds: number) => { clock += milliseconds; });
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      request,
+      sleep,
+      monotonicNow: () => clock,
+      readJson: vi.fn(async () => ({
+        schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {},
+      })),
+    }) as never);
+
+    await expect(runtime.control(READY_IDENTITY, 'shutdown')).resolves.toEqual({
+      command: 'shutdown', value: { accepted: true },
+    });
+
+    expect(successful.bodies).toEqual([
+      '{"command":"status"}',
+      '{"command":"shutdown"}',
+      '{"command":"status"}',
+      '{"command":"status"}',
+    ]);
+    expect(store.read).toHaveBeenCalledTimes(2);
+    expect(store.removeIfMatches).not.toHaveBeenCalled();
+    expect(store.quarantineStaleIfExact).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['HTTP status', controlFrame({ error: { code: 'control_unauthorized' } }, 401)],
+    ['redirect', controlFrame({}, 302)],
+    ['duplicate content length', (() => {
+      const frame = controlFrame({ schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' });
+      return { ...frame, rawHeaders: [...frame.rawHeaders!, 'Content-Length', String(frame.body.byteLength)] };
+    })()],
+    ['transfer encoding', (() => {
+      const frame = controlFrame({ schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' });
+      return { ...frame, rawHeaders: [...frame.rawHeaders!, 'Transfer-Encoding', 'chunked'] };
+    })()],
+    ['wrong content type', (() => {
+      const frame = controlFrame({ schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' });
+      return { ...frame, rawHeaders: ['Content-Type', 'application/json', 'Content-Length', String(frame.body.byteLength)] };
+    })()],
+    ['short framing', (() => {
+      const frame = controlFrame({ schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' });
+      return { ...frame, rawHeaders: ['Content-Type', 'application/json; charset=utf-8', 'Content-Length', String(frame.body.byteLength + 1)] };
+    })()],
+    ['incomplete response', controlFrame(
+      { schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' },
+      200,
+      { complete: false },
+    )],
+    ['trailers', controlFrame(
+      { schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' },
+      200,
+      { trailers: { sentinel: 'unsafe' } },
+    )],
+    ['schema extras', controlFrame({
+      schemaVersion: 1, identity: READY_IDENTITY, state: 'ready', secret: 'SECRET-RESPONSE-SENTINEL',
+    })],
+    ['identity mismatch', controlFrame({
+      schemaVersion: 1,
+      identity: { ...READY_IDENTITY, instance_id: `svc_${'b'.repeat(32)}` },
+      state: 'ready',
+    })],
+    ['fatal UTF-8', {
+      statusCode: 200,
+      body: Buffer.from([0xc3, 0x28]),
+      rawHeaders: ['Content-Type', 'application/json; charset=utf-8', 'Content-Length', '2'],
+      complete: true,
+      trailers: {},
+    }],
+  ])('fails closed on strict control %s', async (_label, frame) => {
+    const store = identityStore();
+    const transport = requestSequence([frame]);
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readJson: vi.fn(async () => ({
+        schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {},
+      })),
+      request: transport.request,
+    }) as never);
+
+    const error = await runtime.control(READY_IDENTITY, 'status').catch((value: unknown) => value);
+
+    expect(error).toMatchObject({ code: 'process_unverified', message: 'process_unverified' });
+    expect(JSON.stringify(error)).not.toMatch(/SECRET|unsafe/);
   });
 });
