@@ -42,14 +42,14 @@ Codex, and Hermes, lets the user choose which runtimes to connect, and gives eve
 runtime an isolated RongCloud identity and worker.
 
 ```bash
-npm install -g quukk-clawmessenger
+npm install -g quukk-clawmessenger@beta
 quukk-clawmessenger setup
 ```
 
 Use `quukk-clawmessenger setup --no-open` on a terminal-only host. Installation never signs in to
 an agent CLI or registers a runtime before explicit local confirmation. See the
 [Quukk ClawMessenger guide](packages/quukk-clawmessenger/README.md) for provider prerequisites,
-all seven commands, the deny-by-default local work-directory policy, migration, diagnostics,
+all seven commands, the deny-by-default local work-directory policy, beta migration limits, diagnostics,
 uninstall, platform support, and server deployment gates.
 
 Quukk ClawMessenger is **built on Multica** and retains the Multica interface branding,

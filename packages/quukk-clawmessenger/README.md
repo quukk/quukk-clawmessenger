@@ -21,7 +21,7 @@ Requirements:
 Install globally, then open the local setup page:
 
 ```bash
-npm install -g quukk-clawmessenger
+npm install -g quukk-clawmessenger@beta
 quukk-clawmessenger setup
 ```
 
@@ -108,26 +108,17 @@ then `config.json`, then built-in defaults. The default server URL is
 `https://newsradar.dreamdt.cn/im`. `config.json` never stores RongCloud tokens or the per-install
 Bridge secret.
 
-## Legacy migration
+## Legacy migration in this beta
 
-Setup recognizes these fixed OpenCode ClawMessenger locations under the explicitly selected user
-home:
+The beta CLI and setup page do not automatically inspect or import an older OpenCode
+ClawMessenger installation. Enter the non-secret server, work-directory, authorized-root, and
+provider-path settings again in Quukk setup, then select and register each runtime to obtain its
+new isolated identity.
 
-- `.config/opencode/clawmessenger.json`
-- `.claw-bridge/opencode/opencode-config.json`
-- `.claw-bridge/opencode/config.json`
-- `.claw-bridge/config.json`
-
-Only a strictly validated, size-bounded projection of non-secret settings can be imported:
-the secure server URL, working directory/authorized roots, and provider path overrides. Legacy
-node IDs, MAC addresses, AppKey/AppSecret values, passwords, tokens, bindings, sessions, and logs
-are never imported. Registration caches are detected without opening their contents.
-
-Import requires an explicit confirmation. The destination is validated and written through the
-same protected atomic store as normal settings. Failure leaves the old files byte-for-byte
-untouched and leaves no partial Quukk `config.json`. Legacy files are not moved or deleted; after
-a successful settings import, select and register each runtime again to obtain a new isolated
-identity.
+Legacy files are never moved, changed, or deleted. Do not copy legacy node IDs, MAC-derived
+identities, AppKey/AppSecret values, passwords, tokens, bindings, sessions, or logs into Quukk
+configuration. Automated, explicitly confirmed migration remains disabled until it has a complete
+authenticated setup UI path.
 
 ## Diagnostics and recovery
 
