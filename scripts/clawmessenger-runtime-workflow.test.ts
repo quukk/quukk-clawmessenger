@@ -11,6 +11,7 @@ interface WorkflowStep {
   name?: string;
   uses?: string;
   run?: string;
+  'working-directory'?: string;
   env?: Record<string, string>;
   with?: Record<string, unknown>;
 }
@@ -70,6 +71,15 @@ const EXPECTED_PACKAGE_NAMES = [
   '@quukk/clawmessenger-runtime-linux-arm64',
   'quukk-clawmessenger',
 ];
+const PINNED_ACTIONS = new Set([
+  'actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
+  'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020',
+  'actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff',
+  'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+  'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+  'actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be',
+  'pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1',
+]);
 
 async function loadWorkflow(): Promise<RuntimeWorkflow> {
   return parseYaml(
@@ -93,12 +103,32 @@ function requiredStep(job: WorkflowJob, name: string): WorkflowStep {
 }
 
 describe('Quukk ClawMessenger seven-package workflow', () => {
+  it('runs the exact Bridge and runtime-access Go contracts before artifact builds', async () => {
+    const workflow = await loadWorkflow();
+    const contracts = requiredJob(workflow, 'runtime-contracts');
+    const test = requiredStep(contracts, 'Test Bridge Go contracts');
+    expect(test['working-directory']).toBe('server');
+    expect(test.run).toContain("go test -count=1 -run '^TestBridgeCommand' ./cmd/multica");
+    expect(test.run).toContain("go test -count=1 -run '^TestBridge' ./internal/daemon");
+    expect(test.run).toContain(
+      "go test -count=1 -run '^(TestClaimTaskByRuntime|TestBuildClaimedTaskResponse)' ./internal/handler",
+    );
+    expect(test.run).toContain(
+      "go test -count=1 -run '^(TestRuntimeAccessGates|TestClaimTask)' ./internal/service",
+    );
+  });
+
   it('builds and attests the entry package after the Bridge UI and TypeScript builds', async () => {
     const workflow = await loadWorkflow();
     const entry = requiredJob(workflow, 'build-entry');
     expect(entry.needs).toBe('runtime-contracts');
     expect(JSON.stringify(entry)).not.toContain('NPM_TOKEN');
 
+    const bridgeTest = requiredStep(entry, 'Test Bridge UI');
+    const bridgeTypecheck = requiredStep(entry, 'Typecheck Bridge UI');
+    const entryTest = requiredStep(entry, 'Test entry package');
+    const entryTypecheck = requiredStep(entry, 'Typecheck entry package');
+    const e2eTypecheck = requiredStep(entry, 'Typecheck fake end-to-end');
     const bridgeBuild = requiredStep(entry, 'Build Bridge UI');
     const entryBuild = requiredStep(entry, 'Build entry TypeScript');
     const licenseAudit = requiredStep(entry, 'Audit Bridge licenses');
@@ -108,6 +138,11 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
     const attest = requiredStep(entry, 'Attest entry package provenance');
     const upload = requiredStep(entry, 'Upload entry package');
     const orderedSteps = [
+      bridgeTest,
+      bridgeTypecheck,
+      entryTest,
+      entryTypecheck,
+      e2eTypecheck,
       bridgeBuild,
       entryBuild,
       licenseAudit,
@@ -121,6 +156,11 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
       index >= 0 && (position === 0 || index > orderedSteps[position - 1])
     ))).toBe(true);
 
+    expect(bridgeTest.run).toBe('pnpm --dir apps/bridge test');
+    expect(bridgeTypecheck.run).toBe('pnpm --dir apps/bridge typecheck');
+    expect(entryTest.run).toBe('pnpm --dir packages/quukk-clawmessenger test');
+    expect(entryTypecheck.run).toBe('pnpm --dir packages/quukk-clawmessenger typecheck');
+    expect(e2eTypecheck.run).toBe('pnpm --dir packages/quukk-clawmessenger typecheck:e2e');
     expect(bridgeBuild.run).toBe('pnpm --dir apps/bridge build');
     expect(entryBuild.run).toBe(
       'pnpm --dir packages/quukk-clawmessenger exec tsc -p tsconfig.json',
@@ -133,9 +173,13 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
     expect(dryRun.run).toContain('packages/quukk-clawmessenger/scripts/audit-tarball.mjs');
     expect(pack.run).toContain('npm pack --ignore-scripts');
     expect(pack.run).not.toContain('--dry-run');
-    expect(attest.uses).toBe('actions/attest-build-provenance@v2');
+    expect(attest.uses).toBe(
+      'actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be',
+    );
     expect(attest.with?.['subject-path']).toBe('.artifacts/entry/*.tgz');
-    expect(upload.uses).toBe('actions/upload-artifact@v4');
+    expect(upload.uses).toBe(
+      'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+    );
     expect(upload.with).toMatchObject({
       name: 'quukk-entry-package',
       path: '.artifacts/entry/*.tgz',
@@ -168,8 +212,12 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
     expect(commands).toContain('first_sha256');
     expect(commands).toContain('second_sha256');
     expect(commands).toContain('npm pack "./packages/');
-    expect(actions).toContain('actions/upload-artifact@v4');
-    expect(actions).toContain('actions/attest-build-provenance@v2');
+    expect(actions).toContain(
+      'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+    );
+    expect(actions).toContain(
+      'actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be',
+    );
     expect(JSON.stringify(build)).not.toContain('NPM_TOKEN');
   });
 
@@ -194,7 +242,9 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
     expect(publish.env).toBeUndefined();
 
     const downloads = publish.steps.filter(
-      (step) => step.uses === 'actions/download-artifact@v4',
+      (step) =>
+        step.uses ===
+        'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
     );
     expect(downloads.map((step) => [step.with?.name, step.with?.path])).toEqual(
       EXPECTED_ARTIFACTS,
@@ -237,5 +287,17 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
 
     const allPublishCommands = publish.steps.map((step) => step.run ?? '').join('\n');
     expect(allPublishCommands.match(/npm publish /g)).toHaveLength(2);
+  });
+
+  it('pins every third-party action to one reviewed commit', async () => {
+    const workflow = await loadWorkflow();
+    const uses = Object.values(workflow.jobs).flatMap((job) =>
+      job.steps.map((step) => step.uses).filter((value): value is string => value !== undefined),
+    );
+    expect(uses.length).toBeGreaterThan(0);
+    for (const action of uses) {
+      expect(action).toMatch(/@[0-9a-f]{40}$/);
+      expect(PINNED_ACTIONS.has(action), action).toBe(true);
+    }
   });
 });

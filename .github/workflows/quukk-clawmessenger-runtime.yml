@@ -23,13 +23,30 @@ jobs:
   runtime-contracts:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Test Bridge Go contracts
+        shell: bash
+        working-directory: server
+        env:
+          GOENV: 'off'
+          GOWORK: 'off'
+          GOTOOLCHAIN: 'local'
+        run: |
+          set -euo pipefail
+          go test -count=1 -run '^TestBridgeCommand' ./cmd/multica
+          go test -count=1 -run '^TestBridge' ./internal/daemon
+          go test -count=1 -run '^(TestClaimTaskByRuntime|TestBuildClaimedTaskResponse)' ./internal/handler
+          go test -count=1 -run '^(TestRuntimeAccessGates|TestClaimTask)' ./internal/service
       - run: >-
           pnpm exec vitest run
           scripts/clawmessenger-runtime.test.ts
@@ -43,15 +60,25 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Test Bridge UI
+        run: pnpm --dir apps/bridge test
+      - name: Typecheck Bridge UI
+        run: pnpm --dir apps/bridge typecheck
+      - name: Test entry package
+        run: pnpm --dir packages/quukk-clawmessenger test
+      - name: Typecheck entry package
+        run: pnpm --dir packages/quukk-clawmessenger typecheck
+      - name: Typecheck fake end-to-end
+        run: pnpm --dir packages/quukk-clawmessenger typecheck:e2e
       - name: Build Bridge UI
         run: pnpm --dir apps/bridge build
       - name: Build entry TypeScript
@@ -79,11 +106,11 @@ jobs:
           npm pack --ignore-scripts ./packages/quukk-clawmessenger --pack-destination "$artifact_dir"
       - name: Attest entry package provenance
         if: github.event_name != 'pull_request'
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: .artifacts/entry/*.tgz
       - name: Upload entry package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: quukk-entry-package
           path: .artifacts/entry/*.tgz
@@ -129,15 +156,15 @@ jobs:
             arch: arm64
             directory: quukk-clawmessenger-runtime-linux-arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: server/go.mod
           cache-dependency-path: server/go.sum
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
@@ -171,11 +198,11 @@ jobs:
           npm pack "./packages/${{ matrix.directory }}" --pack-destination "$artifact_dir"
       - name: Attest package provenance
         if: github.event_name != 'pull_request'
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: .artifacts/${{ matrix.platform }}-${{ matrix.arch }}/*.tgz
       - name: Upload runtime package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: quukk-runtime-${{ matrix.platform }}-${{ matrix.arch }}
           path: .artifacts/${{ matrix.platform }}-${{ matrix.arch }}/*.tgz
@@ -202,8 +229,8 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
@@ -219,37 +246,37 @@ jobs:
           fi
           npm whoami --registry=https://registry.npmjs.org >/dev/null
       - name: Download Windows x64 runtime
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: quukk-runtime-win32-x64
           path: .artifacts/incoming/win32-x64
       - name: Download Windows arm64 runtime
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: quukk-runtime-win32-arm64
           path: .artifacts/incoming/win32-arm64
       - name: Download macOS x64 runtime
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: quukk-runtime-darwin-x64
           path: .artifacts/incoming/darwin-x64
       - name: Download macOS arm64 runtime
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: quukk-runtime-darwin-arm64
           path: .artifacts/incoming/darwin-arm64
       - name: Download Linux x64 runtime
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: quukk-runtime-linux-x64
           path: .artifacts/incoming/linux-x64
       - name: Download Linux arm64 runtime
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: quukk-runtime-linux-arm64
           path: .artifacts/incoming/linux-arm64
       - name: Download entry package
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: quukk-entry-package
           path: .artifacts/incoming/entry
