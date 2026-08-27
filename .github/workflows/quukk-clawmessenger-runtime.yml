@@ -1,0 +1,143 @@
+name: Quukk ClawMessenger runtime packages
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - codex/quukk-clawmessenger
+    tags:
+      - quukk-clawmessenger-v*
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified runtime packages to npm
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec vitest run scripts/clawmessenger-runtime.test.ts
+
+  build-runtime:
+    needs: runtime-contracts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: win32
+            arch: x64
+            directory: quukk-clawmessenger-runtime-win32-x64
+          - platform: win32
+            arch: arm64
+            directory: quukk-clawmessenger-runtime-win32-arm64
+          - platform: darwin
+            arch: x64
+            directory: quukk-clawmessenger-runtime-darwin-x64
+          - platform: darwin
+            arch: arm64
+            directory: quukk-clawmessenger-runtime-darwin-arm64
+          - platform: linux
+            arch: x64
+            directory: quukk-clawmessenger-runtime-linux-x64
+          - platform: linux
+            arch: arm64
+            directory: quukk-clawmessenger-runtime-linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build runtime
+        run: >-
+          node scripts/build-clawmessenger-runtime.mjs
+          --platform ${{ matrix.platform }}
+          --arch ${{ matrix.arch }}
+      - name: Verify runtime
+        run: >-
+          node scripts/verify-clawmessenger-runtime.mjs
+          packages/${{ matrix.directory }}
+      - name: Verify reproducible rebuild
+        shell: bash
+        run: |
+          package_dir="packages/${{ matrix.directory }}"
+          first_sha256="$(node -p "JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8')).sha256" "$package_dir/manifest.json")"
+          node scripts/build-clawmessenger-runtime.mjs --platform "${{ matrix.platform }}" --arch "${{ matrix.arch }}"
+          node scripts/verify-clawmessenger-runtime.mjs "$package_dir"
+          second_sha256="$(node -p "JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8')).sha256" "$package_dir/manifest.json")"
+          if [ "$first_sha256" != "$second_sha256" ]; then
+            echo "::error::runtime rebuild digest changed"
+            exit 1
+          fi
+      - name: Pack runtime
+        shell: bash
+        run: |
+          artifact_dir=".artifacts/${{ matrix.platform }}-${{ matrix.arch }}"
+          mkdir -p "$artifact_dir"
+          npm pack "./packages/${{ matrix.directory }}" --pack-destination "$artifact_dir"
+      - name: Attest package provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: .artifacts/${{ matrix.platform }}-${{ matrix.arch }}/*.tgz
+      - name: Upload runtime package
+        uses: actions/upload-artifact@v4
+        with:
+          name: quukk-runtime-${{ matrix.platform }}-${{ matrix.arch }}
+          path: .artifacts/${{ matrix.platform }}-${{ matrix.arch }}/*.tgz
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-runtime-packages:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+    needs: build-runtime
+    runs-on: ubuntu-latest
+    environment: npm-runtime-prerelease
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: quukk-runtime-*
+          path: .artifacts
+          merge-multiple: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Publish prerelease runtime packages
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for package in .artifacts/*.tgz; do
+            npm publish "$package" --access public --tag beta --provenance
+          done

@@ -22,6 +22,14 @@
     "ws": "8.20.0",
     "zod": "catalog:"
   },
+  "optionalDependencies": {
+    "@quukk/clawmessenger-runtime-win32-x64": "0.1.0-beta.1",
+    "@quukk/clawmessenger-runtime-win32-arm64": "0.1.0-beta.1",
+    "@quukk/clawmessenger-runtime-darwin-x64": "0.1.0-beta.1",
+    "@quukk/clawmessenger-runtime-darwin-arm64": "0.1.0-beta.1",
+    "@quukk/clawmessenger-runtime-linux-x64": "0.1.0-beta.1",
+    "@quukk/clawmessenger-runtime-linux-arm64": "0.1.0-beta.1"
+  },
   "devDependencies": {
     "@multica/tsconfig": "workspace:*",
     "@types/jsdom": "21.1.7",

@@ -1,0 +1,21 @@
+{
+  "name": "@quukk/clawmessenger-runtime-linux-arm64",
+  "version": "0.1.0-beta.1",
+  "description": "Multica Bridge runtime for Quukk ClawMessenger on Linux arm64",
+  "license": "SEE LICENSE IN LICENSE",
+  "homepage": "https://github.com/multica-ai/multica",
+  "files": [
+    "multica",
+    "manifest.json",
+    "LICENSE",
+    "NOTICE",
+    "MODIFICATIONS.md",
+    "SOURCE.md"
+  ],
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
