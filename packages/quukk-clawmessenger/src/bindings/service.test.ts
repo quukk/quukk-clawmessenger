@@ -9,6 +9,7 @@ import { localPaths } from '../config/paths.js';
 import { DEFAULT_CONFIG } from '../config/schema.js';
 import { LocalStore } from '../config/store.js';
 import type {
+  ConfigOverrides,
   Provider,
   RuntimeBinding,
   TrustedRuntime,
@@ -105,7 +106,15 @@ class FakeRuntimeSource {
 
 async function harness(
   runtimes: readonly TrustedRuntime[] = [runtime('codex')],
-  options: { home?: string; hostname?: string; registration?: FakeRegistrationClient } = {},
+  options: {
+    home?: string;
+    hostname?: string;
+    registration?: FakeRegistrationClient;
+    configSnapshot?: {
+      overrides?: ConfigOverrides;
+      environment?: NodeJS.ProcessEnv;
+    };
+  } = {},
 ) {
   const home = options.home ?? (await temporaryHome());
   const store = await LocalStore.open({ homeDirectory: home, now: () => new Date(TIME_1) });
@@ -115,6 +124,7 @@ async function harness(
     store,
     registrationClient: registration,
     runtimeSource: source,
+    configSnapshot: options.configSnapshot,
     now: () => new Date(TIME_1),
     hostname: () => options.hostname ?? 'fixture-host',
   });
@@ -331,6 +341,29 @@ describe('BindingService', () => {
     expect(fixture.registration.registerCalls).toEqual([]);
   });
 
+  it('uses copied config overrides for AppKey lookup and registration', async () => {
+    const selected = runtime('codex');
+    const overrides: ConfigOverrides = { serverUrl: 'https://override.example/im' };
+    const environment: NodeJS.ProcessEnv = {
+      QUUKK_CLAWMESSENGER_SERVER_URL: 'https://environment.example/im',
+    };
+    const fixture = await harness([selected], {
+      configSnapshot: { overrides, environment },
+    });
+
+    overrides.serverUrl = 'https://mutated-override.example/im';
+    environment.QUUKK_CLAWMESSENGER_SERVER_URL = 'https://mutated-environment.example/im';
+    await fixture.service.enableSelected([selected.id]);
+
+    expect(fixture.registration.appKeyCalls).toEqual(['https://override.example/im']);
+    expect(fixture.registration.registerCalls).toEqual([
+      expect.objectContaining({
+        runtimeId: selected.id,
+        serverUrl: 'https://override.example/im',
+      }),
+    ]);
+  });
+
   it('returns an already-enabled complete binding idempotently without network', async () => {
     const selected = runtime('codex');
     const fixture = await harness([selected]);
@@ -381,7 +414,10 @@ describe('BindingService', () => {
     expect(reopenedSame.registration.registerCalls[0]).not.toHaveProperty('existingNodeToken');
 
     const changed = await harness([selected]);
-    await seedBinding(changed.store, selected, { serverUrl: 'https://old.example/im' });
+    await seedBinding(changed.store, selected, {
+      enabled: false,
+      serverUrl: 'https://old.example/im',
+    });
     await changed.store.saveConfig({
       schemaVersion: 1,
       serverUrl: 'https://new.example/im',
@@ -391,7 +427,8 @@ describe('BindingService', () => {
       logLevel: 'info',
     });
     const reopenedChanged = await harness([selected], { home: changed.home });
-    await reopenedChanged.service.enableSelected([selected.id]);
+    const [changedResult] = await reopenedChanged.service.enableSelected([selected.id]);
+    expect(changedResult?.ok && changedResult.binding.enabled).toBe(true);
     expect(reopenedChanged.registration.registerCalls[0]).not.toHaveProperty('existingNodeId');
     expect(reopenedChanged.registration.registerCalls[0]).not.toHaveProperty('existingNodeToken');
   });
@@ -713,33 +750,129 @@ describe('BindingService', () => {
     expect(reopened.store.credential(current!.tokenRef!)?.token).toBe('codex-refreshed-token');
   });
 
-  it('rejects cross-server reregister without network and preserves the old credential', async () => {
+  it('uses one copied environment snapshot for same-server refresh', async () => {
+    const selected = runtime('codex');
+    const environment: NodeJS.ProcessEnv = {
+      QUUKK_CLAWMESSENGER_SERVER_URL: 'https://environment.example/im',
+    };
+    const fixture = await harness([selected]);
+    await seedBinding(fixture.store, selected, {
+      serverUrl: environment.QUUKK_CLAWMESSENGER_SERVER_URL,
+    });
+    const reopened = await harness([selected], {
+      home: fixture.home,
+      configSnapshot: { environment },
+    });
+
+    environment.QUUKK_CLAWMESSENGER_SERVER_URL = 'https://mutated.example/im';
+    await expect(reopened.service.reregister(selected.id)).resolves.toMatchObject({ ok: true });
+
+    expect(reopened.registration.appKeyCalls).toEqual(['https://environment.example/im']);
+    expect(reopened.registration.refreshCalls).toEqual([
+      expect.objectContaining({
+        runtimeId: selected.id,
+        serverUrl: 'https://environment.example/im',
+      }),
+    ]);
+    expect(reopened.registration.registerCalls).toEqual([]);
+  });
+
+  it.each([false, true])(
+    'fully registers on a changed server and preserves enabled=%s',
+    async (enabled) => {
+      const selected = runtime('codex');
+      const fixture = await harness([selected]);
+      const old = await seedBinding(fixture.store, selected, {
+        enabled,
+        serverUrl: 'https://old.example/im',
+        nodeId: 'codex_old_node',
+      });
+      const registration = new FakeRegistrationClient();
+      registration.getAppKeyImplementation = async () => 'new-app-key';
+      registration.registerImplementation = async (input) => ({
+        nodeId: 'codex_new_node',
+        nodeName: input.nodeName,
+        token: 'new-rongcloud-token',
+      });
+      const reopened = await harness([selected], {
+        home: fixture.home,
+        registration,
+        configSnapshot: { overrides: { serverUrl: 'https://new.example/im' }, environment: {} },
+      });
+
+      const result = await reopened.service.reregister(selected.id);
+
+      expect(result).toMatchObject({
+        ok: true,
+        runtimeId: selected.id,
+        binding: { enabled, nodeId: 'codex_new_node', registrationState: 'offline' },
+      });
+      expect(registration.appKeyCalls).toEqual(['https://new.example/im']);
+      expect(registration.refreshCalls).toEqual([]);
+      expect(registration.registerCalls).toEqual([
+        expect.objectContaining({
+          runtimeId: selected.id,
+          serverUrl: 'https://new.example/im',
+          provider: 'codex',
+        }),
+      ]);
+      expect(registration.registerCalls[0]).not.toHaveProperty('existingNodeId');
+      expect(JSON.stringify(registration.registerCalls[0])).not.toContain('codex_old_node');
+      expect(JSON.stringify(registration.registerCalls[0])).not.toContain('old-rongcloud-token');
+      const current = result.ok ? result.binding : undefined;
+      expect(current?.tokenRef).not.toBe(old.tokenRef);
+      expect(reopened.store.credential(old.tokenRef!)).toBeUndefined();
+      expect(reopened.store.credential(current!.tokenRef!)).toMatchObject({
+        serverUrl: 'https://new.example/im',
+        appKey: 'new-app-key',
+        token: 'new-rongcloud-token',
+        nodeId: 'codex_new_node',
+      });
+    },
+  );
+
+  it('restores the old binding and credential when changed-server registration fails', async () => {
     const selected = runtime('codex');
     const fixture = await harness([selected]);
     const old = await seedBinding(fixture.store, selected, {
+      enabled: false,
       serverUrl: 'https://old.example/im',
+      nodeId: 'codex_old_node',
     });
-    await fixture.store.saveConfig({
-      schemaVersion: 1,
-      serverUrl: 'https://new.example/im',
-      defaultWorkdir: null,
-      authorizedWorkRoots: [],
-      providerPathOverrides: {},
-      logLevel: 'info',
+    const registration = new FakeRegistrationClient();
+    registration.registerImplementation = async () => {
+      throw new RegistrationError('registration_rejected', 'registration', false);
+    };
+    const reopened = await harness([selected], {
+      home: fixture.home,
+      registration,
+      configSnapshot: { overrides: { serverUrl: 'https://new.example/im' }, environment: {} },
     });
-    const reopened = await harness([selected], { home: fixture.home });
 
     await expect(reopened.service.reregister(selected.id)).resolves.toEqual({
       runtimeId: selected.id,
       ok: false,
-      errorCode: 'runtime_identity_changed',
+      errorCode: 'registration_rejected',
     });
-    expect(reopened.registration.appKeyCalls).toEqual([]);
-    expect(reopened.registration.registerCalls).toEqual([]);
-    expect(reopened.registration.refreshCalls).toEqual([]);
-    expect(reopened.source.calls).toBe(0);
-    expect(reopened.service.list()[0]?.tokenRef).toBe(old.tokenRef);
-    expect(reopened.store.credential(old.tokenRef!)?.token).toBe('old-rongcloud-token');
+
+    expect(registration.appKeyCalls).toEqual(['https://new.example/im']);
+    expect(registration.registerCalls).toHaveLength(1);
+    expect(registration.registerCalls[0]).not.toHaveProperty('existingNodeId');
+    expect(registration.refreshCalls).toEqual([]);
+    expect(reopened.service.list()[0]).toMatchObject({
+      runtimeId: old.runtimeId,
+      enabled: false,
+      nodeId: old.nodeId,
+      tokenRef: old.tokenRef,
+      registrationState: 'offline',
+      lastErrorCode: 'registration_rejected',
+    });
+    expect(reopened.store.credential(old.tokenRef!)).toMatchObject({
+      serverUrl: 'https://old.example/im',
+      appKey: 'old-app-key',
+      token: 'old-rongcloud-token',
+      nodeId: 'codex_old_node',
+    });
   });
 
   it('retains the old token reference and credential after failed reregister', async () => {

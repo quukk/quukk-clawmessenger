@@ -4,6 +4,7 @@ import { isAbsolute } from 'node:path';
 import {
   PROVIDERS,
   RUNTIME_ID_PATTERN,
+  type ConfigOverrides,
   type Provider,
   type RuntimeBinding,
   type TrustedRuntime,
@@ -26,10 +27,16 @@ export type TrustedRuntimeSource = {
 
 type RegistrationPort = Pick<RegistrationClient, 'getAppKey' | 'register' | 'refreshToken'>;
 
+export type BindingConfigSnapshotContext = {
+  overrides?: ConfigOverrides;
+  environment?: NodeJS.ProcessEnv;
+};
+
 export type BindingServiceDependencies = {
   store: LocalStore;
   registrationClient: RegistrationPort;
   runtimeSource: TrustedRuntimeSource;
+  configSnapshot?: BindingConfigSnapshotContext;
   now?: () => Date;
   hostname?: () => string;
 };
@@ -81,6 +88,8 @@ export class BindingService {
   readonly #store: LocalStore;
   readonly #registrationClient: RegistrationPort;
   readonly #runtimeSource: TrustedRuntimeSource;
+  readonly #configOverrides: ConfigOverrides;
+  readonly #environment: NodeJS.ProcessEnv;
   readonly #now: () => Date;
   readonly #hostname: () => string;
   readonly #bindings = new Map<string, RuntimeBinding>();
@@ -92,14 +101,30 @@ export class BindingService {
     this.#store = dependencies.store;
     this.#registrationClient = dependencies.registrationClient;
     this.#runtimeSource = dependencies.runtimeSource;
+    const overrides = dependencies.configSnapshot?.overrides ?? {};
+    const authorizedWorkRoots = overrides.authorizedWorkRoots?.slice();
+    const providerPathOverrides =
+      overrides.providerPathOverrides === undefined
+        ? undefined
+        : { ...overrides.providerPathOverrides };
+    if (authorizedWorkRoots !== undefined) Object.freeze(authorizedWorkRoots);
+    if (providerPathOverrides !== undefined) Object.freeze(providerPathOverrides);
+    this.#configOverrides = Object.freeze({
+      ...overrides,
+      ...(authorizedWorkRoots === undefined ? {} : { authorizedWorkRoots }),
+      ...(providerPathOverrides === undefined ? {} : { providerPathOverrides }),
+    });
+    this.#environment = Object.freeze({ ...(dependencies.configSnapshot?.environment ?? {}) });
     this.#now = dependencies.now ?? (() => new Date());
     this.#hostname = dependencies.hostname ?? osHostname;
     for (const binding of initialBindings) this.#bindings.set(binding.runtimeId, cloneBinding(binding));
   }
 
   static async open(dependencies: BindingServiceDependencies): Promise<BindingService> {
-    const snapshot = await dependencies.store.snapshot();
-    return new BindingService(dependencies, snapshot.bindings);
+    const service = new BindingService(dependencies);
+    const snapshot = await service.#configSnapshot();
+    for (const binding of snapshot.bindings) service.#replace(binding);
+    return service;
   }
 
   list(): readonly RuntimeBinding[] {
@@ -108,6 +133,10 @@ export class BindingService {
 
   #replace(binding: RuntimeBinding): void {
     this.#bindings.set(binding.runtimeId, cloneBinding(binding));
+  }
+
+  #configSnapshot(): ReturnType<LocalStore['snapshot']> {
+    return this.#store.snapshot(this.#configOverrides, this.#environment);
   }
 
   #nodeName(provider: Provider): string {
@@ -179,7 +208,7 @@ export class BindingService {
       return distinct.map((runtimeId) => failure(runtimeId, code));
     }
 
-    const preparation = Promise.all([this.#runtimeSource.runtimes(), this.#store.snapshot()])
+    const preparation = Promise.all([this.#runtimeSource.runtimes(), this.#configSnapshot()])
       .then(([catalog, { config }]) => {
         const byId = new Map(catalog.map((runtime) => [runtime.id, runtime]));
         const plans = new Map<string, EnablePlan>();
@@ -263,6 +292,7 @@ export class BindingService {
         credential?.serverUrl === serverUrl,
         serverUrl,
         appKey,
+        true,
       );
     } finally {
       if (this.#providerClaims.get(runtime.provider) === runtime.id) {
@@ -277,6 +307,7 @@ export class BindingService {
     sameServerIdentity: boolean,
     serverUrl: string,
     appKey: () => Promise<string>,
+    enabledOnSuccess: boolean,
   ): Promise<EnableResult> {
     const pending: RuntimeBinding = {
       runtimeId: runtime.id,
@@ -309,7 +340,7 @@ export class BindingService {
       const committed = await this.#store.commitRegistration(
         {
           ...pending,
-          enabled: true,
+          enabled: enabledOnSuccess,
           nodeId: registered.nodeId,
           nodeName: pending.nodeName,
           registrationState: 'offline',
@@ -385,11 +416,8 @@ export class BindingService {
       let catalog: readonly TrustedRuntime[];
       let config: Awaited<ReturnType<LocalStore['snapshot']>>['config'];
       try {
-        ({ config } = await this.#store.snapshot());
+        ({ config } = await this.#configSnapshot());
       } catch {
-        return failure(runtimeId, 'runtime_identity_changed');
-      }
-      if (credential.serverUrl !== config.serverUrl) {
         return failure(runtimeId, 'runtime_identity_changed');
       }
       try {
@@ -403,6 +431,16 @@ export class BindingService {
       if (runtimeError !== undefined) return failure(runtimeId, runtimeError);
       if (runtime.provider !== previous.provider || runtime.path !== previous.runtimePath) {
         return failure(runtimeId, 'runtime_identity_changed');
+      }
+      if (credential.serverUrl !== config.serverUrl) {
+        return this.#register(
+          runtime,
+          previous,
+          false,
+          config.serverUrl,
+          () => this.#registrationClient.getAppKey(config.serverUrl),
+          previous.enabled,
+        );
       }
       const pending: RuntimeBinding = {
         ...previous,
