@@ -85,7 +85,6 @@ async function startServer(staticRoot: string, dependencies?: ConstructorParamet
     api, control,
     tickets: new LaunchTicketStore({ instanceId: INSTANCE_ID }),
     sessions: new BrowserSessionStore(),
-    readyIdentity: () => currentIdentity,
     controlCredential: CREDENTIAL,
     logger: { debug() {}, info() {}, warn() {}, error() {} },
   });

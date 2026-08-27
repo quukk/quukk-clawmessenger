@@ -224,7 +224,6 @@ export interface LocalRoutesOptions {
   control: LocalControlPort;
   tickets: LaunchTicketStore;
   sessions: BrowserSessionStore;
-  readyIdentity: () => ReadyDaemonIdentity;
   controlCredential: string;
   logger: HttpLogger;
   now?: () => number;

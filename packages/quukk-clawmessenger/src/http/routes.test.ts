@@ -141,7 +141,7 @@ async function harness(overrides: {
   const sessions = overrides.sessions ?? new BrowserSessionStore();
   let origin = '';
   const routes = new LocalRoutes({
-    api, control, tickets, sessions, readyIdentity: () => identity,
+    api, control, tickets, sessions,
     controlCredential: CONTROL_CREDENTIAL,
     logger: { debug() {}, info() {}, warn() {}, error() {} },
     setTimeout: overrides.setTimeout,
