@@ -2224,6 +2224,35 @@ describe('createProductionCliRuntime', () => {
     expect(store.quarantineStaleIfExact).not.toHaveBeenCalled();
   });
 
+  it('fails closed when a fresh shutdown-poll credential read fails after acceptance', async () => {
+    const store = identityStore();
+    store.read.mockResolvedValue({});
+    const readJson = vi.fn()
+      .mockResolvedValueOnce({
+        schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {},
+      })
+      .mockResolvedValueOnce({
+        schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {},
+      })
+      .mockRejectedValueOnce(new Error('SECRET-ROTATED-CREDENTIAL-MISSING'));
+    const transport = requestSequence([
+      controlFrame({ schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' }),
+      controlFrame({ schemaVersion: 1, accepted: true }, 202),
+    ]);
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readJson,
+      request: transport.request,
+    }) as never);
+
+    const error = await runtime.control(READY_IDENTITY, 'shutdown')
+      .catch((value: unknown) => value);
+
+    expect(error).toMatchObject({ code: 'process_unverified', message: 'process_unverified' });
+    expect(JSON.stringify(error)).not.toContain('SECRET-ROTATED-CREDENTIAL-MISSING');
+    expect(transport.bodies).toEqual(['{"command":"status"}', '{"command":"shutdown"}']);
+    expect(readJson).toHaveBeenCalledTimes(3);
+  });
+
   it('uses one total shutdown deadline and performs no status poll after it expires', async () => {
     const store = identityStore({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
     const transport = requestSequence([
@@ -2411,7 +2440,7 @@ describe('createProductionCliRuntime', () => {
     expect(lines).toEqual(['old-two', 'partial-new', 'rotated', 'truncated']);
     expect(readLogSnapshot).toHaveBeenCalledTimes(5);
     for (const call of readLogSnapshot.mock.calls) {
-      expect(call).toEqual([localPaths(HOME).bridgeLog, 8 << 20]);
+      expect(call).toEqual([localPaths(HOME).bridgeLog, 5 << 20]);
     }
     expect(signals.listenerCount('SIGINT')).toBe(0);
     expect(signals.listenerCount('SIGTERM')).toBe(0);
@@ -2426,7 +2455,36 @@ describe('createProductionCliRuntime', () => {
     for await (const line of runtime.readLogs({ lines: 100, follow: false })) lines.push(line);
 
     expect(lines).toEqual([]);
-    expect(readLogSnapshot).toHaveBeenCalledWith(localPaths(HOME).bridgeLog, 8 << 20);
+    expect(readLogSnapshot).toHaveBeenCalledWith(localPaths(HOME).bridgeLog, 5 << 20);
+  });
+
+  it('accepts an exact 5 MiB log snapshot and rejects one extra byte', async () => {
+    const store = identityStore();
+    const exactRuntime = createProductionCliRuntime(productionOptions(store, {
+      readLogSnapshot: vi.fn(async () => ({
+        fileId: 'exact-limit', bytes: Buffer.alloc(5 << 20),
+      })),
+    }) as never);
+    const oversizedRuntime = createProductionCliRuntime(productionOptions(store, {
+      readLogSnapshot: vi.fn(async () => ({
+        fileId: 'over-limit', bytes: Buffer.alloc((5 << 20) + 1),
+      })),
+    }) as never);
+
+    const exactLines: string[] = [];
+    for await (const line of exactRuntime.readLogs({ lines: 1, follow: false })) {
+      exactLines.push(line);
+    }
+    const oversized = (async () => {
+      for await (const _line of oversizedRuntime.readLogs({ lines: 1, follow: false })) {
+        // No complete line is expected.
+      }
+    })();
+
+    expect(exactLines).toEqual([]);
+    await expect(oversized).rejects.toMatchObject({
+      code: 'operation_unavailable', message: 'operation_unavailable',
+    });
   });
 
   it('doctor reads only bounded strict metadata, identity, credentials, and authenticated status', async () => {
@@ -2481,6 +2539,47 @@ describe('createProductionCliRuntime', () => {
     expect(serialized).not.toMatch(/tokenRef|nodeId|path/i);
   });
 
+  it.each(['credential', 'malformed_response'] as const)(
+    'returns safe offline doctor diagnostics when ready control is unverified by %s',
+    async (failure) => {
+      const store = identityStore({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
+      const paths = localPaths(HOME);
+      const readJson = vi.fn(async (filePath: string) => {
+        if (filePath === paths.config) return DEFAULT_CONFIG;
+        if (filePath === paths.state) {
+          return {
+            schemaVersion: 1 as const,
+            installId: '00000000-0000-4000-8000-000000000001',
+            bindings: [],
+          };
+        }
+        if (failure === 'credential') throw new Error('SECRET-DOCTOR-CREDENTIAL-FAILURE');
+        return { schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {} };
+      });
+      const transport = requestSequence([
+        failure === 'malformed_response'
+          ? controlFrame({ schemaVersion: 1, state: 'ready', secret: 'SECRET-DOCTOR-BODY' })
+          : controlFrame({ schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' }),
+      ]);
+      const runtime = createProductionCliRuntime(productionOptions(store, {
+        readJson,
+        request: transport.request,
+        readLogSnapshot: vi.fn(async () => {
+          throw new Error('doctor_must_not_read_log');
+        }),
+      }) as never);
+
+      const diagnostics = await runtime.doctor();
+
+      expect(diagnostics).toEqual({
+        schemaVersion: 1,
+        state: 'offline',
+        warnings: ['control_unverified'],
+      });
+      expect(JSON.stringify(diagnostics)).not.toMatch(/SECRET|path|tokenRef|nodeId/i);
+    },
+  );
+
   it('uses a pure packaged-path guard before any self-execution I/O', () => {
     const packageRoot = resolve('selfexec', 'node_modules', 'quukk-clawmessenger');
     const moduleUrl = pathToFileURL(resolve(packageRoot, 'dist', 'cli.js')).href;
@@ -2500,6 +2599,11 @@ describe('createProductionCliRuntime', () => {
       resolve(packageRoot, '..', '.bin', 'quukk-clawmessenger'),
       'doctor',
     ], moduleUrl)).toEqual(expect.objectContaining({ argv: ['doctor'] }));
+    expect(packagedCliCandidate([
+      EXECUTABLE,
+      resolve('selfexec', 'global-bin', 'quukk-clawmessenger'),
+      'status',
+    ], moduleUrl)).toEqual(expect.objectContaining({ argv: ['status'] }));
     expect(packagedCliCandidate([
       EXECUTABLE, resolve(packageRoot, 'bin', 'quukk-clawmessenger.js'),
     ], pathToFileURL(resolve(packageRoot, 'src', 'cli.ts')).href)).toBeUndefined();

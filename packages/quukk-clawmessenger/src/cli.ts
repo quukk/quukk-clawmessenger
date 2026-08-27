@@ -1103,7 +1103,7 @@ const CONTROL_RESPONSE_LIMIT = 1 << 20;
 const CREDENTIAL_FILE_LIMIT = 4 << 20;
 const METADATA_FILE_LIMIT = 1 << 20;
 const CHILD_INPUT_LIMIT = 64 << 10;
-const LOG_SNAPSHOT_LIMIT = 8 << 20;
+const LOG_SNAPSHOT_LIMIT = 5 << 20;
 const START_WAIT_MS = 65_000;
 const SHUTDOWN_WAIT_MS = 20_000;
 const POLL_MS = 100;
@@ -1252,10 +1252,10 @@ async function defaultReadLogSnapshot(
   }
   try {
     const opened = await handle.stat();
+    if (!opened.isFile()) throw productionFailure('operation_unavailable');
+    if (!sameLogFile(before, opened)) return undefined;
     if (
-      !opened.isFile()
-      || !sameLogFile(before, opened)
-      || !Number.isSafeInteger(opened.size)
+      !Number.isSafeInteger(opened.size)
       || opened.size < 0
       || opened.size > maximumBytes
     ) throw productionFailure('operation_unavailable');
@@ -1728,7 +1728,14 @@ export function createProductionCliRuntime(
           Math.min(1_000, remaining),
           deadline,
         );
-      } catch {
+      } catch (error) {
+        if (!explicitlyUnreachable(error)) {
+          if (
+            errorCodeOf(error) === 'operation_timeout'
+            || errorCodeOf(error) === 'shutdown_timeout'
+          ) throw productionFailure('shutdown_timeout');
+          throw productionFailure('process_unverified');
+        }
         oldAuthenticationFailed = true;
       }
       remainingDeadline(deadline);
@@ -2175,7 +2182,18 @@ export function createProductionCliRuntime(
           ...withWarnings,
         };
       }
-      const status = await control(value.identity, 'status');
+      let status: ControlResponse & { command: 'status' };
+      try {
+        const response = await control(value.identity, 'status');
+        if (response.command !== 'status') throw productionFailure('process_unverified');
+        status = response;
+      } catch {
+        return {
+          schemaVersion: 1,
+          state: 'offline',
+          warnings: [...warnings, 'control_unverified'],
+        };
+      }
       return {
         schemaVersion: 1,
         state: 'ready',
@@ -2234,7 +2252,11 @@ export function packagedCliCandidate(
   const packagedBinPath = resolve(packageRoot, 'bin', 'quukk-clawmessenger.js');
   const invokedBinPath = resolve(processArgv[1]!);
   const localShimPath = resolve(dirname(packageRoot), '.bin', 'quukk-clawmessenger');
-  if (invokedBinPath !== packagedBinPath && invokedBinPath !== localShimPath) {
+  if (
+    invokedBinPath !== packagedBinPath
+    && invokedBinPath !== localShimPath
+    && basename(invokedBinPath) !== 'quukk-clawmessenger'
+  ) {
     return undefined;
   }
   return {
