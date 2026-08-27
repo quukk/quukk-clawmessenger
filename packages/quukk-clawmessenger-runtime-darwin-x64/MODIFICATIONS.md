@@ -13,7 +13,8 @@
 - `apps/bridge`: private React/Vite workspace that builds local Bridge UI assets into the entry package.
 - `server/internal/daemon/bridge*.go`: injected, bounded discovery for local OpenCode, OpenClaw, Codex, and Hermes runtimes, kept separate from the existing daemon lifecycle.
 - Synchronous agent probe output shares a 64 KiB cap so noisy version and catalog commands safely fail instead of growing daemon memory without bound; Task 14/CI must watch for real catalog output above that limit.
-- Later fork commits implement the runtime workers, registration transport, session routing, and the local Bridge UI described below.
+- The fork now includes the runtime workers, registration transport, session routing, local
+  service/CLI, and Bridge UI described below.
 
 ## Local runtime selection UI
 
@@ -39,12 +40,38 @@
 - `packages/quukk-clawmessenger/src/config`, `src/registration`, and `src/bindings` add strict versioned config/state/credential storage, protected per-install identity, fail-closed work-directory authorization, bounded atomic JSON recovery, four-provider registration, per-runtime enrollment proof, credentials-first token swaps, and provider-isolated lifecycle coordination.
 - The enrollment proof is derived locally from the decoded 32-byte Bridge secret, full normalized server base URL, and runtime ID. Only the domain-separated HMAC result crosses HTTPS; raw Bridge and RongCloud credentials remain outside request bodies, URLs, errors, logs, state, and ordinary config.
 
+## Legacy migration and package audit
+
+- `packages/quukk-clawmessenger/src/migration` discovers only the fixed OpenCode
+  ClawMessenger configuration locations under an explicitly supplied home directory. It reads
+  only the bounded main settings file, projects validated non-secret server/work-directory/path
+  settings, reports registration caches without opening them, and requires explicit confirmation
+  before writing through `LocalStore`.
+- Migration never moves or deletes a legacy file and never imports tokens, AppKey/AppSecret,
+  passwords, node/MAC identity, bindings, sessions, or logs. Validation and atomic-write failures
+  leave the legacy bytes and destination config unchanged.
+- `packages/quukk-clawmessenger/scripts/prepare-package.mjs` copies the exact four root legal
+  files into the entry package and the exact root `LICENSE`, `NOTICE`, and `MODIFICATIONS.md`
+  into either zero or the complete six binary-only platform staging packages while rejecting
+  partial matrices, traversal, and symbolic-link/junction components. Platform source
+  attribution remains the build-generated `SOURCE.md` from the reproducible runtime task.
+- `packages/quukk-clawmessenger/scripts/audit-tarball.mjs` consumes bounded `npm pack --json`
+  reports and strictly checks legal files, README, npm/platform manifests, bin, compiled worker,
+  Bridge UI assets, source-map absence, path containment, symlinks, credential-like literals, and
+  developer-specific paths. Failure output is a fixed code and does not echo matched content.
+- The entry TypeScript build excludes tests and disables source/declaration maps so rejected
+  development artifacts cannot enter the npm tarball.
+
 ## Modified upstream files
 
 - `.gitignore`: excludes a repository-local Quukk ClawMessenger runtime-data directory.
 - `docs/superpowers/specs/2026-08-26-quukk-clawmessenger-fork-design.md`: records the initial workspace scaffold and its intentionally limited scope.
 - `pnpm-workspace.yaml`: adds the catalog-pinned Vite version required by the Bridge UI workspace.
 - `pnpm-lock.yaml`: records the fork workspaces and the focused Bridge UI dependencies used by the local package build.
+- `README.md`: adds the Quukk ClawMessenger derivative entry point while retaining Multica as the
+  primary product and attribution.
+- `MODIFICATIONS.md` and `THIRD_PARTY_NOTICES.md`: record migration/package hardening and retain
+  the unresolved RongCloud licensing metadata discrepancy as a publication gate.
 - `server/pkg/agent/launch.go`: bounds synchronous probe output while preserving process ownership and timeout errors.
 - `server/pkg/agent/agent_test.go`: covers oversized version output and timeout precedence without executing an installed agent CLI.
 
