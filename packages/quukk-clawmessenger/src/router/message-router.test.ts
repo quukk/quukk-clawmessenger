@@ -1110,6 +1110,145 @@ describe('MessageRouter plain task admission', () => {
     },
   );
 
+  it('reactivates a disposed binding for new worker events', async () => {
+    const fixture = await routerHarness();
+    await fixture.router.disposeBinding(IDENTITY_A);
+    await fixture.router.onWorkerEvent(
+      IDENTITY_A,
+      inbound(IDENTITY_A, message('disabled-before-activation')),
+    );
+    await fixture.router.activateBinding(IDENTITY_A);
+    await fixture.router.onWorkerEvent(
+      IDENTITY_A,
+      inbound(IDENTITY_A, message('enabled-after-activation')),
+    );
+
+    expect(fixture.starts).toHaveLength(1);
+    expect(fixture.receipts).toHaveLength(1);
+    expect(fixture.receipts[0]?.input.messageUid).toBe('enabled-after-activation');
+  });
+
+  it('waits for a pending binding disposal before activation completes', async () => {
+    const fixture = await routerHarness();
+    const originalSend = fixture.worker.send.bind(fixture.worker);
+    let sendEntered!: () => void;
+    let releaseSend!: () => void;
+    const sendWasEntered = new Promise<void>((resolve) => { sendEntered = resolve; });
+    const sendGate = new Promise<void>((resolve) => { releaseSend = resolve; });
+    fixture.worker.send = async (identity, input) => {
+      sendEntered();
+      await sendGate;
+      return originalSend(identity, input);
+    };
+
+    const routing = fixture.router.onWorkerEvent(
+      IDENTITY_A,
+      inbound(IDENTITY_A, message('', 'invalid')),
+    );
+    await sendWasEntered;
+    const disposal = fixture.router.disposeBinding(IDENTITY_A);
+    let activationSettled = false;
+    const activation = fixture.router.activateBinding(IDENTITY_A).then(() => {
+      activationSettled = true;
+    });
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    const settledBeforeDisposal = activationSettled;
+    releaseSend();
+    await Promise.all([routing, disposal, activation]);
+    await fixture.router.onWorkerEvent(
+      IDENTITY_A,
+      inbound(IDENTITY_A, message('enabled-after-pending-disposal')),
+    );
+
+    expect(settledBeforeDisposal).toBe(false);
+    expect(fixture.starts).toHaveLength(1);
+    expect(fixture.receipts.at(-1)?.input.messageUid).toBe('enabled-after-pending-disposal');
+  });
+
+  it('rejects binding activation after global disposal', async () => {
+    const fixture = await routerHarness();
+    await fixture.router.dispose();
+
+    await expect(fixture.router.activateBinding(IDENTITY_A)).rejects.toThrow('router_disposed');
+  });
+
+  it('keeps repeated activation idempotent while a new task is starting', async () => {
+    const fixture = await routerHarness();
+    await fixture.router.disposeBinding(IDENTITY_A);
+    await fixture.router.activateBinding(IDENTITY_A);
+    let startEntered!: () => void;
+    let resolveStart!: (value: { taskId: string; eventsUrl: string }) => void;
+    const startWasEntered = new Promise<void>((resolve) => { startEntered = resolve; });
+    fixture.setStart(async (input) => {
+      fixture.starts.push(input);
+      startEntered();
+      return new Promise((resolve) => { resolveStart = resolve; });
+    });
+
+    const routing = fixture.router.onWorkerEvent(
+      IDENTITY_A,
+      inbound(IDENTITY_A, message('repeated-activation')),
+    );
+    await startWasEntered;
+    await Promise.all([
+      fixture.router.activateBinding(IDENTITY_A),
+      fixture.router.activateBinding(IDENTITY_A),
+    ]);
+    resolveStart({ taskId: 'task-after-repeated-activation', eventsUrl: '/events' });
+    await routing;
+
+    expect(fixture.cancellations).toEqual([]);
+    expect(fixture.receipts).toHaveLength(1);
+  });
+
+  it('publishes the binding disposal promise before a cancellation callback can reactivate', async () => {
+    const fixture = await routerHarness();
+    let resolveNext!: (value: IteratorResult<BridgeTaskEvent>) => void;
+    let nextEntered!: () => void;
+    const nextWasEntered = new Promise<void>((resolve) => { nextEntered = resolve; });
+    fixture.setEvents(() => ({
+      [Symbol.asyncIterator]() {
+        return {
+          next: () => {
+            nextEntered();
+            return new Promise<IteratorResult<BridgeTaskEvent>>((resolve) => { resolveNext = resolve; });
+          },
+          return: async () => {
+            resolveNext({ done: true, value: undefined });
+            return { done: true as const, value: undefined };
+          },
+        };
+      },
+    }));
+    let releaseCancel!: () => void;
+    let activation: Promise<void> | undefined;
+    let activationSettled = false;
+    const cancelGate = new Promise<void>((resolve) => { releaseCancel = resolve; });
+    fixture.task.cancelTask = async (taskId) => {
+      fixture.cancellations.push(taskId);
+      activation = fixture.router.activateBinding(IDENTITY_A).then(() => {
+        activationSettled = true;
+      });
+      await cancelGate;
+    };
+
+    const routing = fixture.router.onWorkerEvent(
+      IDENTITY_A,
+      inbound(IDENTITY_A, message('reentrant-activation')),
+    );
+    await nextWasEntered;
+    const disposal = fixture.router.disposeBinding(IDENTITY_A);
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    const activationWasScheduled = activation !== undefined;
+    const settledBeforeDisposal = activationSettled;
+    releaseCancel();
+    await Promise.all([routing, disposal, activation!]);
+
+    expect(activationWasScheduled).toBe(true);
+    expect(settledBeforeDisposal).toBe(false);
+    expect(fixture.cancellations).toEqual(['task_1_1']);
+  });
+
   it('shares one global disposal promise while task cancellation is still pending', async () => {
     const fixture = await routerHarness();
     let nextEntered!: () => void;

@@ -632,9 +632,28 @@ export class MessageRouter {
     const key = bindingKey(identity);
     const existing = this.#bindingDisposals.get(key);
     if (existing) return existing;
-    const disposal = this.#disposeBindingOnce(identity);
+    let resolveDisposal!: () => void;
+    let rejectDisposal!: (error: unknown) => void;
+    const disposal = new Promise<void>((resolve, reject) => {
+      resolveDisposal = resolve;
+      rejectDisposal = reject;
+    });
     this.#bindingDisposals.set(key, disposal);
+    void this.#disposeBindingOnce(identity).then(resolveDisposal, rejectDisposal);
     return disposal;
+  }
+
+  async activateBinding(identity: WorkerIdentity): Promise<void> {
+    if (this.#disposed) throw new Error('router_disposed');
+    const key = bindingKey(identity);
+    const disposal = this.#bindingDisposals.get(key);
+    if (disposal !== undefined) await disposal;
+    if (this.#disposed) throw new Error('router_disposed');
+    if (!this.#disposedBindings.has(key)) return;
+    if (disposal !== undefined && this.#bindingDisposals.get(key) !== disposal) return;
+    this.#bindingDisposals.delete(key);
+    this.#disposedBindings.delete(key);
+    this.#bindingGenerations.set(key, (this.#bindingGenerations.get(key) ?? 0) + 1);
   }
 
   async #disposeBindingOnce(identity: WorkerIdentity): Promise<void> {
