@@ -35,6 +35,29 @@ back for review. Self-hostable, works with 23 agent CLIs, no lock-in.
 
 ---
 
+## Quukk ClawMessenger community derivative
+
+This fork also contains **Quukk ClawMessenger**, a local bridge that detects OpenCode, OpenClaw,
+Codex, and Hermes, lets the user choose which runtimes to connect, and gives every selected
+runtime an isolated RongCloud identity and worker.
+
+```bash
+npm install -g quukk-clawmessenger
+quukk-clawmessenger setup
+```
+
+Use `quukk-clawmessenger setup --no-open` on a terminal-only host. Installation never signs in to
+an agent CLI or registers a runtime before explicit local confirmation. See the
+[Quukk ClawMessenger guide](packages/quukk-clawmessenger/README.md) for provider prerequisites,
+all seven commands, the deny-by-default local work-directory policy, migration, diagnostics,
+uninstall, platform support, and server deployment gates.
+
+Quukk ClawMessenger is **built on Multica** and retains the Multica interface branding,
+copyright, and attribution. It is subject to the complete [Multica License](LICENSE); this fork
+does not claim commercial hosted-service rights or a branding waiver.
+
+---
+
 ## What is Multica?
 
 You already run Claude Code, Codex, and three other agents. Each one lives in its own terminal
