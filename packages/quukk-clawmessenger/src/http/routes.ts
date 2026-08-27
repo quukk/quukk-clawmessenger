@@ -11,6 +11,7 @@ import {
   type StoredConfig,
 } from '../config/schema.js';
 import { BridgeEventTypeSchema } from '../go/types.js';
+import type { LocalLogger } from '../logging/logger.js';
 import {
   BrowserSessionStore,
   constantTimeCredentialEqual,
@@ -190,12 +191,7 @@ export const ControlStatusResponseSchema = z.strictObject({
 });
 export type ControlStatusResponse = z.infer<typeof ControlStatusResponseSchema>;
 
-export interface HttpLogger {
-  debug(event: { event: string; [key: string]: unknown }): void;
-  info(event: { event: string; [key: string]: unknown }): void;
-  warn(event: { event: string; [key: string]: unknown }): void;
-  error(event: { event: string; [key: string]: unknown }): void;
-}
+export type HttpLogger = Pick<LocalLogger, 'debug' | 'info' | 'warn' | 'error'>;
 
 export interface LocalApiPort {
   runtimes(signal: AbortSignal): Promise<RuntimesResponse>;
