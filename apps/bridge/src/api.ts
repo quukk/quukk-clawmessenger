@@ -266,7 +266,7 @@ const diagnosticsSchema = z
           .strict(),
       )
       .max(4),
-    warnings: z.array(safeCodeSchema).max(64),
+    warnings: z.array(z.string().min(1).max(256)).max(64),
     logging: z
       .object({
         dropped: z.number().int().nonnegative(),

@@ -169,7 +169,7 @@ describe('local bridge API client', () => {
           bridge: { state: 'ready' },
           runtimes: [],
           workers: [],
-          warnings: [],
+          warnings: ['config recovery required'],
           logging: { dropped: 0, retained: 1 },
         }),
       );
@@ -196,6 +196,7 @@ describe('local bridge API client', () => {
     await expect(api.getDiagnostics()).resolves.toMatchObject({
       schemaVersion: 1,
       service: { state: 'ready', port: 48321 },
+      warnings: ['config recovery required'],
     });
   });
 
