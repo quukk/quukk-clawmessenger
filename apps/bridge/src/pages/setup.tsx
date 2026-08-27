@@ -53,6 +53,7 @@ export function SetupPage({
   const [authorizedRoot, setAuthorizedRoot] = useState(settings.authorizedWorkRoots[0] ?? '');
   const [defaultWorkdir, setDefaultWorkdir] = useState(settings.defaultWorkdir ?? '');
   const [policyAccepted, setPolicyAccepted] = useState(false);
+  const [registrationDisclosureAccepted, setRegistrationDisclosureAccepted] = useState(false);
   const [policyOpen, setPolicyOpen] = useState(false);
   const [savingPolicy, setSavingPolicy] = useState(false);
   const [refreshError, setRefreshError] = useState(false);
@@ -89,7 +90,10 @@ export function SetupPage({
     (entry) => entry.state === 'connected',
   ).length;
   const policyComplete =
-    authorizedRoot.trim().length > 0 && defaultWorkdir.trim().length > 0 && policyAccepted;
+    authorizedRoot.trim().length > 0 &&
+    defaultWorkdir.trim().length > 0 &&
+    policyAccepted &&
+    registrationDisclosureAccepted;
 
   function toggleRuntime(runtimeId: string, selected: boolean) {
     setSelectedIds((current) => {
@@ -275,6 +279,34 @@ export function SetupPage({
             className="mt-0.5"
           />
           <span>I understand the permission policy and authorize the directory above.</span>
+        </label>
+
+        <div className="grid gap-2 rounded-lg border border-warning/40 bg-warning/8 p-3">
+          <h2 className="font-heading text-title-sm font-medium">
+            Cloud registration disclosure
+          </h2>
+          <p className="text-body text-muted-foreground">
+            Registration contacts the configured service at {settings.serverUrl}. It sends a
+            hostname-derived node label, a network-interface MAC address when available (or a
+            stable install-derived fallback), the selected provider and capability flags, and
+            enrollment proof. Each enabled agent then connects to RongCloud, where its chat and
+            task messages use that cloud IM connection.
+          </p>
+          <p className="text-body text-muted-foreground">
+            This beta has no self-service remote identity deletion. Contact the operator of the
+            configured service before enabling agents if you require deletion or privacy terms.
+          </p>
+        </div>
+
+        <label className="flex cursor-pointer items-start gap-3 text-body">
+          <Checkbox
+            aria-label="I understand the cloud registration disclosure"
+            checked={registrationDisclosureAccepted}
+            disabled={registering || savingPolicy}
+            onCheckedChange={(checked) => setRegistrationDisclosureAccepted(checked === true)}
+            className="mt-0.5"
+          />
+          <span>I understand the cloud registration disclosure and consent to registration.</span>
         </label>
 
         {failedRuntimes.length > 0 ? (

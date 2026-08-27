@@ -101,6 +101,9 @@ async function completePolicyForm(user: ReturnType<typeof userEvent.setup>) {
   await user.click(
     screen.getByRole('checkbox', { name: /i understand the permission policy/i }),
   );
+  await user.click(
+    screen.getByRole('checkbox', { name: /i understand the cloud registration disclosure/i }),
+  );
 }
 
 afterEach(() => {
@@ -163,6 +166,31 @@ describe('runtime setup', () => {
       }),
     );
     expect(api.enableBindings).toHaveBeenCalledTimes(2);
+  });
+
+  it('requires consent to the outbound registration disclosure', async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    await renderReady(api);
+
+    expect(screen.getByRole('heading', { name: /cloud registration disclosure/i })).toBeVisible();
+    expect(screen.getByText(/hostname-derived node label/i)).toBeVisible();
+    expect(screen.getByText(/network-interface MAC address/i)).toBeVisible();
+    expect(screen.getByText(/newsradar\.dreamdt\.cn\/im/i)).toBeVisible();
+    expect(screen.getByText(/no self-service remote identity deletion/i)).toBeVisible();
+
+    await user.type(screen.getByLabelText(/authorized work root/i), 'C:\\work');
+    await user.type(screen.getByLabelText(/default work directory/i), 'C:\\work\\project');
+    await user.click(
+      screen.getByRole('checkbox', { name: /i understand the permission policy/i }),
+    );
+    expect(screen.getByRole('button', { name: /register 2 agents/i })).toBeDisabled();
+    expect(api.enableBindings).not.toHaveBeenCalled();
+
+    await user.click(
+      screen.getByRole('checkbox', { name: /i understand the cloud registration disclosure/i }),
+    );
+    expect(screen.getByRole('button', { name: /register 2 agents/i })).toBeEnabled();
   });
 
   it('keeps independent progress and successful rows when another registration fails', async () => {
@@ -272,6 +300,9 @@ describe('runtime setup', () => {
     await user.type(root, 'D:\\keep');
     await user.click(
       screen.getByRole('checkbox', { name: /i understand the permission policy/i }),
+    );
+    await user.click(
+      screen.getByRole('checkbox', { name: /i understand the cloud registration disclosure/i }),
     );
     await user.click(screen.getByRole('button', { name: /register 2 agents/i }));
 

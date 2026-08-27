@@ -48,6 +48,21 @@ quukk-clawmessenger setup
 The local service listens only on `127.0.0.1`. Registration starts only after the user reviews
 the detected runtimes and explicitly submits a selection.
 
+## Cloud registration and data disclosure
+
+Before a selected runtime can be registered, setup shows the configured service URL and requires
+a separate confirmation. Registration sends that service a hostname-derived node label, a
+network-interface MAC address when available (or a stable install-derived fallback), the selected
+provider and capability flags, and a runtime-scoped enrollment proof. Each enabled runtime then
+uses its own RongCloud connection; its ClawMessenger chat and task messages traverse that cloud IM
+service.
+
+This beta has no self-service remote identity deletion. Removing a local binding or uninstalling
+the npm package does not delete its server or RongCloud identity. Before enabling a hosted service,
+obtain its operator contact, privacy terms, retention policy, and deletion process. Publication of
+the default hosted service remains blocked until those items and the data-processing review are
+complete.
+
 ## Agent login prerequisites
 
 Quukk ClawMessenger does not install, upgrade, or sign in to any agent CLI. Complete the
