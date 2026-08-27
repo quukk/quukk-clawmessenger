@@ -36,6 +36,15 @@ session. It does not register an agent, wait for input, or download an executabl
 installs, non-desktop sessions, and `QUUKK_CLAWMESSENGER_NO_OPEN=1` receive only a setup hint.
 Run `setup` explicitly whenever lifecycle scripts are disabled.
 
+Before upgrading a beta installation, stop the authenticated old daemon so the package manager
+does not reuse or try to replace a running Bridge binary:
+
+```bash
+quukk-clawmessenger stop
+npm install -g quukk-clawmessenger@beta
+quukk-clawmessenger setup
+```
+
 The local service listens only on `127.0.0.1`. Registration starts only after the user reviews
 the detected runtimes and explicitly submits a selection.
 
