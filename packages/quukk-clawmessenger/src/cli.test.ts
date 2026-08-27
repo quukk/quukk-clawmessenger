@@ -1791,6 +1791,7 @@ describe('createProductionCliRuntime', () => {
       .mockResolvedValueOnce({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
     const child = daemonChild();
     const spawn = vi.fn(() => child);
+    const kill = vi.fn();
     const transport = requestSequence([
       controlFrame({ schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' }),
     ]);
@@ -1806,6 +1807,7 @@ describe('createProductionCliRuntime', () => {
     const runtime = createProductionCliRuntime({
       ...productionOptions(store, {
         spawn,
+        kill,
         sleep: vi.fn(async () => undefined),
         readJson: vi.fn(async () => ({
           schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {},
@@ -1840,6 +1842,8 @@ describe('createProductionCliRuntime', () => {
     expect(child.stdin.end).toHaveBeenCalledOnce();
     expect(child.stdin.end).toHaveBeenCalledWith(`${JSON.stringify(input)}\n`, 'utf8');
     expect(child.unref).toHaveBeenCalledOnce();
+    expect(kill).toHaveBeenCalledOnce();
+    expect(kill).toHaveBeenCalledWith(STARTING_IDENTITY.pid, 0);
     expect(store.claim).not.toHaveBeenCalled();
     expect(transport.bodies).toEqual(['{"command":"status"}']);
     const spawnSerialization = JSON.stringify(spawn.mock.calls);
@@ -1931,6 +1935,76 @@ describe('createProductionCliRuntime', () => {
     expect(child.unref).toHaveBeenCalledOnce();
   });
 
+  it('quarantines an exact dead starting identity before spawning its replacement', async () => {
+    const digest = '1'.repeat(64);
+    const store = identityStore();
+    store.read
+      .mockResolvedValueOnce({ identity: STARTING_IDENTITY, contentDigest: digest })
+      .mockResolvedValueOnce({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
+    const child = daemonChild();
+    const spawn = vi.fn(() => child);
+    const kill = vi.fn(() => {
+      throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+    });
+    const transport = requestSequence([
+      controlFrame({ schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' }),
+    ]);
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      spawn,
+      kill,
+      sleep: vi.fn(async () => undefined),
+      readJson: vi.fn(async () => ({
+        schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {},
+      })),
+      request: transport.request,
+    }) as never);
+
+    await expect(runtime.start({
+      foreground: false, noOpen: true, configOverrides: {},
+    })).resolves.toEqual({ identity: READY_IDENTITY, alreadyRunning: false });
+
+    expect(kill).toHaveBeenCalledOnce();
+    expect(kill).toHaveBeenCalledWith(STARTING_IDENTITY.pid, 0);
+    expect(store.quarantineStaleIfExact).toHaveBeenCalledOnce();
+    expect(store.quarantineStaleIfExact).toHaveBeenCalledWith({
+      expected: STARTING_IDENTITY,
+      contentDigest: digest,
+    });
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(child.unref).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['a live PID', undefined],
+    ['an EPERM PID probe', 'EPERM'],
+  ])('never quarantines a starting identity for %s', async (_label, killCode) => {
+    const store = identityStore({
+      identity: STARTING_IDENTITY,
+      contentDigest: '1'.repeat(64),
+    });
+    const kill = vi.fn(() => {
+      if (killCode !== undefined) throw Object.assign(new Error(killCode), { code: killCode });
+      return true;
+    });
+    const spawn = vi.fn(() => daemonChild());
+    let clock = 0;
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      kill,
+      spawn,
+      monotonicNow: () => clock,
+      sleep: vi.fn(async () => { clock = START_WAIT_MS_FOR_TEST; }),
+    }) as never);
+
+    await expect(runtime.start({
+      foreground: false, noOpen: true, configOverrides: {},
+    })).rejects.toMatchObject({ code: 'operation_timeout' });
+
+    expect(kill).toHaveBeenCalledOnce();
+    expect(kill).toHaveBeenCalledWith(STARTING_IDENTITY.pid, 0);
+    expect(store.quarantineStaleIfExact).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it('requires three one-second unreachable probes and ESRCH before exact stale quarantine', async () => {
     const store = identityStore({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
     const bodies: string[] = [];
@@ -1962,6 +2036,32 @@ describe('createProductionCliRuntime', () => {
     expect(store.quarantineStaleIfExact).toHaveBeenCalledOnce();
     expect(store.quarantineStaleIfExact).toHaveBeenCalledWith({
       expected: READY_IDENTITY, contentDigest: '2'.repeat(64),
+    });
+  });
+
+  it('recovers a dead exact starting identity without a control request', async () => {
+    const store = identityStore();
+    const request = vi.fn();
+    const kill = vi.fn(() => {
+      throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+    });
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      request,
+      kill,
+    }) as never);
+
+    await expect(runtime.recoverStaleForStart({
+      identity: STARTING_IDENTITY,
+      contentDigest: '1'.repeat(64),
+      pidProbe: 'esrch',
+      controlAttempts: 0,
+    })).resolves.toBe(true);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(kill).toHaveBeenCalledWith(STARTING_IDENTITY.pid, 0);
+    expect(store.quarantineStaleIfExact).toHaveBeenCalledWith({
+      expected: STARTING_IDENTITY,
+      contentDigest: '1'.repeat(64),
     });
   });
 

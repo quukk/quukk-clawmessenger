@@ -1719,6 +1719,36 @@ export function createProductionCliRuntime(
     return true;
   };
 
+  const recoverExactStarting = async (
+    identity: StartingDaemonIdentity,
+    contentDigest: string,
+    deadline = beginDeadline(START_WAIT_MS, 'operation_timeout'),
+  ): Promise<boolean> => {
+    if (
+      !StartingDaemonIdentitySchema.safeParse(identity).success
+      || !/^[0-9a-f]{64}$/.test(contentDigest)
+    ) throw productionFailure('stale_unverified');
+    remainingDeadline(deadline);
+    try {
+      kill(identity.pid, 0);
+      return false;
+    } catch (error) {
+      if (errorCodeOf(error) !== 'ESRCH') return false;
+    }
+    remainingDeadline(deadline);
+    let quarantined: boolean;
+    try {
+      quarantined = await identityStore.quarantineStaleIfExact({
+        expected: identity,
+        contentDigest,
+      });
+    } catch {
+      throw productionFailure('stale_unverified');
+    }
+    remainingDeadline(deadline);
+    return quarantined;
+  };
+
   const waitForShutdown = async (
     identity: ReadyDaemonIdentity,
     deadline: OperationDeadline,
@@ -1901,6 +1931,19 @@ export function createProductionCliRuntime(
           checkChild = child.check;
           ownedPid = child.ownedPid;
           spawned = true;
+        }
+      } else if (snapshot.identity.state === 'starting') {
+        const recovered = await recoverExactStarting(
+          snapshot.identity,
+          snapshot.contentDigest!,
+          deadline,
+        );
+        if (recovered) {
+          spawned = false;
+          checkChild = (): void => {};
+          ownedPid = undefined;
+          snapshot = {};
+          continue;
         }
       } else if (snapshot.identity.state === 'ready') {
         try {
@@ -2087,11 +2130,16 @@ export function createProductionCliRuntime(
     },
     control,
     async recoverStaleForStart(stale): Promise<boolean> {
-      const identity = ReadyDaemonIdentitySchema.safeParse(stale.identity);
-      if (!identity.success || !/^[0-9a-f]{64}$/.test(stale.contentDigest)) {
+      if (!/^[0-9a-f]{64}$/.test(stale.contentDigest)) {
         throw productionFailure('stale_unverified');
       }
-      return recoverExactStale(identity.data, stale.contentDigest);
+      const starting = StartingDaemonIdentitySchema.safeParse(stale.identity);
+      if (starting.success) {
+        return recoverExactStarting(starting.data, stale.contentDigest);
+      }
+      const ready = ReadyDaemonIdentitySchema.safeParse(stale.identity);
+      if (!ready.success) throw productionFailure('stale_unverified');
+      return recoverExactStale(ready.data, stale.contentDigest);
     },
     async *readLogs(input): AsyncIterable<string> {
       if (
