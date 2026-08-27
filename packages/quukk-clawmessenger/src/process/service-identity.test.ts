@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import {
   chmod as fsChmod,
   link as fsLink,
+  lstat as fsLstat,
   mkdir,
   mkdtemp,
   open as fsOpen,
@@ -11,10 +12,12 @@ import {
   readdir,
   rename,
   rm,
+  stat as fsStat,
+  symlink,
   unlink as fsUnlink,
   writeFile,
 } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -75,6 +78,19 @@ function postCreateFailureDependencies(
   return {
     platform: 'linux',
     open: async (path, flags, mode) => {
+      const value = String(path);
+      if (value.endsWith('daemon.pid.recovery')
+        || value.includes(`daemon.pid.recovery${sep}`)) {
+        const isDirectory = value.endsWith('daemon.pid.recovery');
+        return {
+          stat: async () => ({
+            isDirectory: () => isDirectory,
+            isFile: () => !isDirectory,
+          }),
+          chmod: async () => undefined,
+          close: async () => undefined,
+        } as unknown as Awaited<ReturnType<typeof fsOpen>>;
+      }
       const handle = await fsOpen(path, flags, mode);
       if (String(flags) !== 'wx' || phase === 'chmod') return handle;
       return {
@@ -445,6 +461,136 @@ describe('DaemonIdentityStore', () => {
     expect(recoveryPath).toContain('daemon.pid.recovery');
     expect(recoveryPath).toContain('write-unverified-');
     expect(JSON.parse(await readFile(recoveryPath!, 'utf8'))).toEqual(rogue);
+  });
+
+  it('bounds recovery garbage by entry count and total bytes across repeated lifecycles', async () => {
+    const filePath = await identityPath('recovery-bounds');
+    const recoveryDirectory = `${filePath}.recovery`;
+    await mkdir(recoveryDirectory, { mode: 0o700 });
+    await Promise.all(Array.from({ length: 32 }, (_, index) =>
+      writeFile(
+        join(recoveryDirectory, `retired-${index.toString(16).padStart(32, '0')}.json`),
+        Buffer.alloc(40_000, 0x78),
+      )));
+    await writeFile(join(recoveryDirectory, 'unmanaged.keep'), 'preserve');
+    await mkdir(join(recoveryDirectory, `retired-${'f'.repeat(32)}.json`));
+    const outsideRecovery = join(dirname(recoveryDirectory), 'outside-recovery');
+    await mkdir(outsideRecovery);
+    await writeFile(join(outsideRecovery, 'sentinel'), 'outside');
+    const recoverySymlink = join(recoveryDirectory, `retired-${'e'.repeat(32)}.json`);
+    await symlink(outsideRecovery, recoverySymlink, process.platform === 'win32' ? 'junction' : 'dir');
+
+    const store = new DaemonIdentityStore({ filePath });
+    for (let index = 1; index <= 18; index += 1) {
+      const cycleStarting = starting({
+        pid: 5000 + index,
+        instance_id: `svc_${index.toString(16).padStart(32, '0')}`,
+      });
+      const cycleReady: ReadyDaemonIdentity = {
+        ...cycleStarting,
+        state: 'ready',
+        address: ready().address,
+      };
+      await store.claim(cycleStarting);
+      await store.markReady(cycleStarting, cycleReady.address);
+      await store.removeIfMatches(cycleReady);
+    }
+
+    const managed = (await Promise.all((await readdir(recoveryDirectory))
+      .filter((name) => /^(?:retired|write-(?:owned|unverified))-[0-9a-f]{32}\.json$/.test(name))
+      .map(async (name) => ({ name, metadata: await fsStat(join(recoveryDirectory, name)) }))))
+      .filter(({ metadata }) => metadata.isFile());
+    const sizes = managed.map(({ metadata }) => metadata.size);
+    expect(managed).toHaveLength(32);
+    expect(sizes.reduce((total, size) => total + size, 0)).toBeLessThanOrEqual(1_048_576);
+    await expect(readFile(join(recoveryDirectory, 'unmanaged.keep'), 'utf8'))
+      .resolves.toBe('preserve');
+    await expect(fsStat(join(recoveryDirectory, `retired-${'f'.repeat(32)}.json`)))
+      .resolves.toMatchObject({ isDirectory: expect.any(Function) });
+    expect((await fsLstat(recoverySymlink)).isSymbolicLink()).toBe(true);
+    await expect(readFile(join(outsideRecovery, 'sentinel'), 'utf8')).resolves.toBe('outside');
+  });
+
+  it('fails safe on recovery pruning errors without permanently blocking a new claim', async () => {
+    const filePath = await identityPath('recovery-prune-failure');
+    const recoveryDirectory = `${filePath}.recovery`;
+    await mkdir(recoveryDirectory, { mode: 0o700 });
+    await Promise.all(Array.from({ length: 33 }, (_, index) =>
+      writeFile(
+        join(recoveryDirectory, `retired-${index.toString(16).padStart(32, '0')}.json`),
+        'garbage',
+      )));
+    const store = new DaemonIdentityStore({
+      filePath,
+      dependencies: {
+        unlink: async (path) => {
+          if (String(path).startsWith(`${recoveryDirectory}${sep}`)) throw ioFailure();
+          await fsUnlink(path);
+        },
+      },
+    });
+    const cycleStarting = starting({ pid: 9882, instance_id: `svc_${'66'.repeat(16)}` });
+    const cycleReady: ReadyDaemonIdentity = {
+      ...cycleStarting,
+      state: 'ready',
+      address: ready().address,
+    };
+    await store.claim(cycleStarting);
+
+    await expect(store.markReady(cycleStarting, cycleReady.address)).resolves.toEqual(cycleReady);
+    await expect(store.removeIfMatches(cycleReady))
+      .rejects.toMatchObject({ code: 'identity_write_failed' });
+    await expect(readFile(filePath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await readdir(dirname(filePath)))
+      .filter((name) => name.startsWith('daemon.pid.claim-'))).toEqual([]);
+    const nextStarting = starting({ pid: 9883, instance_id: `svc_${'67'.repeat(16)}` });
+    await expect(store.claim(nextStarting)).resolves.toBe(true);
+  });
+
+  it('hardens an existing recovery directory and every moved artifact on Unix', async () => {
+    const filePath = await identityPath('recovery-permissions');
+    const recoveryDirectory = `${filePath}.recovery`;
+    await mkdir(recoveryDirectory, { mode: 0o777 });
+    const recoveryChmods: Array<{ mode: number; path: string }> = [];
+    const store = new DaemonIdentityStore({
+      filePath,
+      dependencies: {
+        platform: 'linux',
+        open: async (path, flags, mode) => {
+          const value = String(path);
+          if (value === recoveryDirectory || value.startsWith(`${recoveryDirectory}${sep}`)) {
+            return {
+              stat: async () => ({
+                isDirectory: () => value === recoveryDirectory,
+                isFile: () => value !== recoveryDirectory,
+              }),
+              chmod: async (nextMode: number) => {
+                recoveryChmods.push({ mode: nextMode, path: value });
+              },
+              close: async () => undefined,
+            } as unknown as Awaited<ReturnType<typeof fsOpen>>;
+          }
+          return fsOpen(path, flags, mode);
+        },
+      },
+    });
+    const cycleStarting = starting({ pid: 9881, instance_id: `svc_${'65'.repeat(16)}` });
+    const cycleReady: ReadyDaemonIdentity = {
+      ...cycleStarting,
+      state: 'ready',
+      address: ready().address,
+    };
+
+    await store.claim(cycleStarting);
+    await store.markReady(cycleStarting, cycleReady.address);
+    await store.removeIfMatches(cycleReady);
+
+    expect(recoveryChmods.filter((call) => call.path === recoveryDirectory))
+      .toEqual([{ path: recoveryDirectory, mode: 0o700 }, { path: recoveryDirectory, mode: 0o700 }]);
+    expect(recoveryChmods.filter((call) => call.path !== recoveryDirectory))
+      .toHaveLength(2);
+    expect(recoveryChmods.filter((call) => call.path !== recoveryDirectory)
+      .every((call) => call.mode === 0o600)).toBe(true);
   });
 
   it('removes only its own failed claim when a replacement wins cleanup', async () => {

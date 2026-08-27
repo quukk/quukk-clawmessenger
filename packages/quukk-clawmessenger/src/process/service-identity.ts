@@ -3,8 +3,12 @@ import {
   randomBytes as cryptoRandomBytes,
 } from 'node:crypto';
 import {
+  constants as fsConstants,
+} from 'node:fs';
+import {
   chmod as fsChmod,
   link as fsLink,
+  lstat as fsLstat,
   mkdir as fsMkdir,
   open as fsOpen,
   opendir as fsOpenDirectory,
@@ -21,6 +25,9 @@ const DIRECTORY_ENTRY_LIMIT = 256;
 const INSTANCE_ID_PATTERN = /^svc_[0-9a-f]{32}$/;
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
 const STALE_ARTIFACT_PATTERN = /^([0-9a-f]{64})(?:-cleanup-[0-9a-f]{32})?$/;
+const RECOVERY_ARTIFACT_PATTERN = /^(?:retired|write-(?:owned|unverified))-[0-9a-f]{32}\.json$/;
+const RECOVERY_ENTRY_LIMIT = 32;
+const RECOVERY_BYTE_LIMIT = 1_048_576n;
 const ADDRESS_PATTERN = /^127\.0\.0\.1:(?:[1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d|6553[0-5])$/;
 const STARTED_AT_SCHEMA = z
   .string()
@@ -92,6 +99,7 @@ export interface DaemonIdentityDependencies {
   platform: NodeJS.Platform;
   mkdir: typeof fsMkdir;
   chmod: typeof fsChmod;
+  lstat: typeof fsLstat;
   open: typeof fsOpen;
   readFile: typeof fsReadFile;
   rename: typeof fsRename;
@@ -173,6 +181,7 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
       platform: options.dependencies?.platform ?? process.platform,
       mkdir: options.dependencies?.mkdir ?? fsMkdir,
       chmod: options.dependencies?.chmod ?? fsChmod,
+      lstat: options.dependencies?.lstat ?? fsLstat,
       open: options.dependencies?.open ?? fsOpen,
       readFile: options.dependencies?.readFile ?? fsReadFile,
       rename: options.dependencies?.rename ?? fsRename,
@@ -488,9 +497,13 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
 
   #recoveryPath(kind: RecoveryKind): string {
     return join(
-      `${this.#path}.recovery`,
+      this.#recoveryDirectory(),
       `${kind}-${this.#randomToken()}.json`,
     );
+  }
+
+  #recoveryDirectory(): string {
+    return `${this.#path}.recovery`;
   }
 
   #randomToken(): string {
@@ -530,20 +543,140 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
   }
 
   async #moveToRecovery(path: string, kind: RecoveryKind): Promise<void> {
+    const recoveryDirectory = await this.#ensureRecoveryDirectory();
     const recoveryPath = this.#recoveryPath(kind);
-    try {
-      await this.#deps.mkdir(dirname(recoveryPath), { mode: 0o700 });
-    } catch (error) {
-      if (errorCode(error) !== 'EEXIST') {
-        throw new DaemonIdentityError('identity_write_failed');
-      }
-    }
     try {
       await this.#deps.rename(path, recoveryPath);
     } catch (error) {
       if (errorCode(error) !== 'ENOENT') {
         throw new DaemonIdentityError('identity_write_failed');
       }
+    }
+    await this.#secureRecoveryArtifact(recoveryPath);
+    await this.#pruneRecovery(recoveryDirectory);
+  }
+
+  async #ensureRecoveryDirectory(): Promise<string> {
+    const recoveryDirectory = this.#recoveryDirectory();
+    try {
+      await this.#deps.mkdir(recoveryDirectory, { mode: 0o700 });
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') {
+        throw new DaemonIdentityError('identity_write_failed');
+      }
+    }
+    let metadata;
+    try {
+      metadata = await this.#deps.lstat(recoveryDirectory);
+    } catch {
+      throw new DaemonIdentityError('identity_write_failed');
+    }
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new DaemonIdentityError('identity_write_failed');
+    }
+    if (this.#deps.platform === 'win32') return recoveryDirectory;
+    let handle;
+    try {
+      handle = await this.#deps.open(
+        recoveryDirectory,
+        fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+      );
+      const opened = await handle.stat();
+      if (!opened.isDirectory()) throw new DaemonIdentityError('identity_write_failed');
+      await handle.chmod(0o700);
+    } catch (error) {
+      if (error instanceof DaemonIdentityError) throw error;
+      throw new DaemonIdentityError('identity_write_failed');
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+    return recoveryDirectory;
+  }
+
+  async #secureRecoveryArtifact(path: string): Promise<void> {
+    let metadata;
+    try {
+      metadata = await this.#deps.lstat(path);
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return;
+      throw new DaemonIdentityError('identity_write_failed');
+    }
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new DaemonIdentityError('identity_write_failed');
+    }
+    if (this.#deps.platform === 'win32') return;
+    let handle;
+    try {
+      handle = await this.#deps.open(
+        path,
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+      );
+      const opened = await handle.stat();
+      if (!opened.isFile()) throw new DaemonIdentityError('identity_write_failed');
+      await handle.chmod(0o600);
+    } catch (error) {
+      if (error instanceof DaemonIdentityError) throw error;
+      throw new DaemonIdentityError('identity_write_failed');
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+  }
+
+  async #pruneRecovery(recoveryDirectory: string): Promise<void> {
+    const candidates: Array<{
+      mtimeNs: bigint;
+      name: string;
+      path: string;
+      size: bigint;
+    }> = [];
+    let directory;
+    try {
+      directory = await fsOpenDirectory(recoveryDirectory);
+      for await (const entry of directory) {
+        if (!RECOVERY_ARTIFACT_PATTERN.test(entry.name)) continue;
+        const path = join(recoveryDirectory, entry.name);
+        let metadata;
+        try {
+          metadata = await this.#deps.lstat(path, { bigint: true });
+        } catch (error) {
+          if (errorCode(error) === 'ENOENT') continue;
+          throw error;
+        }
+        if (!metadata.isFile() || metadata.isSymbolicLink()) continue;
+        candidates.push({
+          mtimeNs: metadata.mtimeNs,
+          name: entry.name,
+          path,
+          size: metadata.size,
+        });
+      }
+    } catch (error) {
+      if (error instanceof DaemonIdentityError) throw error;
+      throw new DaemonIdentityError('identity_write_failed');
+    } finally {
+      await directory?.close().catch(() => undefined);
+    }
+    candidates.sort((left, right) => {
+      if (left.mtimeNs < right.mtimeNs) return -1;
+      if (left.mtimeNs > right.mtimeNs) return 1;
+      return left.name.localeCompare(right.name);
+    });
+    let entries = candidates.length;
+    let bytes = candidates.reduce((total, candidate) => total + candidate.size, 0n);
+    for (const candidate of candidates) {
+      if (entries <= RECOVERY_ENTRY_LIMIT && bytes <= RECOVERY_BYTE_LIMIT) break;
+      try {
+        const current = await this.#deps.lstat(candidate.path);
+        if (current.isFile() && !current.isSymbolicLink()) {
+          await this.#deps.unlink(candidate.path);
+        }
+      } catch (error) {
+        if (errorCode(error) !== 'ENOENT') {
+          throw new DaemonIdentityError('identity_write_failed');
+        }
+      }
+      entries -= 1;
+      bytes -= candidate.size;
     }
   }
 
