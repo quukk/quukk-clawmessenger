@@ -88,6 +88,7 @@ class FakeSdk {
   readonly Events = {
     CONNECTING: 'CONNECTING',
     CONNECTED: 'CONNECTED',
+    SUSPEND: 'SUSPEND',
     DISCONNECT: 'DISCONNECT',
     MESSAGES: 'MESSAGES',
   };
@@ -289,6 +290,7 @@ describe('RongCloudClient lifecycle', () => {
       'register:chatroom_invite:true:false',
       'listen:CONNECTING',
       'listen:CONNECTED',
+      'listen:SUSPEND',
       'listen:DISCONNECT',
       'listen:MESSAGES',
     ]);
@@ -313,6 +315,27 @@ describe('RongCloudClient lifecycle', () => {
     expect(sdk.connectTokens).toEqual(['token-1']);
     pending.resolve({ code: 0 });
     await expect(first).resolves.toBeUndefined();
+  });
+
+  it('ignores CONNECTED until the initial connect settles but accepts it for auto-reconnect', async () => {
+    const pending = deferred<SdkResult>();
+    const sdk = new FakeSdk();
+    sdk.connectImpl = () => pending.promise;
+    const { client, connections } = createClient({ sdk });
+    client.init({ appKey: 'app-key', token: 'token-1' });
+    const connecting = client.connect();
+    await flush();
+
+    sdk.emit('CONNECTED');
+    expect(connections).toEqual([]);
+    await expect(client.send(send(1))).rejects.toMatchObject({ code: 'not_connected' });
+
+    pending.resolve({ code: 0 });
+    await expect(connecting).resolves.toBeUndefined();
+    expect(connections).toEqual(['online']);
+    sdk.emit('SUSPEND');
+    sdk.emit('CONNECTED');
+    expect(connections).toEqual(['online', 'offline', 'online']);
   });
 
   it('refreshes one authentication failure once and never refreshes arbitrary failures', async () => {
@@ -403,6 +426,57 @@ describe('RongCloudClient lifecycle', () => {
     expect(sdk.disconnectCalls).toBe(2);
     sdk.emit('MESSAGES', { messages: [inbound] });
     expect(delivered).toEqual([]);
+  });
+
+  it('serializes stale connect cleanup before a newer physical connection starts', async () => {
+    const firstConnect = deferred<SdkResult>();
+    const sdk = new FakeSdk();
+    let connectCalls = 0;
+    sdk.connectImpl = () => {
+      connectCalls += 1;
+      return connectCalls === 1 ? firstConnect.promise : Promise.resolve({ code: 0 });
+    };
+    const { client } = createClient({ sdk });
+    client.init({ appKey: 'app-key', token: 'token' });
+    const firstOutcome = client.connect().then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    await flush();
+    await client.disconnect();
+    const reconnected = client.connect();
+    await flush();
+
+    expect(sdk.connectTokens).toEqual(['token']);
+    firstConnect.resolve({ code: 0 });
+    expect(await firstOutcome).toMatchObject({ ok: false, error: { code: 'disconnected' } });
+    await expect(reconnected).resolves.toBeUndefined();
+    expect(sdk.callLog.filter((entry) => entry === 'connect' || entry === 'disconnect'))
+      .toEqual(['connect', 'disconnect', 'disconnect', 'connect']);
+    await expect(client.send(send(99))).resolves.toBeDefined();
+  });
+
+  it('recovers online after SDK SUSPEND without duplicating online and reports terminal disconnects', async () => {
+    const terminals: string[] = [];
+    const { client, sdk, connections } = createClient({
+      onTerminalDisconnect: (state: string) => terminals.push(state),
+    });
+    await initialize(client);
+
+    sdk.emit('SUSPEND');
+    expect(connections).toEqual(['online', 'offline']);
+    await expect(client.send(send(1))).rejects.toMatchObject({ code: 'not_connected' });
+    sdk.emit('CONNECTING');
+    sdk.emit('CONNECTED');
+    sdk.emit('CONNECTED');
+    expect(connections).toEqual(['online', 'offline', 'connecting', 'online']);
+    await expect(client.send(send(2))).resolves.toBeDefined();
+
+    sdk.emit('DISCONNECT', 31004);
+    expect(connections.at(-1)).toBe('auth_error');
+    expect(terminals).toEqual(['auth_error']);
+    sdk.emit('CONNECTED');
+    expect(connections.at(-1)).toBe('auth_error');
   });
 
   it('maps only fixed connection states from SDK events', async () => {

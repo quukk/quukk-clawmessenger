@@ -284,6 +284,10 @@ const disconnectSchema = z.strictObject({
   requestId: requestIdSchema,
 });
 
+const shutdownSchema = z.strictObject({
+  type: z.literal('shutdown'),
+});
+
 export const WorkerCommandSchema = z.union([
   initSchema,
   refreshSuccessSchema,
@@ -293,6 +297,7 @@ export const WorkerCommandSchema = z.union([
   receiptSchema,
   joinChatroomSchema,
   disconnectSchema,
+  shutdownSchema,
 ]);
 
 export type WorkerCommand = z.infer<typeof WorkerCommandSchema>;

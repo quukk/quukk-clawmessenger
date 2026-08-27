@@ -45,6 +45,22 @@ function isMissingFile(error: unknown): boolean {
     && Object.getOwnPropertyDescriptor(error, 'code')?.value === 'ENOENT';
 }
 
+export function directoryFsyncErrorIsIgnorable(
+  platform: NodeJS.Platform,
+  error: unknown,
+): boolean {
+  if (platform === 'win32') return true;
+  let code: unknown;
+  try {
+    code = error !== null && typeof error === 'object'
+      ? Object.getOwnPropertyDescriptor(error, 'code')?.value
+      : undefined;
+  } catch {
+    return false;
+  }
+  return code === 'EINVAL' || code === 'ENOTSUP' || code === 'EOPNOTSUPP';
+}
+
 function serializedStorage(items: ReadonlyMap<string, string>): string {
   if (items.size > MAX_STORAGE_ENTRIES) {
     throw new DOMException('storage_quota_exceeded', 'QuotaExceededError');
@@ -130,15 +146,26 @@ function persistStorageFile(storageDir: string, items: ReadonlyMap<string, strin
     closeSync(descriptor);
     descriptor = undefined;
     renameSync(temporaryPath, filePath);
+    let directoryDescriptor: number | undefined;
     try {
-      const directoryDescriptor = openSync(storageDir, constants.O_RDONLY);
+      directoryDescriptor = openSync(storageDir, constants.O_RDONLY);
+    } catch (error) {
+      if (process.platform !== 'win32') throw error;
+    }
+    if (directoryDescriptor !== undefined) {
       try {
-        fsyncSync(directoryDescriptor);
+        try {
+          fsyncSync(directoryDescriptor);
+        } catch (error) {
+          if (!directoryFsyncErrorIsIgnorable(process.platform, error)) throw error;
+        }
       } finally {
-        closeSync(directoryDescriptor);
+        try {
+          closeSync(directoryDescriptor);
+        } catch (error) {
+          if (process.platform !== 'win32') throw error;
+        }
       }
-    } catch {
-      // Windows cannot fsync directory handles; the file itself was fsynced before rename.
     }
   } catch (error) {
     if (descriptor !== undefined) {

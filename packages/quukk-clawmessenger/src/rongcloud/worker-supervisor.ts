@@ -1,5 +1,6 @@
 import { fork, type ForkOptions } from 'node:child_process';
-import { isAbsolute } from 'node:path';
+import { chmodSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
+import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -20,6 +21,8 @@ export const SUPERVISOR_TERMINATE_GRACE_MS = 2_000;
 export const SUPERVISOR_KILL_GRACE_MS = 1_000;
 export const SUPERVISOR_READY_TIMEOUT_MS = 20_000;
 export const SUPERVISOR_ONLINE_TIMEOUT_MS = 20_000;
+export const SUPERVISOR_CREDENTIAL_TIMEOUT_MS = 15_000;
+export const SUPERVISOR_SHUTDOWN_GRACE_MS = 4_000;
 
 export interface WorkerIdentity {
   runtimeId: string;
@@ -71,6 +74,7 @@ export interface WorkerSpawnOptions {
 }
 
 export interface RongCloudWorkerSupervisorOptions {
+  storageRoot: string;
   workerEntryPath?: string;
   spawnChild?: (
     modulePath: string,
@@ -93,6 +97,8 @@ export interface RongCloudWorkerSupervisorOptions {
   killGraceMs?: number;
   readyTimeoutMs?: number;
   onlineTimeoutMs?: number;
+  credentialTimeoutMs?: number;
+  shutdownGraceMs?: number;
   maxPendingRequests?: number;
   maxBufferedCommands?: number;
 }
@@ -111,7 +117,7 @@ export class RongCloudSupervisorError extends Error {
   }
 }
 
-type RequestCommand = Exclude<WorkerCommand, { type: 'init' | 'refresh_result' }>;
+type RequestCommand = Exclude<WorkerCommand, { type: 'init' | 'refresh_result' | 'shutdown' }>;
 
 interface PendingRequest {
   command: RequestCommand;
@@ -137,6 +143,15 @@ interface ChildLifecycle {
   exited: boolean;
   abandoned: boolean;
   termination?: Promise<boolean>;
+  terminationError?: (...values: unknown[]) => void;
+}
+
+interface CredentialLookup {
+  readonly generation: number;
+  promise: Promise<SupervisorCredential>;
+  settled: boolean;
+  blockedCode?: WorkerErrorCode;
+  cancel(): void;
 }
 
 interface WorkerRecord {
@@ -162,6 +177,9 @@ interface WorkerRecord {
   buffer: PendingRequest[];
   refreshRequestId?: string;
   restartAttempt?: Promise<void>;
+  spawnAttempt?: Promise<void>;
+  spawnGeneration?: number;
+  credentialLookup?: CredentialLookup;
   reapBlocked: boolean;
   removeWhenReaped: boolean;
 }
@@ -171,6 +189,7 @@ type TimerSchedule = { ok: true; timer: unknown } | { ok: false };
 const defaultWorkerEntryPath = fileURLToPath(new URL('./worker-entry.js', import.meta.url));
 const windowsEnvKeys = ['SystemRoot', 'WINDIR', 'ComSpec', 'TEMP', 'TMP'] as const;
 const posixEnvKeys = ['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR', 'TEMP', 'TMP', 'TZ'] as const;
+const runtimeStorageSegment = /^rt_[0-9a-f]{32}$/u;
 
 function boundedInteger(value: number | undefined, fallback: number, maximum: number): number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
@@ -186,6 +205,81 @@ function copyBinding(binding: SupervisorBinding): SupervisorBinding {
     tokenRef: binding.tokenRef,
     storageDir: binding.storageDir,
   };
+}
+
+function samePath(left: string, right: string): boolean {
+  return process.platform === 'win32'
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
+
+function assertNoReparseTraversal(input: string): void {
+  const root = parse(input).root;
+  let current = root;
+  for (const segment of input.slice(root.length).split(/[\\/]+/u).filter(Boolean)) {
+    current = join(current, segment);
+    if (lstatSync(current).isSymbolicLink()) throw failure('invalid_request');
+  }
+}
+
+function canonicalStorageRoot(input: string): string {
+  if (typeof input !== 'string' || !isAbsolute(input) || input.includes('\0')) {
+    throw failure('invalid_request');
+  }
+  const normalized = resolve(input);
+  if (samePath(normalized, parse(normalized).root)) throw failure('invalid_request');
+  try {
+    mkdirSync(normalized, { recursive: true, mode: 0o700 });
+    assertNoReparseTraversal(normalized);
+    const stat = lstatSync(normalized);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw failure('invalid_request');
+    // Windows v1 relies on the protected user-profile root's inherited DACL.
+    if (process.platform !== 'win32') chmodSync(normalized, 0o700);
+    const canonical = realpathSync.native(normalized);
+    if (samePath(canonical, parse(canonical).root)) throw failure('invalid_request');
+    if (!samePath(realpathSync.native(normalized), canonical)) throw failure('invalid_request');
+    return canonical;
+  } catch (error) {
+    if (error instanceof RongCloudSupervisorError) throw error;
+    throw failure('invalid_request');
+  }
+}
+
+function confinedStorageDir(
+  storageRoot: string,
+  configuredStorageRoot: string,
+  binding: SupervisorBinding,
+): string {
+  if (!runtimeStorageSegment.test(binding.runtimeId)
+    || typeof binding.storageDir !== 'string'
+    || !isAbsolute(binding.storageDir)
+    || binding.storageDir.includes('\0')
+    || binding.storageDir.split(/[\\/]+/u).includes('..')) {
+    throw failure('invalid_request');
+  }
+  const expected = join(storageRoot, binding.runtimeId);
+  const configuredExpected = join(configuredStorageRoot, binding.runtimeId);
+  const requested = resolve(binding.storageDir);
+  const canonicalChild = samePath(requested, expected) && samePath(dirname(requested), storageRoot);
+  const configuredChild = samePath(requested, configuredExpected)
+    && samePath(dirname(requested), configuredStorageRoot);
+  if (!canonicalChild && !configuredChild) {
+    throw failure('invalid_request');
+  }
+  try {
+    mkdirSync(expected, { recursive: true, mode: 0o700 });
+    const stat = lstatSync(expected);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw failure('invalid_request');
+    if (process.platform !== 'win32') chmodSync(expected, 0o700);
+    const canonical = realpathSync.native(expected);
+    if (!samePath(canonical, expected) || !samePath(dirname(canonical), storageRoot)) {
+      throw failure('invalid_request');
+    }
+    return canonical;
+  } catch (error) {
+    if (error instanceof RongCloudSupervisorError) throw error;
+    throw failure('invalid_request');
+  }
 }
 
 function failure(code: WorkerErrorCode): RongCloudSupervisorError {
@@ -241,6 +335,8 @@ export function buildMinimalWorkerEnv(
 }
 
 export class RongCloudWorkerSupervisor {
+  readonly #storageRoot: string;
+  readonly #configuredStorageRoot: string;
   readonly #workerEntryPath: string;
   readonly #spawnChild: NonNullable<RongCloudWorkerSupervisorOptions['spawnChild']>;
   readonly #workerEnv: NodeJS.ProcessEnv;
@@ -258,6 +354,8 @@ export class RongCloudWorkerSupervisor {
   readonly #killGraceMs: number;
   readonly #readyTimeoutMs: number;
   readonly #onlineTimeoutMs: number;
+  readonly #credentialTimeoutMs: number;
+  readonly #shutdownGraceMs: number;
   readonly #maxPendingRequests: number;
   readonly #maxBufferedCommands: number;
   readonly #records = new Map<string, WorkerRecord>();
@@ -266,6 +364,8 @@ export class RongCloudWorkerSupervisor {
   #disposeAttempt?: Promise<void>;
 
   constructor(options: RongCloudWorkerSupervisorOptions) {
+    this.#storageRoot = canonicalStorageRoot(options.storageRoot);
+    this.#configuredStorageRoot = resolve(options.storageRoot);
     this.#workerEntryPath = options.workerEntryPath ?? defaultWorkerEntryPath;
     if (!isAbsolute(this.#workerEntryPath)) throw failure('invalid_request');
     this.#spawnChild = options.spawnChild ?? productionSpawn;
@@ -315,6 +415,16 @@ export class RongCloudWorkerSupervisor {
       SUPERVISOR_ONLINE_TIMEOUT_MS,
       5 * 60_000,
     );
+    this.#credentialTimeoutMs = boundedInteger(
+      options.credentialTimeoutMs,
+      SUPERVISOR_CREDENTIAL_TIMEOUT_MS,
+      5 * 60_000,
+    );
+    this.#shutdownGraceMs = boundedInteger(
+      options.shutdownGraceMs,
+      SUPERVISOR_SHUTDOWN_GRACE_MS,
+      30_000,
+    );
     this.#maxPendingRequests = boundedInteger(
       options.maxPendingRequests,
       SUPERVISOR_MAX_PENDING_REQUESTS,
@@ -332,6 +442,7 @@ export class RongCloudWorkerSupervisor {
     for (const source of bindings) {
       if (!source.enabled) continue;
       const binding = copyBinding(source);
+      binding.storageDir = confinedStorageDir(this.#storageRoot, this.#configuredStorageRoot, binding);
       const key = workerBindingKey(binding);
       desired.set(key, binding);
     }
@@ -371,8 +482,22 @@ export class RongCloudWorkerSupervisor {
       existing.binding = binding;
       existing.desired = true;
       existing.removeWhenReaped = false;
+      if (credentialsChanged) existing.generation += 1;
+      if (existing.reapBlocked) {
+        starts.push(Promise.reject(failure('worker_exited')));
+        continue;
+      }
+      const termination = existing.lifecycle?.termination;
+      if (termination) {
+        starts.push(termination.then(async (reaped) => {
+          if (!reaped) throw failure('worker_exited');
+          if (this.#disposed || !existing.desired || this.#records.get(key) !== existing) return;
+          await this.#spawn(existing);
+        }));
+        continue;
+      }
       if (credentialsChanged || existing.state === 'stopped') {
-        starts.push(this.#restartRecord(existing));
+        starts.push(this.#restartRecord(existing, true));
       } else if (!existing.child && !existing.lifecycle && !existing.reapBlocked
         && existing.restartTimer === undefined && !existing.restartAttempt) {
         starts.push(this.#spawn(existing));
@@ -413,6 +538,7 @@ export class RongCloudWorkerSupervisor {
     const record = this.#record(identity);
     if (!record) return;
     record.desired = false;
+    record.generation += 1;
     record.removeWhenReaped = false;
     this.#cancelLifecycleTimers(record);
     this.#rejectPending(record, 'worker_exited');
@@ -428,13 +554,14 @@ export class RongCloudWorkerSupervisor {
     if (this.#disposed) throw failure('worker_exited');
     const record = this.#record(identity);
     if (!record) throw failure('not_initialized');
+    const queueAfterCurrent = record.state === 'stopped';
     record.desired = true;
-    await this.#restartRecord(record);
+    await this.#restartRecord(record, queueAfterCurrent);
   }
 
   snapshots(): readonly WorkerSnapshot[] {
     return [...this.#records.values()]
-      .filter((record) => !record.removeWhenReaped)
+      .filter((record) => !record.removeWhenReaped || (record.reapBlocked && !this.#disposed))
       .sort((left, right) => left.key.localeCompare(right.key))
       .map((record) => ({
         runtimeId: record.binding.runtimeId,
@@ -451,6 +578,8 @@ export class RongCloudWorkerSupervisor {
     const records = [...this.#records.values()];
     const attempt = Promise.all(records.map(async (record) => {
       record.desired = false;
+      record.generation += 1;
+      record.credentialLookup?.cancel();
       record.removeWhenReaped = true;
       this.#cancelLifecycleTimers(record);
       this.#rejectPending(record, 'worker_exited');
@@ -472,8 +601,15 @@ export class RongCloudWorkerSupervisor {
     return this.#records.get(workerBindingKey(identity));
   }
 
-  #restartRecord(record: WorkerRecord): Promise<void> {
-    if (record.restartAttempt) return record.restartAttempt;
+  #restartRecord(record: WorkerRecord, queueAfterCurrent = false): Promise<void> {
+    if (record.restartAttempt) {
+      if (!queueAfterCurrent) return record.restartAttempt;
+      const current = record.restartAttempt;
+      return current.then(
+        () => this.#restartRecord(record),
+        () => this.#restartRecord(record),
+      );
+    }
     const attempt = this.#performRestart(record);
     record.restartAttempt = attempt;
     const clear = (): void => {
@@ -484,6 +620,7 @@ export class RongCloudWorkerSupervisor {
   }
 
   async #performRestart(record: WorkerRecord): Promise<void> {
+    const generation = ++record.generation;
     this.#cancelLifecycleTimers(record);
     this.#rejectPending(record, 'worker_exited');
     record.state = 'backoff';
@@ -492,7 +629,7 @@ export class RongCloudWorkerSupervisor {
     record.routable = false;
     const reaped = await this.#terminate(record);
     if (!reaped) throw failure('worker_exited');
-    if (this.#disposed || !record.desired || this.#records.get(record.key) !== record) return;
+    if (!this.#ownsGeneration(record, generation)) return;
     this.#cancelLifecycleTimers(record);
     record.restartCount = 0;
     record.failedGeneration = undefined;
@@ -503,16 +640,63 @@ export class RongCloudWorkerSupervisor {
     await this.#spawn(record);
   }
 
-  async #spawn(record: WorkerRecord): Promise<void> {
+  #spawn(record: WorkerRecord): Promise<void> {
     if (this.#disposed || !record.desired || this.#records.get(record.key) !== record
-      || record.child || record.lifecycle || record.reapBlocked) return;
+      || record.child || record.lifecycle || record.reapBlocked) return Promise.resolve();
+    if (record.spawnAttempt) {
+      if (record.spawnGeneration === record.generation) return record.spawnAttempt;
+      return record.spawnAttempt.then(
+        () => this.#spawn(record),
+        () => this.#spawn(record),
+      );
+    }
     const generation = ++record.generation;
+    const attempt = this.#performSpawn(record, generation);
+    record.spawnAttempt = attempt;
+    record.spawnGeneration = generation;
+    const clear = (): void => {
+      if (record.spawnAttempt === attempt) {
+        record.spawnAttempt = undefined;
+        record.spawnGeneration = undefined;
+        this.#deleteDormantRecord(record);
+      }
+    };
+    void attempt.then(clear, clear);
+    return attempt;
+  }
+
+  async #performSpawn(record: WorkerRecord, generation: number): Promise<void> {
+    if (!this.#ownsGeneration(record, generation)) return;
+    const binding = copyBinding(record.binding);
     record.failedGeneration = undefined;
     record.state = 'starting';
     record.instanceId = null;
     record.readySeen = false;
     record.routable = false;
     record.refreshRequestId = undefined;
+    let credential: SupervisorCredential;
+    try {
+      credential = await this.#boundedCredential(record, generation, binding);
+    } catch (error) {
+      if (this.#ownsGeneration(record, generation)) record.state = 'backoff';
+      if (error instanceof RongCloudSupervisorError) throw error;
+      throw failure('connect_failed');
+    }
+    if (!this.#ownsGeneration(record, generation)) return;
+    const command = parseWorkerCommand({
+      type: 'init',
+      binding: {
+        runtimeId: binding.runtimeId,
+        nodeId: binding.nodeId,
+        appKey: credential.appKey,
+        storageDir: binding.storageDir,
+      },
+      token: credential.token,
+    });
+    if (!command.ok) {
+      record.state = 'backoff';
+      throw failure('authentication_failed');
+    }
     let child: WorkerChild;
     try {
       child = this.#spawnChild(this.#workerEntryPath, [], {
@@ -531,34 +715,85 @@ export class RongCloudWorkerSupervisor {
     this.#trackChild(record, child, generation);
     this.#attach(record, child, generation);
     if (!this.#armWatchdog(record, child, generation, 'ready')) return;
-
-    let credential: SupervisorCredential;
-    try {
-      credential = await this.#resolveCredential(copyBinding(record.binding));
-    } catch {
-      this.#failRecord(record, generation);
-      return;
-    }
-    if (!this.#isCurrent(record, child, generation)) return;
-    const command = parseWorkerCommand({
-      type: 'init',
-      binding: {
-        runtimeId: record.binding.runtimeId,
-        nodeId: record.binding.nodeId,
-        appKey: credential.appKey,
-        storageDir: record.binding.storageDir,
-      },
-      token: credential.token,
-    });
-    if (!command.ok) {
-      this.#failRecord(record, generation);
-      return;
-    }
     try {
       child.send(command.value);
     } catch {
       this.#failRecord(record, generation);
     }
+  }
+
+  #boundedCredential(
+    record: WorkerRecord,
+    generation: number,
+    binding: SupervisorBinding,
+  ): Promise<SupervisorCredential> {
+    const existing = record.credentialLookup;
+    if (existing && !existing.settled) {
+      return existing.blockedCode === undefined
+        ? existing.promise
+        : Promise.reject(failure(existing.blockedCode));
+    }
+
+    let raw: Promise<SupervisorCredential>;
+    try {
+      raw = Promise.resolve(this.#resolveCredential(copyBinding(binding)));
+    } catch {
+      raw = Promise.reject(failure('connect_failed'));
+    }
+    const lookup: CredentialLookup = {
+      generation,
+      promise: Promise.resolve({ appKey: '', token: '' }),
+      settled: false,
+      cancel: () => undefined,
+    };
+    record.credentialLookup = lookup;
+    lookup.promise = new Promise((resolveCredential, rejectCredential) => {
+      let finished = false;
+      let timer: unknown;
+      let timerInstalled = false;
+      const finish = (
+        result: { ok: true; value: SupervisorCredential } | { ok: false; error: RongCloudSupervisorError },
+      ): void => {
+        if (finished) return;
+        finished = true;
+        if (timerInstalled) this.#clearTimeout(timer);
+        if (result.ok) resolveCredential(result.value);
+        else rejectCredential(result.error);
+      };
+      lookup.cancel = () => {
+        lookup.blockedCode = 'worker_exited';
+        finish({ ok: false, error: failure('worker_exited') });
+      };
+      const scheduled = this.#schedule(() => {
+        lookup.blockedCode = 'timeout';
+        finish({ ok: false, error: failure('timeout') });
+      }, this.#credentialTimeoutMs);
+      if (!scheduled.ok) {
+        lookup.blockedCode = 'timer_failed';
+        finish({ ok: false, error: failure('timer_failed') });
+      } else {
+        timer = scheduled.timer;
+        timerInstalled = true;
+        if (finished) this.#clearTimeout(timer);
+      }
+      void raw.then(
+        (value) => {
+          lookup.settled = true;
+          if (record.credentialLookup === lookup) record.credentialLookup = undefined;
+          this.#deleteDormantRecord(record);
+          if (lookup.blockedCode === undefined) finish({ ok: true, value });
+        },
+        () => {
+          lookup.settled = true;
+          if (record.credentialLookup === lookup) record.credentialLookup = undefined;
+          this.#deleteDormantRecord(record);
+          if (lookup.blockedCode === undefined) {
+            finish({ ok: false, error: failure('connect_failed') });
+          }
+        },
+      );
+    });
+    return lookup.promise;
   }
 
   #trackChild(record: WorkerRecord, child: WorkerChild, generation: number): ChildLifecycle {
@@ -595,6 +830,10 @@ export class RongCloudWorkerSupervisor {
 
   #releaseLifecycle(record: WorkerRecord, lifecycle: ChildLifecycle): void {
     removeListener(lifecycle.child, 'exit', lifecycle.onExit);
+    if (lifecycle.terminationError) {
+      removeListener(lifecycle.child, 'error', lifecycle.terminationError);
+      lifecycle.terminationError = undefined;
+    }
     if (record.lifecycle === lifecycle) {
       record.lifecycle = undefined;
       record.reapBlocked = false;
@@ -668,6 +907,7 @@ export class RongCloudWorkerSupervisor {
     event: Extract<WorkerEvent, { type: 'connection' }>,
   ): void {
     if (event.state === 'online') {
+      if (record.routable && record.state === 'online') return;
       if (record.onlineTimer !== undefined) this.#clearTimeout(record.onlineTimer);
       record.onlineTimer = undefined;
       record.state = 'online';
@@ -693,6 +933,8 @@ export class RongCloudWorkerSupervisor {
       record.state = event.state === 'connecting' ? 'starting' : 'offline';
       if (record.stableTimer !== undefined) this.#clearTimeout(record.stableTimer);
       record.stableTimer = undefined;
+      if (record.onlineTimer === undefined
+        && !this.#armWatchdog(record, child, generation, 'online')) return;
     }
     this.#emit(record, event);
   }
@@ -794,7 +1036,8 @@ export class RongCloudWorkerSupervisor {
       return Promise.reject(failure('queue_full'));
     }
     const parsed = parseWorkerCommand(input);
-    if (!parsed.ok || parsed.value.type === 'init' || parsed.value.type === 'refresh_result') {
+    if (!parsed.ok || parsed.value.type === 'init' || parsed.value.type === 'refresh_result'
+      || parsed.value.type === 'shutdown') {
       return Promise.reject(failure('invalid_request'));
     }
     const command = parsed.value;
@@ -897,7 +1140,7 @@ export class RongCloudWorkerSupervisor {
         record.restartTimer = undefined;
         if (this.#disposed || !record.desired || this.#records.get(record.key) !== record
           || record.reapBlocked) return;
-        void this.#spawn(record).catch(() => this.#failRecord(record, record.generation));
+        void this.#spawn(record).catch(() => undefined);
       }, delay);
       record.restartTimer = scheduled.ok ? scheduled.timer : undefined;
     }, () => undefined);
@@ -911,6 +1154,7 @@ export class RongCloudWorkerSupervisor {
       ? lifecycle
       : this.#trackChild(record, child, record.generation);
     if (tracked.termination) return tracked.termination;
+    this.#retainTerminationError(tracked);
     this.#detach(record, child);
     if (record.child === child) record.child = undefined;
     const termination = this.#terminateLifecycle(record, tracked);
@@ -918,10 +1162,38 @@ export class RongCloudWorkerSupervisor {
     return termination;
   }
 
+  #retainTerminationError(lifecycle: ChildLifecycle): void {
+    if (lifecycle.terminationError) return;
+    const sink = (): void => undefined;
+    try {
+      lifecycle.child.on('error', sink);
+      lifecycle.terminationError = sink;
+    } catch {
+      // The operational listener remains until this registration attempt finishes.
+    }
+  }
+
   async #terminateLifecycle(record: WorkerRecord, lifecycle: ChildLifecycle): Promise<boolean> {
     const child = lifecycle.child;
     if (this.#childHasExited(child)) this.#markExited(record, lifecycle);
     if (lifecycle.exited) {
+      this.#releaseLifecycle(record, lifecycle);
+      return true;
+    }
+    let shutdownSent = false;
+    if (child.connected !== false) {
+      try {
+        const shutdown = parseWorkerCommand({ type: 'shutdown' });
+        if (shutdown.ok) {
+          child.send(shutdown.value);
+          shutdownSent = true;
+        }
+      } catch {
+        // Continue to the fixed process-termination sequence.
+      }
+    }
+    if (shutdownSent
+      && (lifecycle.exited || await this.#waitForExit(lifecycle, this.#shutdownGraceMs))) {
       this.#releaseLifecycle(record, lifecycle);
       return true;
     }
@@ -1027,6 +1299,7 @@ export class RongCloudWorkerSupervisor {
 
   async #removeRecord(record: WorkerRecord): Promise<void> {
     record.desired = false;
+    record.generation += 1;
     record.removeWhenReaped = true;
     this.#cancelLifecycleTimers(record);
     this.#rejectPending(record, 'worker_exited');
@@ -1039,16 +1312,28 @@ export class RongCloudWorkerSupervisor {
       reaped &&
       record.removeWhenReaped &&
       !record.desired &&
+      !record.spawnAttempt &&
+      !record.credentialLookup &&
       this.#records.get(record.key) === record
     ) {
       this.#records.delete(record.key);
     }
+    if (!reaped) throw failure('worker_exited');
+  }
+
+  #deleteDormantRecord(record: WorkerRecord): void {
+    if (record.removeWhenReaped && !record.desired && !record.child && !record.lifecycle
+      && !record.spawnAttempt && !record.credentialLookup
+      && this.#records.get(record.key) === record) this.#records.delete(record.key);
+  }
+
+  #ownsGeneration(record: WorkerRecord, generation: number): boolean {
+    return !this.#disposed && record.desired && this.#records.get(record.key) === record
+      && record.generation === generation && record.failedGeneration !== generation;
   }
 
   #isCurrent(record: WorkerRecord, child: WorkerChild, generation: number): boolean {
-    return !this.#disposed && record.desired && this.#records.get(record.key) === record
-      && record.child === child && record.generation === generation
-      && record.failedGeneration !== generation;
+    return this.#ownsGeneration(record, generation) && record.child === child;
   }
 
   #schedule(callback: () => void, milliseconds: number): TimerSchedule {

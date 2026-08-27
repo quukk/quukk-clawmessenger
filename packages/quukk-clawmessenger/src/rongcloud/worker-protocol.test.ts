@@ -123,7 +123,7 @@ describe('parent-to-child IPC', () => {
     }
   });
 
-  it('accepts normalized receipts, bounded chatroom joins, and disconnects', () => {
+  it('accepts normalized receipts, bounded chatroom joins, disconnects, and strict shutdown', () => {
     expect(api().parseWorkerCommand({
       type: 'receipt',
       requestId,
@@ -153,6 +153,11 @@ describe('parent-to-child IPC', () => {
       ok: true,
       value: { type: 'disconnect', requestId },
     });
+    expect(api().parseWorkerCommand({ type: 'shutdown' })).toEqual({
+      ok: true,
+      value: { type: 'shutdown' },
+    });
+    expectRejected(api().parseWorkerCommand({ type: 'shutdown', requestId }));
   });
 
   it('requires a token only on successful refresh results', () => {

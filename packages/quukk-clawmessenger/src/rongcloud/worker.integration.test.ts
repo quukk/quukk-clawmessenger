@@ -64,6 +64,7 @@ type PolyfillModule = {
   MAX_XHR_RESPONSE_BYTES: number;
   NodeXMLHttpRequest: new () => XMLHttpRequestLike;
   installWorkerPolyfills(storageDir: string): () => void;
+  directoryFsyncErrorIsIgnorable(platform: NodeJS.Platform, error: unknown): boolean;
 };
 
 let workerModule: WorkerModule | undefined;
@@ -146,6 +147,7 @@ class FakeSdk {
   readonly Events = {
     CONNECTING: 'CONNECTING',
     CONNECTED: 'CONNECTED',
+    SUSPEND: 'SUSPEND',
     DISCONNECT: 'DISCONNECT',
     MESSAGES: 'MESSAGES',
   };
@@ -481,6 +483,14 @@ describe('worker browser polyfills', () => {
       .toThrowError('worker_storage_invalid');
   });
 
+  it('propagates POSIX directory fsync failures except explicitly unsupported operations', () => {
+    const classify = polyfillsApi().directoryFsyncErrorIsIgnorable;
+    expect(classify('linux', Object.assign(new Error('denied'), { code: 'EACCES' }))).toBe(false);
+    expect(classify('linux', Object.assign(new Error('unsupported'), { code: 'EINVAL' }))).toBe(true);
+    expect(classify('darwin', Object.assign(new Error('unsupported'), { code: 'ENOTSUP' }))).toBe(true);
+    expect(classify('win32', Object.assign(new Error('denied'), { code: 'EACCES' }))).toBe(true);
+  });
+
   it('implements bounded HTTP-only XMLHttpRequest with normalized headers and abort cleanup', async () => {
     const { NodeXMLHttpRequest: Xhr, MAX_XHR_RESPONSE_BYTES } = polyfillsApi();
     const server = createServer((request, response) => {
@@ -609,6 +619,62 @@ describe('worker browser polyfills', () => {
 });
 
 describe('injected worker runtime', () => {
+  it('gracefully shuts down before init and after online without leaking timers or SDK resources', async () => {
+    const preInit = createRuntime();
+    preInit.port.emit('message', { type: 'shutdown' });
+    await flush();
+    expect(preInit.exits).toEqual([0]);
+    expect(preInit.timers.pending.size).toBe(0);
+
+    const online = createRuntime();
+    await initialize(online);
+    online.port.emit('message', { type: 'shutdown' });
+    await flush();
+    expect(online.sdk.disconnectCalls).toBe(1);
+    expect(online.sdk.destroyCalls).toBe(1);
+    expect(online.exits).toEqual([0]);
+    expect(online.timers.pending.size).toBe(0);
+    expect([...online.port.listeners.values()].every((listeners) => listeners.size === 0)).toBe(true);
+  });
+
+  it('bounds graceful shutdown when the online SDK disconnect never settles', async () => {
+    const sdk = new FakeSdk();
+    sdk.disconnectImpl = () => new Promise(() => undefined);
+    const fixture = createRuntime({ sdk });
+    await initialize(fixture);
+    fixture.port.emit('message', { type: 'shutdown' });
+    await flush();
+    expect(fixture.exits).toEqual([]);
+    fixture.timers.run(workerApi().WORKER_CLEANUP_TIMEOUT_MS);
+    await flush();
+    expect(fixture.exits).toEqual([0]);
+    expect(fixture.timers.pending.size).toBe(0);
+  });
+
+  it('survives SUSPEND auto-reconnect but exits on terminal DISCONNECT', async () => {
+    const fixture = createRuntime();
+    await initialize(fixture);
+    fixture.sdk.emit('SUSPEND', undefined);
+    await flush();
+    expect(fixture.port.sent).toContainEqual({
+      type: 'connection', runtimeId, instanceId, state: 'offline',
+    });
+    expect(fixture.exits).toEqual([]);
+    fixture.sdk.emit('CONNECTED', undefined);
+    await flush();
+    expect(fixture.port.sent.filter((event) =>
+      (event as { type?: string; state?: string }).type === 'connection'
+      && (event as { state?: string }).state === 'online')).toHaveLength(2);
+
+    fixture.sdk.emit('DISCONNECT', 31004);
+    await flush();
+    expect(fixture.port.sent).toContainEqual({
+      type: 'connection', runtimeId, instanceId, state: 'auth_error',
+    });
+    expect(fixture.exits).toEqual([1]);
+    expect(fixture.timers.pending.size).toBe(0);
+  });
+
   it('does not load worker dependencies until init supplies the binding storage directory', async () => {
     const port = new FakePort();
     const sdk = new FakeSdk();
@@ -825,6 +891,7 @@ describe('real child-process supervisor boundary', () => {
       "    send({ type: 'connection', ...identity, state: 'online' });",
       '    return;',
       '  }',
+      "  if (command.type === 'shutdown') { process.exitCode = 0; process.disconnect(); return; }",
       "  if (!identity || typeof command.requestId !== 'string') { process.exitCode = 92; process.disconnect(); return; }",
       "  if (command.type === 'send' && command.content === 'hang') {",
       "    send({ type: 'connection', ...identity, state: 'connecting' });",
@@ -866,19 +933,21 @@ describe('real child-process supervisor boundary', () => {
     };
     const firstToken = 'PHASE_E_TOKEN_SENTINEL_FIRST';
     const secondToken = 'PHASE_E_TOKEN_SENTINEL_SECOND';
+    const storageRoot = join(testDirectory, 'workers');
+    await mkdir(storageRoot);
     const first: SupervisorBinding = {
       runtimeId: 'rt_11111111111111111111111111111111',
       nodeId: 'real-child-one',
       enabled: true,
       tokenRef: 'rc_11111111111111111111111111111111',
-      storageDir: join(testDirectory, 'storage-one'),
+      storageDir: join(storageRoot, 'rt_11111111111111111111111111111111'),
     };
     const second: SupervisorBinding = {
       runtimeId: 'rt_22222222222222222222222222222222',
       nodeId: 'real-child-two',
       enabled: true,
       tokenRef: 'rc_22222222222222222222222222222222',
-      storageDir: join(testDirectory, 'storage-two'),
+      storageDir: join(storageRoot, 'rt_22222222222222222222222222222222'),
     };
     const credentials = new Map([[first.nodeId, firstToken], [second.nodeId, secondToken]]);
     const parentEnv: NodeJS.ProcessEnv = process.platform === 'win32'
@@ -902,6 +971,7 @@ describe('real child-process supervisor boundary', () => {
           HOME: '/home/must-not-reach-child',
         };
     const supervisor = new RongCloudWorkerSupervisor({
+      storageRoot,
       workerEntryPath: childEntry,
       processEnv: parentEnv,
       platform: process.platform,
@@ -949,10 +1019,10 @@ describe('real child-process supervisor boundary', () => {
       expect(children).toHaveLength(2);
       expect(new Set(children.map(({ pid }) => pid)).size).toBe(2);
       expect(order.slice(0, 4)).toEqual([
-        expect.stringMatching(/^spawn:/u),
         'credential:' + first.nodeId,
-        expect.stringMatching(/^spawn:/u),
         'credential:' + second.nodeId,
+        expect.stringMatching(/^spawn:/u),
+        expect.stringMatching(/^spawn:/u),
       ]);
       const spawnMaterial = JSON.stringify(spawnAudit);
       expect(spawnMaterial).not.toMatch(/PHASE_E_TOKEN_SENTINEL|CLAW_TOKEN|NODE_TLS_REJECT_UNAUTHORIZED/u);

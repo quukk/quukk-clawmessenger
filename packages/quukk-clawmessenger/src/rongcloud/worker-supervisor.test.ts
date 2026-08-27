@@ -1,6 +1,10 @@
 // @vitest-environment node
 
-import { beforeAll, describe, expect, it } from 'vitest';
+import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join, parse, relative, resolve } from 'node:path';
+
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { parseWorkerCommand } from './worker-protocol.js';
 
@@ -36,11 +40,18 @@ type SupervisorModule = {
 };
 
 let supervisorModule: SupervisorModule | undefined;
+const configuredTaskTemp = resolve(tmpdir());
+let unitStorageRoot = '';
 
 beforeAll(async () => {
+  unitStorageRoot = await mkdtemp(join(configuredTaskTemp, 'quukk-task9-supervisor-unit-'));
   supervisorModule = await import('./worker-supervisor.js')
     .then((module) => module as unknown as SupervisorModule)
     .catch(() => undefined);
+});
+
+afterAll(async () => {
+  if (unitStorageRoot) await rm(unitStorageRoot, { recursive: true, force: true });
 });
 
 function supervisorApi(): SupervisorModule {
@@ -50,6 +61,16 @@ function supervisorApi(): SupervisorModule {
 
 async function flush(): Promise<void> {
   for (let index = 0; index < 16; index += 1) await Promise.resolve();
+}
+
+function deferred<T>() {
+  let resolvePromise!: (value: T) => void;
+  let rejectPromise!: (error: unknown) => void;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
 
 type ChildEvent = 'message' | 'exit' | 'error' | 'disconnect';
@@ -65,6 +86,8 @@ class FakeChild {
   disconnectCalls = 0;
   exitOnSigterm = true;
   exitOnSigkill = true;
+  exitOnShutdown = true;
+  readonly shutdownErrorListenerCounts: number[] = [];
   readonly killSignals: Array<string | number> = [];
 
   constructor(readonly pid: number, readonly recordSend: (message: unknown) => void) {}
@@ -87,10 +110,14 @@ class FakeChild {
     const detached = structuredClone(message);
     this.sent.push(detached);
     this.recordSend(detached);
+    if ((detached as { type?: string }).type === 'shutdown') {
+      this.shutdownErrorListenerCounts.push(this.listeners.get('error')?.size ?? 0);
+      if (this.exitOnShutdown) this.reap(0, null);
+    }
     return true;
   }
 
-  kill(signal = 'SIGTERM'): boolean {
+  kill(signal: NodeJS.Signals | number = 'SIGTERM'): boolean {
     this.killCalls += 1;
     this.killSignals.push(signal);
     if (!this.alive) return false;
@@ -239,12 +266,13 @@ function hex(index: number): string {
 }
 
 function binding(index: number, overrides: Partial<SupervisorBinding> = {}): SupervisorBinding {
+  const runtimeId = `rt_${hex(index + 1)}`;
   return {
-    runtimeId: `rt_${hex(index + 1)}`,
+    runtimeId,
     nodeId: `node-${index + 1}`,
     enabled: true,
     tokenRef: `rc_${hex(index + 101)}`,
-    storageDir: `D:\\worker-storage\\${index + 1}`,
+    storageDir: join(unitStorageRoot, runtimeId),
     ...overrides,
   };
 }
@@ -275,6 +303,7 @@ function createFixture(overrides: Record<string, unknown> = {}) {
     spawnChild: spawn.spawn,
     processEnv: hostileParentEnv,
     platform: 'win32',
+    storageRoot: unitStorageRoot,
     resolveCredential: async (value: SupervisorBinding) => {
       resolved.push(structuredClone(value));
       return credential(value);
@@ -301,7 +330,7 @@ function createFixture(overrides: Record<string, unknown> = {}) {
 }
 
 function initFor(child: FakeChild): {
-  binding: { runtimeId: string; nodeId: string };
+  binding: { runtimeId: string; nodeId: string; storageDir: string };
   token: string;
 } {
   const command = child.sent.find((value) => (value as { type?: string }).type === 'init');
@@ -309,7 +338,7 @@ function initFor(child: FakeChild): {
   const parsed = parseWorkerCommand(command);
   expect(parsed.ok).toBe(true);
   return command as {
-    binding: { runtimeId: string; nodeId: string };
+    binding: { runtimeId: string; nodeId: string; storageDir: string };
     token: string;
   };
 }
@@ -368,12 +397,122 @@ describe('RongCloud worker supervisor', () => {
 
     const fixture = createFixture();
     const sharedRuntime = `rt_${hex(90)}`;
+    const sharedStorageDir = join(unitStorageRoot, sharedRuntime);
     await fixture.supervisor.reconcile([
-      binding(0, { runtimeId: sharedRuntime, nodeId: 'node-a' }),
-      binding(1, { runtimeId: sharedRuntime, nodeId: 'node-b' }),
+      binding(0, { runtimeId: sharedRuntime, nodeId: 'node-a', storageDir: sharedStorageDir }),
+      binding(1, { runtimeId: sharedRuntime, nodeId: 'node-b', storageDir: sharedStorageDir }),
     ]);
     expect(fixture.spawn.calls).toHaveLength(2);
     expect(new Set(fixture.spawn.calls.map((call) => call.child.pid)).size).toBe(2);
+  });
+
+  it('confines every binding to one canonical direct child of the trusted storage root', async () => {
+    const testRoot = await mkdtemp(join(configuredTaskTemp, 'quukk-task9-supervisor-storage-'));
+    const storageRoot = join(testRoot, 'workers');
+    const outside = join(testRoot, 'outside');
+    await Promise.all([mkdir(storageRoot), mkdir(outside)]);
+    const fixtures: ReturnType<typeof createFixture>[] = [];
+    try {
+      const valid = binding(40);
+      const expectedStorageDir = join(storageRoot, valid.runtimeId);
+      valid.storageDir = process.platform === 'win32'
+        ? expectedStorageDir.toUpperCase()
+        : expectedStorageDir;
+      const validFixture = createFixture({ storageRoot });
+      fixtures.push(validFixture);
+      await validFixture.supervisor.reconcile([valid]);
+      const initializedStorageDir = initFor(validFixture.spawn.calls[0]!.child).binding.storageDir;
+      const canonicalStorageRoot = await realpath(storageRoot);
+      expect(process.platform === 'win32' ? initializedStorageDir.toLowerCase() : initializedStorageDir)
+        .toBe(process.platform === 'win32'
+          ? resolve(canonicalStorageRoot, valid.runtimeId).toLowerCase()
+          : resolve(canonicalStorageRoot, valid.runtimeId));
+
+      const invalidBindings = [
+        binding(41, { storageDir: storageRoot }),
+        binding(42, { storageDir: join(testRoot, 'sibling', `rt_${hex(43)}`) }),
+        binding(43, { storageDir: join(storageRoot, `rt_${hex(44)}`, '..') }),
+        binding(44, { runtimeId: '../escape', storageDir: join(storageRoot, 'escape') }),
+      ];
+      for (const invalid of invalidBindings) {
+        const fixture = createFixture({ storageRoot });
+        fixtures.push(fixture);
+        await expect(fixture.supervisor.reconcile([invalid])).rejects.toMatchObject({ code: 'invalid_request' });
+        expect(fixture.spawn.calls).toHaveLength(0);
+      }
+
+      const linked = binding(45);
+      linked.storageDir = join(storageRoot, linked.runtimeId);
+      await symlink(outside, linked.storageDir, process.platform === 'win32' ? 'junction' : 'dir');
+      const linkFixture = createFixture({ storageRoot });
+      fixtures.push(linkFixture);
+      await expect(linkFixture.supervisor.reconcile([linked])).rejects.toMatchObject({ code: 'invalid_request' });
+      expect(linkFixture.spawn.calls).toHaveLength(0);
+
+      const filesystemRoot = parse(configuredTaskTemp).root;
+      expect(() => createFixture({ storageRoot: filesystemRoot })).toThrowError(
+        expect.objectContaining({ code: 'invalid_request' }),
+      );
+    } finally {
+      await Promise.allSettled(fixtures.map(({ supervisor }) => supervisor.dispose()));
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('canonicalizes a trusted short-path alias while still checking the actual path for reparses', async () => {
+    const aliasRoot = await mkdtemp(join(configuredTaskTemp, 'quukk-task9-supervisor-alias-'));
+    const expandedRoot = `${aliasRoot}-expanded`;
+    await mkdir(expandedRoot);
+    const actualFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const canonicalExpandedRoot = actualFs.realpathSync.native(expandedRoot);
+    const mockedRealpath = Object.assign(
+      (path: Parameters<typeof actualFs.realpathSync>[0]) => actualFs.realpathSync(path),
+      {
+        native: (path: Parameters<typeof actualFs.realpathSync.native>[0]) => {
+          const requested = resolve(String(path));
+          const aliasChild = relative(aliasRoot, requested);
+          if (aliasChild === '') return canonicalExpandedRoot;
+          if (!aliasChild.startsWith('..') && !isAbsolute(aliasChild)) {
+            return join(canonicalExpandedRoot, aliasChild);
+          }
+          const canonicalChild = relative(canonicalExpandedRoot, requested);
+          if (!canonicalChild.startsWith('..') && !isAbsolute(canonicalChild)) return requested;
+          return actualFs.realpathSync.native(path);
+        },
+      },
+    );
+    vi.resetModules();
+    vi.doMock('node:fs', () => ({ ...actualFs, realpathSync: mockedRealpath }));
+    try {
+      const isolated = await import('./worker-supervisor.js');
+      const spawn = new SpawnHarness();
+      const supervisor = new isolated.RongCloudWorkerSupervisor({
+        storageRoot: aliasRoot,
+        workerEntryPath,
+        spawnChild: (modulePath, args, options) => spawn.spawn(
+          modulePath,
+          args,
+          options as unknown as Record<string, unknown>,
+        ),
+        resolveCredential: async () => ({ appKey: 'unused', token: 'unused' }),
+        refreshCredential: async () => 'unused',
+      });
+      const value = binding(46, { storageDir: join(aliasRoot, `rt_${hex(47)}`) });
+      await supervisor.reconcile([value]);
+      expect(spawn.calls).toHaveLength(1);
+      expect(initFor(spawn.calls[0]!.child).binding.storageDir)
+        .toBe(resolve(canonicalExpandedRoot, value.runtimeId));
+      const sibling = binding(47, { storageDir: join(configuredTaskTemp, `rt_${hex(48)}`) });
+      await expect(supervisor.reconcile([sibling])).rejects.toMatchObject({ code: 'invalid_request' });
+      await expect(supervisor.dispose()).resolves.toBeUndefined();
+    } finally {
+      vi.doUnmock('node:fs');
+      vi.resetModules();
+      await Promise.all([
+        rm(aliasRoot, { recursive: true, force: true }),
+        rm(expandedRoot, { recursive: true, force: true }),
+      ]);
+    }
   });
 
   it('spawns four complete bindings as four children with minimal env and credentials only in post-spawn IPC', async () => {
@@ -431,6 +570,181 @@ describe('RongCloud worker supervisor', () => {
       item.runtimeId, item.nodeId, item.storageDir, item.tokenRef,
       credential(item).appKey, credential(item).token, credential(item).serverUrl,
     ])) expect(spawnMaterial).not.toContain(value);
+  });
+
+  it('bounds one never-resolving credential lookup before spawn and leaves a healthy sibling usable', async () => {
+    const pending = deferred<{ appKey: string; token: string }>();
+    const credentialTimeoutMs = 7;
+    const values = [binding(0), binding(1)];
+    let blockedCalls = 0;
+    const fixture = createFixture({
+      credentialTimeoutMs,
+      resolveCredential: (value: SupervisorBinding) => {
+        if (value.nodeId === values[0]!.nodeId) {
+          blockedCalls += 1;
+          return pending.promise;
+        }
+        return Promise.resolve(credential(value));
+      },
+    });
+    const reconciled = track(fixture.supervisor.reconcile(values));
+    await flush();
+    expect(fixture.spawn.calls).toHaveLength(1);
+    expect(initFor(fixture.spawn.calls[0]!.child).binding.nodeId).toBe(values[1]!.nodeId);
+    await activate(fixture.spawn.calls[0]!.child);
+
+    fixture.timers.advance(credentialTimeoutMs);
+    await flush();
+    expect(await reconciled.outcome).toMatchObject({ ok: false, error: { code: 'timeout' } });
+    expect(fixture.supervisor.snapshots()).toContainEqual(expect.objectContaining({
+      runtimeId: values[0]!.runtimeId, state: 'backoff',
+    }));
+    expect(fixture.spawn.calls[0]!.child.alive).toBe(true);
+
+    await expect(fixture.supervisor.reconcile(values)).rejects.toMatchObject({ code: 'timeout' });
+    expect(blockedCalls).toBe(1);
+    expect(fixture.spawn.calls).toHaveLength(1);
+
+    pending.resolve(credential(values[0]!));
+    await flush();
+    expect(fixture.spawn.calls).toHaveLength(1);
+
+    await fixture.supervisor.reconcile(values);
+    expect(blockedCalls).toBe(2);
+    expect(fixture.spawn.calls).toHaveLength(2);
+    expect(initFor(fixture.spawn.calls[1]!.child).binding.nodeId).toBe(values[0]!.nodeId);
+  });
+
+  it('fences an old credential lookup before spawning after a token reference change', async () => {
+    const oldCredential = deferred<{ appKey: string; token: string }>();
+    const value = binding(0);
+    const changed = { ...value, tokenRef: `rc_${hex(998)}` };
+    let lookups = 0;
+    const fixture = createFixture({
+      resolveCredential: (current: SupervisorBinding) => {
+        lookups += 1;
+        return lookups === 1
+          ? oldCredential.promise
+          : Promise.resolve({ appKey: 'new-app-key', token: `new-token-${current.tokenRef}` });
+      },
+    });
+    const original = track(fixture.supervisor.reconcile([value]));
+    await flush();
+    const replacement = track(fixture.supervisor.reconcile([changed]));
+    await flush();
+    expect(fixture.spawn.calls).toHaveLength(0);
+
+    oldCredential.resolve({ appKey: 'old-app-key', token: 'old-token' });
+    expect((await original.outcome).ok).toBe(true);
+    expect((await replacement.outcome).ok).toBe(true);
+    expect(lookups).toBe(2);
+    expect(fixture.spawn.calls).toHaveLength(1);
+    expect(initFor(fixture.spawn.calls[0]!.child).token).toBe(`new-token-${changed.tokenRef}`);
+  });
+
+  it('never combines an earlier restart credential with a later token-reference binding', async () => {
+    const value = binding(0);
+    const second = { ...value, tokenRef: `rc_${hex(997)}` };
+    const latest = { ...value, tokenRef: `rc_${hex(998)}` };
+    const secondCredential = deferred<{ appKey: string; token: string }>();
+    let lookups = 0;
+    const fixture = createFixture({
+      resolveCredential: (current: SupervisorBinding) => {
+        lookups += 1;
+        if (current.tokenRef === second.tokenRef) return secondCredential.promise;
+        return Promise.resolve({ appKey: `app-${current.tokenRef}`, token: `token-${current.tokenRef}` });
+      },
+    });
+    await fixture.supervisor.reconcile([value]);
+    const replacing = track(fixture.supervisor.reconcile([second]));
+    await flush();
+    expect(lookups).toBe(2);
+    expect(fixture.spawn.calls).toHaveLength(1);
+
+    const latestReconcile = track(fixture.supervisor.reconcile([latest]));
+    secondCredential.resolve({ appKey: 'stale-app', token: 'stale-token' });
+    expect((await replacing.outcome).ok).toBe(true);
+    expect((await latestReconcile.outcome).ok).toBe(true);
+    expect(lookups).toBe(3);
+    expect(fixture.spawn.calls).toHaveLength(2);
+    expect(initFor(fixture.spawn.calls[1]!.child)).toMatchObject({
+      binding: { runtimeId: value.runtimeId, nodeId: value.nodeId },
+      token: `token-${latest.tokenRef}`,
+    });
+  });
+
+  it('retains one pending credential lookup across disable and re-add', async () => {
+    const credentialTimeoutMs = 7;
+    const value = binding(0);
+    let lookups = 0;
+    const fixture = createFixture({
+      credentialTimeoutMs,
+      resolveCredential: () => {
+        lookups += 1;
+        return new Promise(() => undefined);
+      },
+    });
+    const original = track(fixture.supervisor.reconcile([value]));
+    await flush();
+    await fixture.supervisor.reconcile([]);
+    const readded = track(fixture.supervisor.reconcile([value]));
+    await flush();
+    expect(lookups).toBe(1);
+    expect(fixture.spawn.calls).toHaveLength(0);
+
+    fixture.timers.advance(credentialTimeoutMs);
+    await flush();
+    expect(await original.outcome).toMatchObject({ ok: false, error: { code: 'timeout' } });
+    expect(await readded.outcome).toMatchObject({ ok: false, error: { code: 'timeout' } });
+    expect(lookups).toBe(1);
+  });
+
+  it('queues same-binding re-add behind a generation-invalidated restart lookup', async () => {
+    const value = binding(0);
+    const changed = { ...value, tokenRef: `rc_${hex(996)}` };
+    const staleCredential = deferred<{ appKey: string; token: string }>();
+    let lookups = 0;
+    const fixture = createFixture({
+      resolveCredential: () => {
+        lookups += 1;
+        if (lookups === 2) return staleCredential.promise;
+        return Promise.resolve({ appKey: `app-${lookups}`, token: `token-${lookups}` });
+      },
+    });
+    await fixture.supervisor.reconcile([value]);
+    const staleRestart = track(fixture.supervisor.reconcile([changed]));
+    await flush();
+    expect(lookups).toBe(2);
+    expect(fixture.spawn.calls).toHaveLength(1);
+
+    await fixture.supervisor.reconcile([]);
+    const readded = track(fixture.supervisor.reconcile([changed]));
+    staleCredential.resolve({ appKey: 'stale-app', token: 'stale-token' });
+    expect((await staleRestart.outcome).ok).toBe(true);
+    expect((await readded.outcome).ok).toBe(true);
+    expect(lookups).toBe(3);
+    expect(fixture.spawn.calls).toHaveLength(2);
+    expect(initFor(fixture.spawn.calls[1]!.child).token).toBe('token-3');
+  });
+
+  it('settles a pending credential deadline when the supervisor is disposed', async () => {
+    const value = binding(0);
+    const fixture = createFixture({
+      credentialTimeoutMs: 7,
+      resolveCredential: () => new Promise(() => undefined),
+    });
+    const reconciled = track(fixture.supervisor.reconcile([value]));
+    await flush();
+    expect(fixture.timers.pendingDelays()).toEqual([7]);
+
+    await fixture.supervisor.dispose();
+    await flush();
+    expect(fixture.timers.pendingDelays()).toEqual([]);
+    expect(await reconciled.outcome).toMatchObject({
+      ok: false,
+      error: { code: 'worker_exited' },
+    });
+    expect(fixture.spawn.calls).toHaveLength(0);
   });
 
   it('buffers until one matching ready-then-online sequence and only then routes commands and events', async () => {
@@ -520,6 +834,61 @@ describe('RongCloud worker supervisor', () => {
     expect(fixture.spawn.calls).toHaveLength(3);
   });
 
+  it('rearms one generation online deadline during auto-reconnect and drains only after recovery', async () => {
+    const onlineTimeoutMs = 13;
+    const fixture = createFixture({ onlineTimeoutMs });
+    const values = [binding(0), binding(1)];
+    await fixture.supervisor.reconcile(values);
+    const first = fixture.spawn.calls[0]!.child;
+    const sibling = fixture.spawn.calls[1]!.child;
+    const firstInstance = await activate(first);
+    await activate(sibling);
+    first.exitOnShutdown = true;
+
+    first.emitMessage({
+      type: 'connection', runtimeId: values[0]!.runtimeId, instanceId: firstInstance, state: 'offline',
+    });
+    first.emitMessage({
+      type: 'connection', runtimeId: values[0]!.runtimeId, instanceId: firstInstance, state: 'connecting',
+    });
+    await flush();
+    expect(fixture.timers.pendingDelays()).toContain(onlineTimeoutMs);
+    const pending = fixture.supervisor.send(identity(values[0]!), {
+      conversationType: 1, targetId: 'target', messageType: 'text', content: 'after-reconnect',
+    });
+    await flush();
+    expect(workerCommands(first)).toEqual([]);
+
+    first.emitMessage({
+      type: 'connection', runtimeId: values[0]!.runtimeId, instanceId: firstInstance, state: 'online',
+    });
+    first.emitMessage({
+      type: 'connection', runtimeId: values[0]!.runtimeId, instanceId: firstInstance, state: 'online',
+    });
+    await flush();
+    const command = workerCommands(first)[0]!;
+    expect(command).toMatchObject({ type: 'send', content: 'after-reconnect' });
+    expect(fixture.events.filter(({ identity: eventIdentity, event }) =>
+      eventIdentity.runtimeId === values[0]!.runtimeId && event.type === 'connection'
+      && event.state === 'online')).toHaveLength(2);
+    first.emitMessage({
+      type: 'result', runtimeId: values[0]!.runtimeId, instanceId: firstInstance,
+      requestId: command.requestId, ok: true, messageUid: 'reconnected-uid',
+    });
+    await expect(pending).resolves.toBe('reconnected-uid');
+
+    first.emitMessage({
+      type: 'connection', runtimeId: values[0]!.runtimeId, instanceId: firstInstance, state: 'offline',
+    });
+    fixture.timers.advance(onlineTimeoutMs);
+    await flush();
+    expect(first.alive).toBe(false);
+    expect(sibling.alive).toBe(true);
+    expect(fixture.supervisor.snapshots()).toContainEqual(expect.objectContaining({
+      runtimeId: values[0]!.runtimeId, state: 'backoff',
+    }));
+  });
+
   it('fences wrong identities, duplicate ready, malformed IPC, and stale-generation handlers to one worker', async () => {
     const fixture = createFixture();
     const first = binding(0);
@@ -538,7 +907,8 @@ describe('RongCloud worker supervisor', () => {
 
     oldChild.emitMessage({ type: 'ready', runtimeId: first.runtimeId, instanceId: oldInstance });
     await flush();
-    expect(oldChild.killCalls).toBe(1);
+    expect(oldChild.killCalls).toBe(0);
+    expect(oldChild.sent).toContainEqual({ type: 'shutdown' });
     expect(sibling.killCalls).toBe(0);
     expect(fixture.timers.pendingDelays()).toContain(restartBaseMs);
     fixture.timers.advance(restartBaseMs);
@@ -555,7 +925,8 @@ describe('RongCloud worker supervisor', () => {
 
     replacement.emitMessage({ type: 'not-a-worker-event', secret: 'PHASE_D_MALFORMED_SENTINEL' });
     await flush();
-    expect(replacement.killCalls).toBe(1);
+    expect(replacement.killCalls).toBe(0);
+    expect(replacement.sent).toContainEqual({ type: 'shutdown' });
     expect(sibling.connected).toBe(true);
 
     fixture.timers.advance(restartBaseMs * 2);
@@ -593,7 +964,8 @@ describe('RongCloud worker supervisor', () => {
     child.emitStaleMessage(0, request);
     await flush();
     expect(fixture.refreshed).toHaveLength(1);
-    expect(child.killCalls).toBe(1);
+    expect(child.killCalls).toBe(0);
+    expect(child.sent).toContainEqual({ type: 'shutdown' });
     expect(workerCommands(child).filter(({ type }) => type === 'refresh_result')).toHaveLength(1);
 
     fixture.timers.advance(restartBaseMs);
@@ -762,8 +1134,13 @@ describe('RongCloud worker supervisor', () => {
     expect(fixture.timers.pendingDelays()).toEqual([restartBaseMs]);
     expect(fixture.supervisor.snapshots()[0]).toMatchObject({ restartCount: 1, state: 'backoff' });
 
+    let requestSchedules = 0;
     const timerFailure = createFixture({
-      setTimeout: () => { throw new Error('PHASE_D_TIMER_FAILURE_SENTINEL'); },
+      setTimeout: () => {
+        requestSchedules += 1;
+        if (requestSchedules <= 2) return 80_000 + requestSchedules;
+        throw new Error('PHASE_D_TIMER_FAILURE_SENTINEL');
+      },
     });
     const timerBinding = binding(8);
     await timerFailure.supervisor.reconcile([timerBinding]);
@@ -808,17 +1185,61 @@ describe('RongCloud worker supervisor', () => {
     expect(fixture.supervisor.snapshots()).toEqual([]);
   });
 
+  it('offers bounded graceful shutdown before IPC disconnect and contains it to the target worker', async () => {
+    const shutdownGraceMs = 9;
+    const fixture = createFixture({ shutdownGraceMs, terminateGraceMs: 10, killGraceMs: 20 });
+    const values = [binding(0), binding(1), binding(2)];
+    await fixture.supervisor.reconcile(values);
+    const [preInit, onlineHung, sibling] = fixture.spawn.calls.map(({ child }) => child);
+    preInit!.exitOnShutdown = true;
+    onlineHung!.exitOnShutdown = false;
+    await activate(onlineHung!);
+    await activate(sibling!);
+
+    await expect(fixture.supervisor.stop(identity(values[0]!))).resolves.toBeUndefined();
+    expect(preInit!.sent).toContainEqual({ type: 'shutdown' });
+    expect(preInit!.shutdownErrorListenerCounts).toEqual([1]);
+    expect(preInit!.disconnectCalls).toBe(0);
+    expect(preInit!.killSignals).toEqual([]);
+    expect(preInit!.listeners.get('error')?.size ?? 0).toBe(0);
+
+    const stopped = track(fixture.supervisor.stop(identity(values[1]!)));
+    await flush();
+    expect(onlineHung!.sent).toContainEqual({ type: 'shutdown' });
+    expect(onlineHung!.shutdownErrorListenerCounts).toEqual([1]);
+    expect(onlineHung!.disconnectCalls).toBe(0);
+    expect(onlineHung!.killSignals).toEqual([]);
+    expect(stopped.settled()).toBe(false);
+    expect(sibling!.alive).toBe(true);
+
+    fixture.timers.advance(shutdownGraceMs - 1);
+    await flush();
+    expect(onlineHung!.disconnectCalls).toBe(0);
+    expect(onlineHung!.killSignals).toEqual([]);
+    fixture.timers.advance(1);
+    await flush();
+    expect(await stopped.outcome).toEqual({ ok: true, value: undefined });
+    expect(onlineHung!.disconnectCalls).toBe(1);
+    expect(onlineHung!.killSignals).toEqual(['SIGTERM']);
+    expect(onlineHung!.listeners.get('error')?.size ?? 0).toBe(0);
+    expect(sibling!.alive).toBe(true);
+  });
+
   it('waits for delayed process exit before stop and global disposal settle', async () => {
-    const fixture = createFixture({ terminateGraceMs: 10, killGraceMs: 20 });
+    const fixture = createFixture({ shutdownGraceMs: 5, terminateGraceMs: 10, killGraceMs: 20 });
     const bindings = [binding(0), binding(1)];
     await fixture.supervisor.reconcile(bindings);
     const [stoppedChild, disposedChild] = fixture.spawn.calls.map(({ child }) => child);
     stoppedChild!.exitOnSigterm = false;
     disposedChild!.exitOnSigterm = false;
+    stoppedChild!.exitOnShutdown = false;
+    disposedChild!.exitOnShutdown = false;
 
     const stopped = track(fixture.supervisor.stop(identity(bindings[0]!)));
     await flush();
     expect(stopped.settled()).toBe(false);
+    fixture.timers.advance(5);
+    await flush();
     expect(stoppedChild!.killSignals).toEqual(['SIGTERM']);
     stoppedChild!.reap();
     await flush();
@@ -830,6 +1251,8 @@ describe('RongCloud worker supervisor', () => {
     const disposed = track(fixture.supervisor.dispose());
     await flush();
     expect(disposed.settled()).toBe(false);
+    fixture.timers.advance(5);
+    await flush();
     expect(disposedChild!.killSignals).toEqual(['SIGTERM']);
     disposedChild!.reap();
     await flush();
@@ -837,12 +1260,27 @@ describe('RongCloud worker supervisor', () => {
     expect(fixture.timers.pendingDelays()).toEqual([]);
   });
 
+  it('coalesces concurrent explicit restarts into one replacement', async () => {
+    const fixture = createFixture();
+    const value = binding(0);
+    await fixture.supervisor.reconcile([value]);
+    await activate(fixture.spawn.calls[0]!.child);
+
+    const first = fixture.supervisor.restart(identity(value));
+    const second = fixture.supervisor.restart(identity(value));
+    await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+    expect(fixture.spawn.calls).toHaveLength(2);
+    expect(fixture.spawn.calls.flatMap(({ child }) => child.sent)
+      .filter((command) => (command as { type?: string }).type === 'shutdown')).toHaveLength(1);
+  });
+
   it('never starts a replacement before delayed exit on restart or credential change', async () => {
-    const fixture = createFixture({ terminateGraceMs: 10, killGraceMs: 20 });
+    const fixture = createFixture({ shutdownGraceMs: 5, terminateGraceMs: 10, killGraceMs: 20 });
     const value = binding(0);
     await fixture.supervisor.reconcile([value]);
     const original = fixture.spawn.calls[0]!.child;
     original.exitOnSigterm = false;
+    original.exitOnShutdown = false;
 
     const changed = { ...value, tokenRef: `rc_${hex(999)}` };
     const reconciled = track(fixture.supervisor.reconcile([changed]));
@@ -859,6 +1297,7 @@ describe('RongCloud worker supervisor', () => {
     expect(credentialReplacement.alive).toBe(true);
 
     credentialReplacement.exitOnSigterm = false;
+    credentialReplacement.exitOnShutdown = false;
     const restarted = track(fixture.supervisor.restart(identity(changed)));
     await flush();
     expect(restarted.settled()).toBe(false);
@@ -871,16 +1310,19 @@ describe('RongCloud worker supervisor', () => {
   });
 
   it('fails explicit restart safely without replacement when KILL is not reaped', async () => {
-    const fixture = createFixture({ terminateGraceMs: 10, killGraceMs: 20 });
+    const fixture = createFixture({ shutdownGraceMs: 5, terminateGraceMs: 10, killGraceMs: 20 });
     const value = binding(0);
     await fixture.supervisor.reconcile([value]);
     const child = fixture.spawn.calls[0]!.child;
     child.exitOnSigterm = false;
     child.exitOnSigkill = false;
+    child.exitOnShutdown = false;
     const restarted = track(fixture.supervisor.restart(identity(value)));
     await flush();
     expect(restarted.settled()).toBe(false);
     expect(fixture.spawn.calls).toHaveLength(1);
+    fixture.timers.advance(5);
+    await flush();
     fixture.timers.advance(10);
     await flush();
     fixture.timers.advance(20);
@@ -896,18 +1338,21 @@ describe('RongCloud worker supervisor', () => {
   });
 
   it('fails credential-change reconcile safely without replacement when KILL is not reaped', async () => {
-    const fixture = createFixture({ terminateGraceMs: 10, killGraceMs: 20 });
+    const fixture = createFixture({ shutdownGraceMs: 5, terminateGraceMs: 10, killGraceMs: 20 });
     const value = binding(0);
     await fixture.supervisor.reconcile([value]);
     const child = fixture.spawn.calls[0]!.child;
     child.exitOnSigterm = false;
     child.exitOnSigkill = false;
+    child.exitOnShutdown = false;
     const changed = track(fixture.supervisor.reconcile([{
       ...value, tokenRef: `rc_${hex(997)}`,
     }]));
     await flush();
     expect(changed.settled()).toBe(false);
     expect(fixture.spawn.calls).toHaveLength(1);
+    fixture.timers.advance(5);
+    await flush();
     fixture.timers.advance(10);
     await flush();
     fixture.timers.advance(20);
@@ -923,15 +1368,18 @@ describe('RongCloud worker supervisor', () => {
   });
 
   it('escalates TERM to KILL with finite deadlines and contains timer failures safely', async () => {
-    const fixture = createFixture({ terminateGraceMs: 10, killGraceMs: 20 });
+    const fixture = createFixture({ shutdownGraceMs: 5, terminateGraceMs: 10, killGraceMs: 20 });
     const value = binding(0);
     await fixture.supervisor.reconcile([value]);
     const child = fixture.spawn.calls[0]!.child;
     child.exitOnSigterm = false;
     child.exitOnSigkill = false;
+    child.exitOnShutdown = false;
     const stopped = track(fixture.supervisor.stop(identity(value)));
     await flush();
     expect(stopped.settled()).toBe(false);
+    fixture.timers.advance(5);
+    await flush();
     expect(child.killSignals).toEqual(['SIGTERM']);
     expect(fixture.timers.pendingDelays()).toEqual([10]);
 
@@ -952,11 +1400,12 @@ describe('RongCloud worker supervisor', () => {
 
     let timerSchedules = 0;
     const timerFailure = createFixture({
+      shutdownGraceMs: 5,
       terminateGraceMs: 10,
       killGraceMs: 20,
       setTimeout: () => {
         timerSchedules += 1;
-        if (timerSchedules === 1) return 99_999;
+        if (timerSchedules <= 2) return 99_999 + timerSchedules;
         throw new Error('PHASE_E_REAP_TIMER_SENTINEL');
       },
     });
@@ -965,6 +1414,7 @@ describe('RongCloud worker supervisor', () => {
     const timerChild = timerFailure.spawn.calls[0]!.child;
     timerChild.exitOnSigterm = false;
     timerChild.exitOnSigkill = false;
+    timerChild.exitOnShutdown = false;
     const timerOutcome = await track(timerFailure.supervisor.stop(identity(timerBinding))).outcome;
     expect(timerOutcome).toMatchObject({ ok: false, error: { code: 'worker_exited' } });
     expect(timerChild.killSignals).toEqual(['SIGTERM', 'SIGKILL']);
@@ -974,15 +1424,18 @@ describe('RongCloud worker supervisor', () => {
   });
 
   it('bounds disposal of an unreaped child and never resurrects it after a late exit', async () => {
-    const fixture = createFixture({ terminateGraceMs: 10, killGraceMs: 20 });
+    const fixture = createFixture({ shutdownGraceMs: 5, terminateGraceMs: 10, killGraceMs: 20 });
     const value = binding(0);
     await fixture.supervisor.reconcile([value]);
     const child = fixture.spawn.calls[0]!.child;
     child.exitOnSigterm = false;
     child.exitOnSigkill = false;
+    child.exitOnShutdown = false;
     const disposed = track(fixture.supervisor.dispose());
     await flush();
     expect(disposed.settled()).toBe(false);
+    fixture.timers.advance(5);
+    await flush();
     fixture.timers.advance(10);
     await flush();
     fixture.timers.advance(20);
@@ -1000,22 +1453,29 @@ describe('RongCloud worker supervisor', () => {
   });
 
   it('retains binding ownership across unreaped removal and permits re-add only after late exit', async () => {
-    const fixture = createFixture({ terminateGraceMs: 10, killGraceMs: 20 });
+    const fixture = createFixture({ shutdownGraceMs: 5, terminateGraceMs: 10, killGraceMs: 20 });
     const value = binding(0);
     await fixture.supervisor.reconcile([value]);
     const child = fixture.spawn.calls[0]!.child;
     child.exitOnSigterm = false;
     child.exitOnSigkill = false;
+    child.exitOnShutdown = false;
     const removed = track(fixture.supervisor.reconcile([]));
     await flush();
     expect(removed.settled()).toBe(false);
+    fixture.timers.advance(5);
+    await flush();
     fixture.timers.advance(10);
     await flush();
     fixture.timers.advance(20);
     await flush();
-    expect(await removed.outcome).toEqual({ ok: true, value: undefined });
+    expect(await removed.outcome).toMatchObject({ ok: false, error: { code: 'worker_exited' } });
     expect(fixture.spawn.calls).toHaveLength(1);
-    expect(fixture.supervisor.snapshots()).toEqual([]);
+    expect(fixture.supervisor.snapshots()).toEqual([expect.objectContaining({
+      runtimeId: value.runtimeId,
+      nodeId: value.nodeId,
+      state: 'stopped',
+    })]);
 
     await expect(fixture.supervisor.reconcile([value])).rejects.toMatchObject({ code: 'worker_exited' });
     expect(fixture.spawn.calls).toHaveLength(1);
@@ -1035,6 +1495,7 @@ describe('RongCloud worker supervisor', () => {
     await fixture.supervisor.reconcile([value]);
     const child = fixture.spawn.calls[0]!.child;
     child.exitOnSigterm = false;
+    child.exitOnShutdown = false;
 
     const removed = track(fixture.supervisor.reconcile([]));
     await flush();
@@ -1064,7 +1525,7 @@ describe('RongCloud worker supervisor', () => {
     await flush();
     expect(child.killCalls).toBeLessThanOrEqual(1);
     expect(fixture.timers.pendingDelays()).toEqual([restartBaseMs]);
-    expect(fixture.timers.scheduled).toEqual([20_000, restartBaseMs]);
+    expect(fixture.timers.scheduled).toEqual([15_000, 20_000, restartBaseMs]);
     expect(fixture.supervisor.snapshots()[0]).toMatchObject({ state: 'backoff', restartCount: 1 });
   });
 

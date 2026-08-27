@@ -143,6 +143,10 @@ class Runtime implements WorkerRuntime {
       return;
     }
     const command = parsed.value;
+    if (command.type === 'shutdown') {
+      await this.#close(0, true);
+      return;
+    }
     if (command.type === 'refresh_result') {
       if (!this.#resolveRefresh(command)) await this.#close(1, true);
       return;
@@ -188,6 +192,9 @@ class Runtime implements WorkerRuntime {
       refreshToken: () => this.#requestRefresh(),
       onConnection: (state) => {
         if (!this.#closingStarted) this.#emit({ type: 'connection', ...this.#identity(), state });
+      },
+      onTerminalDisconnect: () => {
+        if (!this.#closingStarted) void this.#close(1, true);
       },
       onMessage: (message) => {
         if (!this.#closingStarted) this.#emit({ type: 'message', ...this.#identity(), message });
@@ -239,7 +246,7 @@ class Runtime implements WorkerRuntime {
     return true;
   }
 
-  #runRequest(command: Exclude<WorkerCommand, { type: 'init' | 'refresh_result' }>): void {
+  #runRequest(command: Exclude<WorkerCommand, { type: 'init' | 'refresh_result' | 'shutdown' }>): void {
     if (this.#pendingRequests.has(command.requestId)) {
       this.#emitFailure(command.requestId, 'invalid_request');
       return;
@@ -270,7 +277,7 @@ class Runtime implements WorkerRuntime {
   }
 
   async #operation(
-    command: Exclude<WorkerCommand, { type: 'init' | 'refresh_result' }>,
+    command: Exclude<WorkerCommand, { type: 'init' | 'refresh_result' | 'shutdown' }>,
     signal: AbortSignal,
   ): Promise<string | undefined> {
     const client = this.#client!;
@@ -428,7 +435,9 @@ function fixedErrorCode(error: unknown, fallback: WorkerErrorCode): WorkerErrorC
   return parsed.success ? parsed.data : fallback;
 }
 
-function fallbackCode(command: Exclude<WorkerCommand, { type: 'init' | 'refresh_result' }>['type']): WorkerErrorCode {
+function fallbackCode(
+  command: Exclude<WorkerCommand, { type: 'init' | 'refresh_result' | 'shutdown' }>['type'],
+): WorkerErrorCode {
   switch (command) {
     case 'send': return 'send_failed';
     case 'receipt': return 'receipt_failed';

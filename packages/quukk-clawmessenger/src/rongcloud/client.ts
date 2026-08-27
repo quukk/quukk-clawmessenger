@@ -16,7 +16,7 @@ export interface RongCloudSdkResult {
 }
 
 export interface RongCloudSdkFacade {
-  Events?: Partial<Record<'CONNECTING' | 'CONNECTED' | 'DISCONNECT' | 'MESSAGES', string>>;
+  Events?: Partial<Record<'CONNECTING' | 'CONNECTED' | 'SUSPEND' | 'DISCONNECT' | 'MESSAGES', string>>;
   TextMessage?: MessageConstructor;
   init(options: { appkey: string }): void;
   connect(token: string): Promise<RongCloudSdkResult>;
@@ -59,6 +59,7 @@ export interface RongCloudClientOptions {
   sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
   refreshToken?: () => Promise<string | undefined>;
   onConnection?: (state: ConnectionState) => void;
+  onTerminalDisconnect?: (state: 'offline' | 'auth_error') => void;
   onMessage?: (message: NormalizedRongCloudMessage) => void | Promise<void>;
 }
 
@@ -319,6 +320,7 @@ export class RongCloudClient {
   readonly #nodeId: string;
   readonly #refreshToken?: () => Promise<string | undefined>;
   readonly #onConnection?: (state: ConnectionState) => void;
+  readonly #onTerminalDisconnect?: (state: 'offline' | 'auth_error') => void;
   readonly #onMessage?: (message: NormalizedRongCloudMessage) => void | Promise<void>;
   readonly #queue: SlidingWindowQueue;
   readonly #constructors = new Map<string, MessageConstructor>();
@@ -329,6 +331,7 @@ export class RongCloudClient {
   #initialized = false;
   #connected = false;
   #desiredConnected = false;
+  #connectedEventAllowed = false;
   #disposed = false;
   #generation = 0;
   #connectAttempt?: Promise<void>;
@@ -340,6 +343,7 @@ export class RongCloudClient {
     this.#nodeId = options.nodeId;
     this.#refreshToken = options.refreshToken;
     this.#onConnection = options.onConnection;
+    this.#onTerminalDisconnect = options.onTerminalDisconnect;
     this.#onMessage = options.onMessage;
     this.#queue = new SlidingWindowQueue(options);
   }
@@ -354,16 +358,23 @@ export class RongCloudClient {
         this.#constructors.set(name, this.#sdk.registerMessageType(name, isPersisted, isCounted));
       }
       this.#listen(this.#sdk.Events?.CONNECTING ?? 'CONNECTING', () => {
-        if (this.#desiredConnected) this.#emitConnection('connecting');
+        if (!this.#desiredConnected) return;
+        this.#suspendConnection(false);
+        this.#emitConnection('connecting');
       });
       this.#listen(this.#sdk.Events?.CONNECTED ?? 'CONNECTED', () => {
-        if (this.#desiredConnected && this.#connected) this.#emitConnection('online');
+        if (this.#connectedEventAllowed) this.#markOnline();
+      });
+      this.#listen(this.#sdk.Events?.SUSPEND ?? 'SUSPEND', () => {
+        if (this.#desiredConnected) this.#suspendConnection(true);
       });
       this.#listen(this.#sdk.Events?.DISCONNECT ?? 'DISCONNECT', (event) => {
         if (!this.#desiredConnected && !this.#connected) return;
-        this.#invalidateConnection(authenticationCodes.has(resultCode(event) ?? Number.NaN)
+        const state = authenticationCodes.has(resultCode(event) ?? Number.NaN)
           ? 'auth_error'
-          : 'offline');
+          : 'offline';
+        this.#invalidateConnection(state);
+        this.#emitTerminalDisconnect(state);
       });
       this.#listen(this.#sdk.Events?.MESSAGES ?? 'MESSAGES', (event) => this.#receive(event));
     } catch {
@@ -383,9 +394,12 @@ export class RongCloudClient {
       if (this.#connectAttempt) return this.#connectAttempt;
     }
 
+    const priorConnect = this.#connectAttempt;
+    const priorDisconnect = this.#disconnectAttempt;
     this.#desiredConnected = true;
+    this.#connectedEventAllowed = false;
     const generation = ++this.#generation;
-    const attempt = this.#runConnect(generation);
+    const attempt = this.#runConnect(generation, priorConnect, priorDisconnect);
     this.#connectAttempt = attempt;
     void attempt.then(
       () => { if (this.#connectAttempt === attempt) this.#connectAttempt = undefined; },
@@ -394,7 +408,15 @@ export class RongCloudClient {
     return attempt;
   }
 
-  async #runConnect(generation: number): Promise<void> {
+  async #runConnect(
+    generation: number,
+    priorConnect?: Promise<void>,
+    priorDisconnect?: Promise<void>,
+  ): Promise<void> {
+    await Promise.allSettled([priorConnect, priorDisconnect].filter(
+      (attempt): attempt is Promise<void> => attempt !== undefined,
+    ));
+    this.#assertCurrent(generation);
     let result: RongCloudSdkResult;
     try {
       result = await this.#sdk.connect(this.#token!);
@@ -407,7 +429,7 @@ export class RongCloudClient {
       }
       result = { code };
     }
-    this.#assertConnectedAttempt(generation);
+    await this.#assertConnectedAttempt(generation);
 
     const firstCode = resultCode(result);
     if (!isSuccess(result) && firstCode !== undefined && authenticationCodes.has(firstCode) && this.#refreshToken) {
@@ -427,7 +449,7 @@ export class RongCloudClient {
           this.#desiredConnected = false;
           throw failure('authentication_failed');
         }
-        this.#assertConnectedAttempt(generation);
+        await this.#assertConnectedAttempt(generation);
       }
     }
 
@@ -437,8 +459,9 @@ export class RongCloudClient {
         ? 'authentication_failed'
         : 'connect_failed');
     }
-    this.#connected = true;
-    this.#emitConnection('online');
+    this.#assertCurrent(generation);
+    this.#connectedEventAllowed = true;
+    this.#markOnline();
   }
 
   disconnect(): Promise<void> {
@@ -446,6 +469,7 @@ export class RongCloudClient {
     if (this.#disconnectAttempt && !wasActive) return this.#disconnectAttempt;
     this.#desiredConnected = false;
     this.#connected = false;
+    this.#connectedEventAllowed = false;
     this.#generation += 1;
     this.#queue.cancelAll('disconnected');
     this.#joinedChatrooms.clear();
@@ -719,10 +743,10 @@ export class RongCloudClient {
     if (!this.#isCurrent(generation)) throw failure('disconnected');
   }
 
-  #assertConnectedAttempt(generation: number): void {
+  async #assertConnectedAttempt(generation: number): Promise<void> {
     if (this.#isCurrent(generation)) return;
     try {
-      void Promise.resolve(this.#sdk.disconnect()).catch(() => undefined);
+      await this.#sdk.disconnect();
     } catch {
       // A stale physical connection remains logically fenced even if cleanup fails.
     }
@@ -739,11 +763,36 @@ export class RongCloudClient {
   #invalidateConnection(state: 'offline' | 'auth_error'): void {
     this.#desiredConnected = false;
     this.#connected = false;
+    this.#connectedEventAllowed = false;
     this.#generation += 1;
     this.#queue.cancelAll('disconnected');
     this.#joinedChatrooms.clear();
     this.#sentUids.clear();
     this.#emitConnection(state);
+  }
+
+  #suspendConnection(emitOffline: boolean): void {
+    if (!this.#connected) return;
+    this.#connected = false;
+    this.#generation += 1;
+    this.#queue.cancelAll('disconnected');
+    this.#joinedChatrooms.clear();
+    this.#sentUids.clear();
+    if (emitOffline) this.#emitConnection('offline');
+  }
+
+  #markOnline(): void {
+    if (!this.#desiredConnected || this.#disposed || this.#connected) return;
+    this.#connected = true;
+    this.#emitConnection('online');
+  }
+
+  #emitTerminalDisconnect(state: 'offline' | 'auth_error'): void {
+    try {
+      this.#onTerminalDisconnect?.(state);
+    } catch {
+      // Terminal observers cannot alter the SDK lifecycle.
+    }
   }
 
   #emitConnection(state: ConnectionState): void {
