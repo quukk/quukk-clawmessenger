@@ -1,6 +1,5 @@
 import {
   createHash,
-  createHmac,
   randomBytes as cryptoRandomBytes,
 } from 'node:crypto';
 import {
@@ -21,7 +20,6 @@ const IDENTITY_LIMIT = 16_384;
 const DIRECTORY_ENTRY_LIMIT = 256;
 const INSTANCE_ID_PATTERN = /^svc_[0-9a-f]{32}$/;
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
-const BRIDGE_SECRET_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const ADDRESS_PATTERN = /^127\.0\.0\.1:(?:[1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d|6553[0-5])$/;
 const STARTED_AT_SCHEMA = z
   .string()
@@ -140,14 +138,6 @@ function serializedDigest(value: DaemonIdentity): string {
   return createHash('sha256').update(serialized(value), 'utf8').digest('hex');
 }
 
-function sameProcessGeneration(left: DaemonIdentity, right: DaemonIdentity): boolean {
-  return left.schema_version === right.schema_version
-    && left.pid === right.pid
-    && left.version === right.version
-    && left.instance_id === right.instance_id
-    && left.started_at === right.started_at;
-}
-
 export class DaemonIdentityStore implements DaemonIdentityPersistence {
   readonly #path: string;
   readonly #directory: string;
@@ -176,7 +166,6 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
   }
 
   async read(): Promise<{ identity?: DaemonIdentity; contentDigest?: string }> {
-    await this.#recoverClaim();
     const snapshot = await this.#readSnapshot(this.#path);
     if ((await this.#artifacts()).claims.length !== 0) {
       throw new DaemonIdentityError('identity_corrupt');
@@ -187,16 +176,10 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
   async claim(value: StartingDaemonIdentity): Promise<boolean> {
     const parsed = StartingDaemonIdentitySchema.safeParse(value);
     if (!parsed.success) throw new DaemonIdentityError('identity_invalid');
-    await this.#ensureDirectory();
-    await this.#recoverClaim();
-    const artifacts = await this.#artifacts();
-    if (artifacts.claims.length !== 0) throw new DaemonIdentityError('identity_corrupt');
     const written = await this.#writeExclusive(this.#path, parsed.data);
     if (!written) return false;
-    try {
-      for (const artifact of artifacts.stale) await this.#deps.unlink(artifact);
-    } catch {
-      throw new DaemonIdentityError('identity_write_failed');
+    if ((await this.#artifacts()).claims.length !== 0) {
+      throw new DaemonIdentityError('identity_corrupt');
     }
     return true;
   }
@@ -217,14 +200,14 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
     const claimed = await this.#takeExact(
       parsedExpected.data,
       serializedDigest(parsedExpected.data),
-      false,
+      true,
     );
     if (claimed === undefined) throw new DaemonIdentityError('identity_conflict');
     let written: boolean;
     try {
       written = await this.#writeExclusive(this.#path, parsedReady.data);
     } catch (error) {
-      await this.#restoreClaim(claimed.path, false);
+      await this.#restoreClaim(claimed.path, true);
       throw error;
     }
     if (!written) {
@@ -236,6 +219,7 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
     } catch {
       throw new DaemonIdentityError('identity_write_failed');
     }
+    await this.#cleanupStaleAfterReady(parsedReady.data);
     return parsedReady.data;
   }
 
@@ -252,12 +236,20 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
     }
     const claimed = await this.#takeExact(parsed.data, input.contentDigest, true);
     if (claimed === undefined) return false;
-    const suffix = basename(claimed.path).slice(`${basename(this.#path)}.claim-`.length);
-    const stalePath = join(this.#directory, `${basename(this.#path)}.stale-${suffix}`);
+    const stalePath = join(
+      this.#directory,
+      `${basename(this.#path)}.stale-${input.contentDigest}`,
+    );
     try {
-      await this.#deps.rename(claimed.path, stalePath);
-    } catch {
+      await this.#deps.link(claimed.path, stalePath);
+    } catch (error) {
       await this.#restoreClaim(claimed.path, true);
+      if (errorCode(error) === 'EEXIST') return false;
+      throw new DaemonIdentityError('identity_write_failed');
+    }
+    try {
+      await this.#deps.unlink(claimed.path);
+    } catch {
       throw new DaemonIdentityError('identity_write_failed');
     }
     return true;
@@ -266,20 +258,11 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
   async removeIfMatches(expected: DaemonIdentity): Promise<boolean> {
     const parsed = DaemonIdentitySchema.safeParse(expected);
     if (!parsed.success) throw new DaemonIdentityError('identity_invalid');
-    const claimed = await this.#takeExact(parsed.data, serializedDigest(parsed.data), false);
+    const claimed = await this.#takeExact(parsed.data, serializedDigest(parsed.data), true);
     if (claimed === undefined) return false;
     try {
       await this.#deps.unlink(claimed.path);
       return true;
-    } catch {
-      throw new DaemonIdentityError('identity_write_failed');
-    }
-  }
-
-  async #ensureDirectory(): Promise<void> {
-    try {
-      await this.#deps.mkdir(this.#directory, { recursive: true, mode: 0o700 });
-      if (this.#deps.platform !== 'win32') await this.#deps.chmod(this.#directory, 0o700);
     } catch {
       throw new DaemonIdentityError('identity_write_failed');
     }
@@ -359,7 +342,9 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
     contentDigest: string | undefined,
     preserveOnRestoreConflict: boolean,
   ): Promise<IdentityClaim | undefined> {
-    await this.#recoverClaim();
+    if ((await this.#artifacts()).claims.length !== 0) {
+      throw new DaemonIdentityError('identity_corrupt');
+    }
     const claimPath = this.#claimPath();
     try {
       await this.#deps.rename(this.#path, claimPath);
@@ -397,8 +382,16 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
   }
 
   async #restoreClaim(claimPath: string, preserveOnConflict: boolean): Promise<void> {
+    await this.#restoreArtifact(claimPath, this.#path, preserveOnConflict);
+  }
+
+  async #restoreArtifact(
+    claimPath: string,
+    destination: string,
+    preserveOnConflict: boolean,
+  ): Promise<void> {
     try {
-      await this.#deps.link(claimPath, this.#path);
+      await this.#deps.link(claimPath, destination);
     } catch (error) {
       const code = errorCode(error);
       if (code === 'EEXIST' && preserveOnConflict) return;
@@ -413,35 +406,41 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
     }
   }
 
-  async #recoverClaim(): Promise<void> {
-    const [claimPath] = (await this.#artifacts()).claims;
-    if (claimPath === undefined) return;
-    const claimed = await this.#readSnapshot(claimPath);
-    if (claimed === undefined) throw new DaemonIdentityError('identity_corrupt');
+  async #cleanupStaleAfterReady(expected: ReadyDaemonIdentity): Promise<void> {
+    const artifacts = await this.#artifacts();
+    if (artifacts.claims.length !== 0) throw new DaemonIdentityError('identity_corrupt');
+    const stalePath = artifacts.stale[0];
+    if (stalePath === undefined) return;
+    const digest = basename(stalePath).slice(`${basename(this.#path)}.stale-`.length);
+    if (!DIGEST_PATTERN.test(digest)) throw new DaemonIdentityError('identity_corrupt');
+    const claimPath = this.#claimPath();
     try {
-      await this.#deps.link(claimPath, this.#path);
+      await this.#deps.rename(stalePath, claimPath);
     } catch (error) {
-      const code = errorCode(error);
-      if (code === 'ENOENT') return;
-      if (code !== 'EEXIST') throw new DaemonIdentityError('identity_write_failed');
-      const current = await this.#readSnapshot(this.#path);
-      const exactCopy = current !== undefined
-        && current.contentDigest === claimed.contentDigest
-        && equalIdentity(current.identity, claimed.identity);
-      const completedReadyTransition = current !== undefined
-        && claimed.identity.state === 'starting'
-        && current.identity.state === 'ready'
-        && sameProcessGeneration(claimed.identity, current.identity);
-      if (!exactCopy && !completedReadyTransition) {
-        throw new DaemonIdentityError('identity_corrupt');
-      }
+      if (errorCode(error) === 'ENOENT') return;
+      throw new DaemonIdentityError('identity_write_failed');
+    }
+    let stale: IdentitySnapshot | undefined;
+    let current: IdentitySnapshot | undefined;
+    try {
+      stale = await this.#readSnapshot(claimPath);
+      current = await this.#readSnapshot(this.#path);
+    } catch (error) {
+      await this.#restoreArtifact(claimPath, stalePath, true);
+      throw error;
+    }
+    const ownsReady = current !== undefined
+      && current.contentDigest === serializedDigest(expected)
+      && equalIdentity(current.identity, expected);
+    const ownsStale = stale !== undefined && stale.contentDigest === digest;
+    if (!ownsReady || !ownsStale) {
+      await this.#restoreArtifact(claimPath, stalePath, true);
+      throw new DaemonIdentityError(ownsReady ? 'identity_corrupt' : 'identity_conflict');
     }
     try {
       await this.#deps.unlink(claimPath);
-    } catch (error) {
-      if (errorCode(error) !== 'ENOENT') {
-        throw new DaemonIdentityError('identity_write_failed');
-      }
+    } catch {
+      throw new DaemonIdentityError('identity_write_failed');
     }
   }
 
@@ -476,17 +475,4 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
     }
     return { claims, stale };
   }
-}
-
-export function deriveControlCredential(bridgeSecret: string, instanceId: string): string {
-  if (!BRIDGE_SECRET_PATTERN.test(bridgeSecret) || !INSTANCE_ID_PATTERN.test(instanceId)) {
-    throw new Error('control_credential_invalid');
-  }
-  const key = Buffer.from(bridgeSecret, 'base64url');
-  if (key.byteLength !== 32 || key.toString('base64url') !== bridgeSecret) {
-    throw new Error('control_credential_invalid');
-  }
-  return createHmac('sha256', key)
-    .update(`quukk-local-control-v1\0${instanceId}`, 'utf8')
-    .digest('base64url');
 }

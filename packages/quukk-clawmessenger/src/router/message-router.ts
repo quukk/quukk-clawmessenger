@@ -632,6 +632,14 @@ export class MessageRouter {
     const key = bindingKey(identity);
     const existing = this.#bindingDisposals.get(key);
     if (existing) return existing;
+    if (this.#disposeAttempt !== undefined) return this.#disposeAttempt;
+    return this.#beginBindingDisposal(identity);
+  }
+
+  #beginBindingDisposal(identity: WorkerIdentity): Promise<void> {
+    const key = bindingKey(identity);
+    const existing = this.#bindingDisposals.get(key);
+    if (existing) return existing;
     let resolveDisposal!: () => void;
     let rejectDisposal!: (error: unknown) => void;
     const disposal = new Promise<void>((resolve, reject) => {
@@ -725,8 +733,14 @@ export class MessageRouter {
 
   dispose(): Promise<void> {
     if (this.#disposeAttempt !== undefined) return this.#disposeAttempt;
-    const attempt = this.#disposeOnce();
+    let resolveDisposal!: () => void;
+    let rejectDisposal!: (error: unknown) => void;
+    const attempt = new Promise<void>((resolve, reject) => {
+      resolveDisposal = resolve;
+      rejectDisposal = reject;
+    });
     this.#disposeAttempt = attempt;
+    void this.#disposeOnce().then(resolveDisposal, rejectDisposal);
     return attempt;
   }
 
@@ -740,7 +754,10 @@ export class MessageRouter {
       if (entries[0]) identities.set(key, entries[0].identity);
     }
     for (const [key, inflight] of this.#inflightByBinding) identities.set(key, inflight.identity);
-    await Promise.all([...identities.values()].map((identity) => this.disposeBinding(identity)));
+    for (const identity of identities.values()) this.#beginBindingDisposal(identity);
+    const results = await Promise.allSettled([...this.#bindingDisposals.values()]);
+    const rejected = results.find((result) => result.status === 'rejected');
+    if (rejected !== undefined && rejected.status === 'rejected') throw rejected.reason;
   }
 
   #validMessage(

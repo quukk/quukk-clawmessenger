@@ -1298,6 +1298,64 @@ describe('MessageRouter plain task admission', () => {
     expect(fixture.cancellations).toEqual(['task_1_1']);
   });
 
+  it('waits for an already-started binding disposal after its route state has drained', async () => {
+    const fixture = await routerHarness();
+    let nextEntered!: () => void;
+    let resolveNext!: (value: IteratorResult<BridgeTaskEvent>) => void;
+    const nextWasEntered = new Promise<void>((resolve) => { nextEntered = resolve; });
+    fixture.setEvents(() => ({
+      [Symbol.asyncIterator]() {
+        return {
+          next: () => {
+            nextEntered();
+            return new Promise<IteratorResult<BridgeTaskEvent>>((resolve) => { resolveNext = resolve; });
+          },
+          return: async () => {
+            resolveNext({ done: true, value: undefined });
+            return { done: true as const, value: undefined };
+          },
+        };
+      },
+    }));
+    let cancelEntered!: () => void;
+    let releaseCancel!: () => void;
+    const cancelWasEntered = new Promise<void>((resolve) => { cancelEntered = resolve; });
+    const cancelGate = new Promise<void>((resolve) => { releaseCancel = resolve; });
+    fixture.task.cancelTask = async (taskId) => {
+      fixture.cancellations.push(taskId);
+      cancelEntered();
+      await cancelGate;
+    };
+
+    const routing = fixture.router.onWorkerEvent(
+      IDENTITY_A,
+      inbound(IDENTITY_A, message('binding-disposal-outlives-route')),
+    );
+    await nextWasEntered;
+    const bindingDisposal = fixture.router.disposeBinding(IDENTITY_A);
+    await cancelWasEntered;
+    await routing;
+    let globalSettled = false;
+    const globalDisposal = fixture.router.dispose().then(() => { globalSettled = true; });
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    const settledBeforeCancel = globalSettled;
+    releaseCancel();
+    await Promise.all([bindingDisposal, globalDisposal]);
+
+    expect(settledBeforeCancel).toBe(false);
+    expect(fixture.cancellations).toEqual(['task_1_1']);
+  });
+
+  it('linearizes a binding disposal started after the global fence onto the global attempt', async () => {
+    const fixture = await routerHarness();
+
+    const globalDisposal = fixture.router.dispose();
+    const overlappingBindingDisposal = fixture.router.disposeBinding(IDENTITY_A);
+
+    expect(overlappingBindingDisposal).toBe(globalDisposal);
+    await Promise.all([globalDisposal, overlappingBindingDisposal]);
+  });
+
   it('cancels a plain task id that arrives after binding disposal without admitting or emitting', async () => {
     const fixture = await routerHarness();
     let startEntered!: () => void;
