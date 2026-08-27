@@ -10,6 +10,9 @@ import {
 } from './cli.js';
 import { VERSION } from './version.js';
 
+const NOW = 2_000_000_000_000;
+const CANONICAL_TICKET = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+
 const READY_IDENTITY = {
   schema_version: 1 as const,
   state: 'ready' as const,
@@ -93,6 +96,7 @@ function harness() {
         stderr: (value: string) => stderr.push(value),
       },
       environment: {},
+      now: () => NOW,
     },
   };
 }
@@ -267,10 +271,10 @@ describe('runCli', () => {
     { command: 'start', path: '/' },
   ] as const)('opens a one-use ticket only after $command has a ready identity', async ({ command, path }) => {
     const test = harness();
-    const ticket = 'T'.repeat(43);
+    const ticket = `${'T'.repeat(42)}A`;
     test.runtime.control.mockResolvedValue({
       command: 'launch_ticket',
-      value: { ticket, expiresAt: Date.now() + 30_000 },
+      value: { ticket, expiresAt: NOW + 30_000 },
     });
 
     const exitCode = await runCli([command], test.options);
@@ -315,8 +319,8 @@ describe('runCli', () => {
   });
 
   it.each([
-    { ticket: 'x'.repeat(42), expiresAt: Date.now() + 30_000 },
-    { ticket: 'x'.repeat(43), expiresAt: Date.now() - 1 },
+    { ticket: 'x'.repeat(42), expiresAt: NOW + 30_000 },
+    { ticket: CANONICAL_TICKET, expiresAt: NOW - 1 },
   ])('rejects malformed or expired launch-ticket responses without opening a browser', async (value) => {
     const test = harness();
     test.runtime.control.mockResolvedValue({ command: 'launch_ticket', value });
@@ -328,14 +332,53 @@ describe('runCli', () => {
     expect(test.browser.open).not.toHaveBeenCalled();
   });
 
+  it.each([
+    {
+      name: 'non-canonical base64url',
+      value: { ticket: 'x'.repeat(43), expiresAt: NOW + 1 },
+    },
+    {
+      name: 'already expired',
+      value: { ticket: CANONICAL_TICKET, expiresAt: NOW },
+    },
+    {
+      name: 'beyond the ticket-store TTL',
+      value: { ticket: CANONICAL_TICKET, expiresAt: NOW + 30_001 },
+    },
+  ])('rejects a $name launch ticket', async ({ value }) => {
+    const test = harness();
+    test.runtime.control.mockResolvedValue({ command: 'launch_ticket', value });
+
+    const exitCode = await runCli(['setup'], test.options);
+
+    expect(exitCode).toBe(5);
+    expect(test.stderr).toEqual(['quukk-clawmessenger: operation_unavailable']);
+    expect(test.browser.open).not.toHaveBeenCalled();
+  });
+
+  it('accepts a canonical 32-byte ticket at the exact TTL boundary', async () => {
+    const test = harness();
+    test.runtime.control.mockResolvedValue({
+      command: 'launch_ticket',
+      value: { ticket: CANONICAL_TICKET, expiresAt: NOW + 30_000 },
+    });
+
+    const exitCode = await runCli(['setup'], test.options);
+
+    expect(exitCode).toBe(0);
+    expect(test.browser.open).toHaveBeenCalledWith(
+      `http://127.0.0.1:43210/setup#ticket=${CANONICAL_TICKET}`,
+    );
+  });
+
   it('rejects non-exact launch-ticket response objects without exposing extra fields', async () => {
     const test = harness();
     const secretSentinel = 'SECRET-LAUNCH-RESPONSE';
     test.runtime.control.mockResolvedValue({
       command: 'launch_ticket',
       value: {
-        ticket: 'x'.repeat(43),
-        expiresAt: Date.now() + 30_000,
+        ticket: CANONICAL_TICKET,
+        expiresAt: NOW + 30_000,
         [secretSentinel]: secretSentinel,
       },
     } as never);
@@ -350,11 +393,11 @@ describe('runCli', () => {
 
   it('maps browser failure to exit 5 without echoing its URL or error', async () => {
     const test = harness();
-    const ticket = 'B'.repeat(43);
+    const ticket = `${'B'.repeat(42)}A`;
     const secretSentinel = 'SECRET-SENTINEL-FROM-BROWSER';
     test.runtime.control.mockResolvedValue({
       command: 'launch_ticket',
-      value: { ticket, expiresAt: Date.now() + 30_000 },
+      value: { ticket, expiresAt: NOW + 30_000 },
     });
     test.browser.open.mockRejectedValue(new Error(
       `failed ${secretSentinel} http://127.0.0.1:43210/#ticket=${ticket}`,
@@ -372,10 +415,10 @@ describe('runCli', () => {
   it('waits for foreground readiness before opening and keeps the service running after opener failure', async () => {
     const test = harness();
     const calls: string[] = [];
-    const ticket = 'F'.repeat(43);
+    const ticket = `${'F'.repeat(42)}A`;
     test.runtime.control.mockImplementation(async () => {
       calls.push('ticket');
-      return { command: 'launch_ticket', value: { ticket, expiresAt: Date.now() + 30_000 } };
+      return { command: 'launch_ticket', value: { ticket, expiresAt: NOW + 30_000 } };
     });
     test.browser.open.mockImplementation(async () => {
       calls.push('browser');
@@ -393,6 +436,172 @@ describe('runCli', () => {
     expect(exitCode).toBe(5);
     expect(calls).toEqual(['service-ready', 'ticket', 'browser', 'service-kept-running']);
     expect(test.stderr).toEqual(['quukk-clawmessenger: browser_open_failed']);
+  });
+
+  it('emits one JSON ready object from onReady while a no-open foreground run stays alive', async () => {
+    const test = harness();
+    let reportReady!: () => void;
+    const ready = new Promise<void>((resolveReady) => { reportReady = resolveReady; });
+    let finishRun!: (exitCode: number) => void;
+    const keptRunning = new Promise<number>((resolveRun) => { finishRun = resolveRun; });
+    test.runtime.runForeground.mockImplementation(async (_input, foreground) => {
+      await foreground.onReady(READY_IDENTITY);
+      reportReady();
+      return await keptRunning;
+    });
+
+    let settled = false;
+    const running = runCli(['start', '--foreground', '--no-open', '--json'], test.options);
+    void running.then(() => { settled = true; });
+    await ready;
+
+    expect(settled).toBe(false);
+    finishRun(0);
+    expect(test.stdout).toEqual([JSON.stringify({
+      schemaVersion: 1,
+      ok: true,
+      command: 'start',
+      state: 'ready',
+      alreadyRunning: false,
+    })]);
+    expect(test.stderr).toEqual([]);
+    expect(await running).toBe(0);
+    expect(test.stdout).toHaveLength(1);
+  });
+
+  it.each([
+    { runtimeExit: 1, expectedExit: 1 },
+    { runtimeExit: 2, expectedExit: 2 },
+    { runtimeExit: 3, expectedExit: 3 },
+    { runtimeExit: 4, expectedExit: 4 },
+    { runtimeExit: 5, expectedExit: 5 },
+    { runtimeExit: 9, expectedExit: 1 },
+  ])('keeps one ready JSON object and safely maps foreground exit $runtimeExit', async ({
+    runtimeExit,
+    expectedExit,
+  }) => {
+    const test = harness();
+    test.runtime.runForeground.mockImplementation(async (_input, foreground) => {
+      await foreground.onReady(READY_IDENTITY);
+      return runtimeExit;
+    });
+
+    const exitCode = await runCli(
+      ['start', '--foreground', '--no-open', '--json'],
+      test.options,
+    );
+
+    expect(exitCode).toBe(expectedExit);
+    expect(test.stderr).toEqual([]);
+    expect(test.stdout).toEqual([JSON.stringify({
+      schemaVersion: 1,
+      ok: true,
+      command: 'start',
+      state: 'ready',
+      alreadyRunning: false,
+    })]);
+  });
+
+  it.each([
+    { runtimeExit: 4, expectedExit: 4, errorCode: 'unsafe_identity' },
+    { runtimeExit: 5, expectedExit: 5, errorCode: 'operation_unavailable' },
+    { runtimeExit: 9, expectedExit: 1, errorCode: 'internal_failure' },
+  ])('maps foreground exit $runtimeExit even when readiness was never reached', async ({
+    runtimeExit,
+    expectedExit,
+    errorCode,
+  }) => {
+    const test = harness();
+    test.runtime.runForeground.mockResolvedValue(runtimeExit);
+
+    const exitCode = await runCli(
+      ['start', '--foreground', '--no-open', '--json'],
+      test.options,
+    );
+
+    expect(exitCode).toBe(expectedExit);
+    expect(test.stderr).toEqual([]);
+    expect(test.stdout).toEqual([JSON.stringify({
+      schemaVersion: 1,
+      ok: false,
+      command: 'start',
+      error: { code: errorCode },
+    })]);
+  });
+
+  it('keeps one ready JSON object when a foreground runtime later throws a fixed failure', async () => {
+    const test = harness();
+    test.runtime.runForeground.mockImplementation(async (_input, foreground) => {
+      await foreground.onReady(READY_IDENTITY);
+      throw Object.assign(new Error('SECRET-FOREGROUND-DETAIL'), {
+        code: 'process_unverified',
+      });
+    });
+
+    const exitCode = await runCli(
+      ['start', '--foreground', '--no-open', '--json'],
+      test.options,
+    );
+
+    expect(exitCode).toBe(4);
+    expect(test.stderr).toEqual([]);
+    expect(test.stdout).toEqual([JSON.stringify({
+      schemaVersion: 1,
+      ok: true,
+      command: 'start',
+      state: 'ready',
+      alreadyRunning: false,
+    })]);
+    expect(test.stdout[0]).not.toContain('SECRET-FOREGROUND-DETAIL');
+  });
+
+  it('emits exactly once when a foreground runtime reports ready concurrently', async () => {
+    const test = harness();
+    test.runtime.control.mockResolvedValue({
+      command: 'launch_ticket',
+      value: { ticket: CANONICAL_TICKET, expiresAt: NOW + 30_000 },
+    });
+    test.runtime.runForeground.mockImplementation(async (_input, foreground) => {
+      const first = foreground.onReady(READY_IDENTITY);
+      await foreground.onReady(READY_IDENTITY);
+      await first;
+      return 0;
+    });
+
+    const exitCode = await runCli(['start', '--foreground', '--json'], test.options);
+
+    expect(exitCode).toBe(1);
+    expect(test.stderr).toEqual([]);
+    expect(test.stdout).toEqual([JSON.stringify({
+      schemaVersion: 1,
+      ok: false,
+      command: 'start',
+      error: { code: 'runtime_response_invalid' },
+    })]);
+  });
+
+  it('ignores a late ready callback after the foreground run has already completed', async () => {
+    const test = harness();
+    let lateReady!: (identity: typeof READY_IDENTITY) => Promise<void>;
+    test.runtime.runForeground.mockImplementation(async (_input, foreground) => {
+      lateReady = foreground.onReady;
+      return 0;
+    });
+
+    const exitCode = await runCli(
+      ['start', '--foreground', '--no-open', '--json'],
+      test.options,
+    );
+    await lateReady(READY_IDENTITY);
+
+    expect(exitCode).toBe(1);
+    expect(test.stderr).toEqual([]);
+    expect(test.stdout).toEqual([JSON.stringify({
+      schemaVersion: 1,
+      ok: false,
+      command: 'start',
+      error: { code: 'runtime_response_invalid' },
+    })]);
   });
 
   it('rejects a foreground run that exits without ever reporting ready', async () => {
@@ -461,16 +670,42 @@ describe('runCli', () => {
   });
 
   it.each([
-    { inspection: { kind: 'starting' as const, identity: STARTING_IDENTITY }, expectedExit: 5, code: 'operation_unavailable' },
-    { inspection: { kind: 'corrupt' as const, errorCode: 'identity_corrupt' as const }, expectedExit: 4, code: 'unsafe_identity' },
-  ])('classifies $inspection.kind identity without using process APIs', async ({ inspection, expectedExit, code }) => {
+    {
+      argv: ['status'],
+      expected: 'quukk-clawmessenger: status starting',
+    },
+    {
+      argv: ['status', '--json'],
+      expected: JSON.stringify({
+        schemaVersion: 1,
+        ok: true,
+        command: 'status',
+        state: 'starting',
+        pid: 321,
+      }),
+    },
+  ])('projects a starting status safely for $argv', async ({ argv, expected }) => {
     const test = harness();
-    test.runtime.inspect.mockResolvedValue(inspection);
+    test.runtime.inspect.mockResolvedValue({ kind: 'starting', identity: STARTING_IDENTITY });
+
+    const exitCode = await runCli(argv, test.options);
+
+    expect(exitCode).toBe(0);
+    expect(test.stdout).toEqual([expected]);
+    expect(test.stderr).toEqual([]);
+    expect(test.runtime.control).not.toHaveBeenCalled();
+  });
+
+  it('classifies a corrupt identity without using process APIs', async () => {
+    const test = harness();
+    test.runtime.inspect.mockResolvedValue({
+      kind: 'corrupt', errorCode: 'identity_corrupt',
+    });
 
     const exitCode = await runCli(['status'], test.options);
 
-    expect(exitCode).toBe(expectedExit);
-    expect(test.stderr).toEqual([`quukk-clawmessenger: ${code}`]);
+    expect(exitCode).toBe(4);
+    expect(test.stderr).toEqual(['quukk-clawmessenger: unsafe_identity']);
     expect(test.runtime.control).not.toHaveBeenCalled();
   });
 
@@ -571,8 +806,15 @@ describe('runCli', () => {
   it.each([
     { runtimeCode: 'control_unauthorized', expectedExit: 4, outputCode: 'authentication_mismatch' },
     { runtimeCode: 'identity_corrupt', expectedExit: 4, outputCode: 'unsafe_identity' },
+    { runtimeCode: 'identity_invalid', expectedExit: 4, outputCode: 'unsafe_identity' },
+    { runtimeCode: 'process_unverified', expectedExit: 4, outputCode: 'unsafe_identity' },
+    { runtimeCode: 'unsafe_identity', expectedExit: 4, outputCode: 'unsafe_identity' },
     { runtimeCode: 'operation_timeout', expectedExit: 5, outputCode: 'operation_timeout' },
+    { runtimeCode: 'timeout', expectedExit: 5, outputCode: 'operation_timeout' },
+    { runtimeCode: 'shutdown_timeout', expectedExit: 5, outputCode: 'operation_timeout' },
     { runtimeCode: 'bridge_unavailable', expectedExit: 5, outputCode: 'operation_unavailable' },
+    { runtimeCode: 'service_unavailable', expectedExit: 5, outputCode: 'operation_unavailable' },
+    { runtimeCode: 'unavailable', expectedExit: 5, outputCode: 'operation_unavailable' },
     { runtimeCode: 'unrecognized-secret-code', expectedExit: 1, outputCode: 'internal_failure' },
   ])('maps runtime $runtimeCode to a fixed safe error', async ({ runtimeCode, expectedExit, outputCode }) => {
     const test = harness();
@@ -587,7 +829,7 @@ describe('runCli', () => {
     expect(exitCode).toBe(expectedExit);
     expect(test.stderr).toEqual([`quukk-clawmessenger: ${outputCode}`]);
     expect(`${test.stdout.join(' ')} ${test.stderr.join(' ')}`).not.toContain(secretSentinel);
-    if (runtimeCode !== outputCode) {
+    if (!outputCode.includes(runtimeCode)) {
       expect(`${test.stdout.join(' ')} ${test.stderr.join(' ')}`).not.toContain(runtimeCode);
     }
   });
@@ -615,6 +857,11 @@ describe('runCli', () => {
     },
     {
       argv: ['setup', '--json', '--server-url', 'https://user:secret@example.test'],
+      command: 'setup',
+      code: 'invalid_config',
+    },
+    {
+      argv: ['setup', '--json', '--workdir', 'status'],
       command: 'setup',
       code: 'invalid_config',
     },
@@ -684,6 +931,42 @@ describe('runCli', () => {
     expect(test.stdout[0]).not.toContain(secretSentinel);
   });
 
+  it('prints the same useful redacted doctor projection for human output', async () => {
+    const test = harness();
+    const secretSentinel = 'SECRET-DOCTOR-HUMAN-EXTRA';
+    test.runtime.doctor.mockResolvedValue({
+      schemaVersion: 1,
+      state: 'ready',
+      service: {
+        pid: 321,
+        version: VERSION,
+        startedAt: '2026-08-27T12:00:00.000Z',
+        port: 43210,
+        controlState: 'ready',
+      },
+      runtimes: [
+        { provider: 'opencode', status: 'ready' },
+        { provider: 'openclaw', status: 'not_found' },
+      ],
+      warnings: ['bridge_refreshing'],
+      [secretSentinel]: secretSentinel,
+    } as never);
+
+    const exitCode = await runCli(['doctor'], test.options);
+
+    expect(exitCode).toBe(0);
+    expect(test.stderr).toEqual([]);
+    expect(test.stdout).toEqual([[
+      'quukk-clawmessenger: doctor ready',
+      `service pid=321 version=${VERSION} started_at=2026-08-27T12:00:00.000Z port=43210 control_state=ready`,
+      'runtime provider=opencode status=ready',
+      'runtime provider=openclaw status=not_found',
+      'warning code=bridge_refreshing',
+    ].join('\n')]);
+    expect(test.stdout[0]).not.toContain(secretSentinel);
+    expect(test.stdout[0]).not.toMatch(/path|nodeId|tokenRef|secret/i);
+  });
+
   it('rejects unsafe doctor fields without echoing them', async () => {
     const test = harness();
     const secretSentinel = 'SECRET DOCTOR WARNING';
@@ -739,7 +1022,7 @@ describe('runCli', () => {
 });
 
 describe('createSystemBrowserPort', () => {
-  const url = `http://127.0.0.1:43210/setup#ticket=${'Z'.repeat(43)}`;
+  const url = `http://127.0.0.1:43210/setup#ticket=${'Z'.repeat(42)}A`;
   const environment = {
     SYSTEMROOT: 'C:\\Windows',
     WINDIR: 'C:\\Windows',
@@ -834,19 +1117,41 @@ describe('createSystemBrowserPort', () => {
     expect(serialized).not.toContain('PASSWORD-SENTINEL');
   });
 
+  it('accepts an explicit identity port 80 after URL default-port normalization', async () => {
+    const port80Url = `http://127.0.0.1:80/#ticket=${CANONICAL_TICKET}`;
+    const child = new EventEmitter() as EventEmitter & { unref: ReturnType<typeof vi.fn> };
+    child.unref = vi.fn();
+    const spawn = vi.fn(() => {
+      queueMicrotask(() => child.emit('spawn'));
+      return child;
+    });
+    const browser = createSystemBrowserPort({
+      platform: 'linux',
+      environment: {},
+      spawn: spawn as never,
+    });
+
+    await browser.open(port80Url);
+
+    expect(spawn).toHaveBeenCalledWith('xdg-open', [port80Url], expect.objectContaining({
+      shell: false,
+    }));
+  });
+
   it.each([
-    `https://127.0.0.1:43210/#ticket=${'x'.repeat(43)}`,
-    `http://localhost:43210/#ticket=${'x'.repeat(43)}`,
-    `http://127.0.0.2:43210/#ticket=${'x'.repeat(43)}`,
-    `http://127.0.0.1/#ticket=${'x'.repeat(43)}`,
-    `http://127.0.0.1:0/#ticket=${'x'.repeat(43)}`,
-    `http://127.0.0.1:43210/setup/#ticket=${'x'.repeat(43)}`,
-    `http://127.0.0.1:43210/other#ticket=${'x'.repeat(43)}`,
-    `http://127.0.0.1:43210/?query=1#ticket=${'x'.repeat(43)}`,
-    `http://user@127.0.0.1:43210/#ticket=${'x'.repeat(43)}`,
+    `https://127.0.0.1:43210/#ticket=${CANONICAL_TICKET}`,
+    `http://localhost:43210/#ticket=${CANONICAL_TICKET}`,
+    `http://127.0.0.2:43210/#ticket=${CANONICAL_TICKET}`,
+    `http://127.0.0.1/#ticket=${CANONICAL_TICKET}`,
+    `http://127.0.0.1:0/#ticket=${CANONICAL_TICKET}`,
+    `http://127.0.0.1:43210/setup/#ticket=${CANONICAL_TICKET}`,
+    `http://127.0.0.1:43210/other#ticket=${CANONICAL_TICKET}`,
+    `http://127.0.0.1:43210/?query=1#ticket=${CANONICAL_TICKET}`,
+    `http://user@127.0.0.1:43210/#ticket=${CANONICAL_TICKET}`,
     'http://127.0.0.1:43210/',
     `http://127.0.0.1:43210/#ticket=${'x'.repeat(42)}`,
-    `http://127.0.0.1:43210/#ticket=${'x'.repeat(43)}&extra=1`,
+    `http://127.0.0.1:43210/#ticket=${CANONICAL_TICKET}&extra=1`,
+    `http://127.0.0.1:43210/#ticket=${'x'.repeat(43)}`,
   ])('rejects an unsafe browser URL before spawn: %s', async (unsafeUrl) => {
     const spawn = vi.fn();
     const browser = createSystemBrowserPort({ platform: 'linux', environment: {}, spawn: spawn as never });

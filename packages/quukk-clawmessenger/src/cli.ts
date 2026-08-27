@@ -40,6 +40,25 @@ const CONFIG_OPTION_NAMES = [
   'log-level',
 ] as const;
 
+const CLI_PARSE_OPTIONS = {
+  help: { type: 'boolean' },
+  version: { type: 'boolean' },
+  json: { type: 'boolean' },
+  'no-open': { type: 'boolean' },
+  foreground: { type: 'boolean' },
+  'daemon-child': { type: 'boolean' },
+  'server-url': { type: 'string' },
+  workdir: { type: 'string' },
+  'authorized-work-root': { type: 'string', multiple: true },
+  'opencode-path': { type: 'string' },
+  'openclaw-path': { type: 'string' },
+  'codex-path': { type: 'string' },
+  'hermes-path': { type: 'string' },
+  'log-level': { type: 'string' },
+  lines: { type: 'string' },
+  follow: { type: 'boolean' },
+} as const;
+
 const PUBLIC_HELP = `Usage: quukk-clawmessenger <command> [options]
 
 Commands:
@@ -194,10 +213,22 @@ const CliDiagnosticsSchema = z.discriminatedUnion('state', [
     warnings: DiagnosticWarningsSchema,
   }),
 ]);
+
+function canonicalLaunchTicket(value: string): string | undefined {
+  if (!/^[A-Za-z0-9_-]{43}$/.test(value)) return undefined;
+  try {
+    const decoded = Buffer.from(value, 'base64url');
+    const canonical = decoded.toString('base64url');
+    return decoded.byteLength === 32 && canonical === value ? canonical : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 const LaunchTicketControlResponseSchema = z.strictObject({
   command: z.literal('launch_ticket'),
   value: z.strictObject({
-    ticket: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    ticket: z.string().refine((value) => canonicalLaunchTicket(value) !== undefined),
     expiresAt: z.number().int().positive().safe(),
   }),
 });
@@ -299,12 +330,12 @@ function validateBrowserUrl(value: string): void {
   } catch {
     throw browserFailure();
   }
-  const port = Number(url.port);
-  const ticket = /^#ticket=([A-Za-z0-9_-]{43})$/.exec(url.hash)?.[1];
+  const port = url.protocol === 'http:' && url.port === '' ? 80 : Number(url.port);
+  const rawTicket = /^#ticket=([A-Za-z0-9_-]{43})$/.exec(url.hash)?.[1];
+  const ticket = rawTicket === undefined ? undefined : canonicalLaunchTicket(rawTicket);
   if (
     url.protocol !== 'http:'
     || url.hostname !== '127.0.0.1'
-    || url.port === ''
     || !Number.isInteger(port)
     || port < 1
     || port > 65_535
@@ -389,6 +420,7 @@ export interface RunCliOptions {
   browser: BrowserPort;
   io: CliIO;
   environment?: NodeJS.ProcessEnv;
+  now?: () => number;
 }
 
 type ParsedCli = {
@@ -452,24 +484,7 @@ function parseCli(argv: readonly string[]): ParsedCli | 'help' | 'version' {
         allowPositionals: true,
         strict: true,
         tokens: true,
-        options: {
-          help: { type: 'boolean' },
-          version: { type: 'boolean' },
-          json: { type: 'boolean' },
-          'no-open': { type: 'boolean' },
-          foreground: { type: 'boolean' },
-          'daemon-child': { type: 'boolean' },
-          'server-url': { type: 'string' },
-          workdir: { type: 'string' },
-          'authorized-work-root': { type: 'string', multiple: true },
-          'opencode-path': { type: 'string' },
-          'openclaw-path': { type: 'string' },
-          'codex-path': { type: 'string' },
-          'hermes-path': { type: 'string' },
-          'log-level': { type: 'string' },
-          lines: { type: 'string' },
-          follow: { type: 'boolean' },
-        },
+        options: CLI_PARSE_OPTIONS,
       });
     } catch {
       throw new CliFailure('usage_error');
@@ -604,10 +619,22 @@ function emitFailure(io: CliIO, parsed: OutputContext | undefined, code: CliErro
 }
 
 function requestedJsonOutput(argv: readonly string[]): OutputContext | undefined {
-  if (argv.filter((value) => value === '--json').length !== 1) return undefined;
-  const commands = argv.filter(isCommand);
-  if (commands.length !== 1 || commands[0] === 'logs') return undefined;
-  return { command: commands[0]!, json: true };
+  try {
+    const parsed = parseArgs({
+      args: [...argv],
+      allowPositionals: true,
+      strict: false,
+      tokens: true,
+      options: CLI_PARSE_OPTIONS,
+    });
+    const counts = countOptions(parsed.tokens);
+    if (counts.get('json') !== 1) return undefined;
+    const command = parsed.positionals[0];
+    if (command === undefined || !isCommand(command) || command === 'logs') return undefined;
+    return { command, json: true };
+  } catch {
+    return undefined;
+  }
 }
 
 function fixedFailure(error: unknown): CliFailure {
@@ -627,10 +654,17 @@ function fixedFailure(error: unknown): CliFailure {
   if (
     code === 'identity_conflict'
     || code === 'identity_corrupt'
+    || code === 'identity_invalid'
+    || code === 'process_unverified'
     || code === 'stale_unverified'
     || code === 'unsafe_identity'
   ) return new CliFailure('unsafe_identity');
-  if (code === 'operation_timeout' || code === 'startup_timeout') {
+  if (
+    code === 'operation_timeout'
+    || code === 'shutdown_timeout'
+    || code === 'startup_timeout'
+    || code === 'timeout'
+  ) {
     return new CliFailure('operation_timeout');
   }
   if (code === 'browser_open_failed') return new CliFailure('browser_open_failed');
@@ -638,6 +672,7 @@ function fixedFailure(error: unknown): CliFailure {
     code === 'bridge_unavailable'
     || code === 'operation_unavailable'
     || code === 'service_unavailable'
+    || code === 'unavailable'
   ) return new CliFailure('operation_unavailable');
   return new CliFailure('internal_failure');
 }
@@ -700,6 +735,14 @@ function hasOverrides(value: ConfigOverrides): boolean {
   return Object.keys(value).length !== 0;
 }
 
+function fixedForegroundFailure(value: number): CliFailure {
+  if (value === 2) return new CliFailure('usage_error');
+  if (value === 3) return new CliFailure('not_running');
+  if (value === 4) return new CliFailure('unsafe_identity');
+  if (value === 5) return new CliFailure('operation_unavailable');
+  return new CliFailure('internal_failure');
+}
+
 async function openBrowser(
   command: 'setup' | 'start',
   identity: ReadyDaemonIdentity,
@@ -708,9 +751,13 @@ async function openBrowser(
   const response = LaunchTicketControlResponseSchema.safeParse(
     await options.runtime.control(identity, 'launch_ticket'),
   );
+  const now = options.now?.() ?? Date.now();
   if (
     !response.success
-    || response.data.value.expiresAt <= Date.now()
+    || !Number.isSafeInteger(now)
+    || now <= 0
+    || response.data.value.expiresAt <= now
+    || response.data.value.expiresAt > now + 30_000
   ) throw new CliFailure('operation_unavailable');
   const pathname = command === 'setup' ? '/setup' : '/';
   const url = `http://${identity.address}${pathname}#ticket=${response.data.value.ticket}`;
@@ -730,34 +777,61 @@ async function startCommand(parsed: ParsedCli, options: RunCliOptions): Promise<
   if (parsed.foreground) {
     let readyFailure: CliFailure | undefined;
     let readySeen = false;
-    const exitCode = await options.runtime.runForeground(input, {
-      daemonChild: parsed.daemonChild,
-      onReady: async (value) => {
-        if (readySeen) {
-          readyFailure = new CliFailure('runtime_response_invalid');
-          return;
-        }
-        readySeen = true;
-        const identity = ReadyDaemonIdentitySchema.safeParse(value);
-        if (!identity.success) {
-          readyFailure = new CliFailure('runtime_response_invalid');
-          return;
-        }
-        if (parsed.noOpen) return;
-        try {
-          await openBrowser(parsed.command as 'start', identity.data, options);
-        } catch (error) {
-          readyFailure = fixedFailure(error);
-        }
-      },
-    });
-    if (readyFailure !== undefined) throw readyFailure;
-    if (!readySeen) throw new CliFailure('runtime_response_invalid');
-    if (!Number.isInteger(exitCode) || exitCode < 0 || exitCode > 255) {
-      throw new CliFailure('runtime_response_invalid');
+    let emitted = false;
+    const emitFixedFailureOnce = (failure: CliFailure): number => {
+      if (emitted) return exitCode(failure.code);
+      emitted = true;
+      return emitFailure(options.io, parsed, failure.code);
+    };
+    const emitReadyFailure = (failure: CliFailure): void => {
+      readyFailure = failure;
+      emitFixedFailureOnce(failure);
+    };
+    let runtimeExit: number;
+    try {
+      runtimeExit = await options.runtime.runForeground(input, {
+        daemonChild: parsed.daemonChild,
+        onReady: async (value) => {
+          if (readySeen) {
+            emitReadyFailure(new CliFailure('runtime_response_invalid'));
+            return;
+          }
+          readySeen = true;
+          const identity = ReadyDaemonIdentitySchema.safeParse(value);
+          if (!identity.success) {
+            emitReadyFailure(new CliFailure('runtime_response_invalid'));
+            return;
+          }
+          if (!parsed.noOpen) {
+            try {
+              await openBrowser(parsed.command as 'start', identity.data, options);
+            } catch (error) {
+              emitReadyFailure(fixedFailure(error));
+              return;
+            }
+          }
+          if (readyFailure !== undefined || emitted) return;
+          emitted = true;
+          emitStartSuccess(parsed, options.io, false);
+        },
+      });
+    } catch (error) {
+      const failure = fixedFailure(error);
+      return emitFixedFailureOnce(failure);
     }
-    if (exitCode === 0) emitStartSuccess(parsed, options.io, false);
-    return exitCode;
+    if (readyFailure !== undefined) return exitCode(readyFailure.code);
+    if (!Number.isInteger(runtimeExit) || runtimeExit < 0 || runtimeExit > 255) {
+      return emitFixedFailureOnce(new CliFailure('runtime_response_invalid'));
+    }
+    if (runtimeExit !== 0) {
+      const failure = fixedForegroundFailure(runtimeExit);
+      if (!readySeen) return emitFixedFailureOnce(failure);
+      return exitCode(failure.code);
+    }
+    if (!readySeen) {
+      return emitFixedFailureOnce(new CliFailure('runtime_response_invalid'));
+    }
+    return 0;
   }
   const result = checkedStartResult(await options.runtime.start(input));
   if (result.alreadyRunning && hasOverrides(parsed.configOverrides)) {
@@ -789,18 +863,28 @@ function emitCommandSuccess(
 }
 
 async function statusCommand(parsed: ParsedCli, options: RunCliOptions): Promise<number> {
-  const identity = await inspectForControl('status', options.runtime);
-  const response = await options.runtime.control(identity!, 'status');
+  const inspection = checkedInspection(await options.runtime.inspect());
+  if (inspection.kind === 'not_running') throw new CliFailure('not_running');
+  if (inspection.kind === 'corrupt') throw new CliFailure('unsafe_identity');
+  if (inspection.kind === 'starting') {
+    emitCommandSuccess(parsed, options.io, {
+      state: 'starting',
+      pid: inspection.identity.pid,
+    }, 'starting');
+    return 0;
+  }
+  const identity = inspection.identity;
+  const response = await options.runtime.control(identity, 'status');
   if (response.command !== 'status') throw new CliFailure('runtime_response_invalid');
   const status = ControlStatusResponseSchema.safeParse(response.value);
   if (!status.success) throw new CliFailure('runtime_response_invalid');
-  if (!sameIdentity(identity!, status.data.identity)) {
+  if (!sameIdentity(identity, status.data.identity)) {
     throw new CliFailure('authentication_mismatch');
   }
   emitCommandSuccess(parsed, options.io, {
     state: status.data.state,
-    pid: identity!.pid,
-    port: portOf(identity!),
+    pid: identity.pid,
+    port: portOf(identity),
   }, status.data.state);
   return 0;
 }
@@ -835,10 +919,34 @@ async function stopCommand(parsed: ParsedCli, options: RunCliOptions): Promise<n
   return 0;
 }
 
+function renderHumanDiagnostics(diagnostics: CliDiagnostics): string {
+  const lines = [`quukk-clawmessenger: doctor ${diagnostics.state}`];
+  if (diagnostics.state === 'starting') {
+    lines.push(
+      `service pid=${diagnostics.service.pid} version=${diagnostics.service.version} started_at=${diagnostics.service.startedAt}`,
+    );
+  } else if (diagnostics.state === 'ready') {
+    lines.push(
+      `service pid=${diagnostics.service.pid} version=${diagnostics.service.version} started_at=${diagnostics.service.startedAt} port=${diagnostics.service.port} control_state=${diagnostics.service.controlState}`,
+    );
+    for (const runtime of diagnostics.runtimes) {
+      lines.push(`runtime provider=${runtime.provider} status=${runtime.status}`);
+    }
+  } else if (diagnostics.state === 'corrupt') {
+    lines.push(`error code=${diagnostics.errorCode}`);
+  }
+  for (const warning of diagnostics.warnings ?? []) lines.push(`warning code=${warning}`);
+  return lines.join('\n');
+}
+
 async function doctorCommand(parsed: ParsedCli, options: RunCliOptions): Promise<number> {
   const diagnostics = CliDiagnosticsSchema.safeParse(await options.runtime.doctor());
   if (!diagnostics.success) throw new CliFailure('runtime_response_invalid');
-  emitCommandSuccess(parsed, options.io, { diagnostics: diagnostics.data }, diagnostics.data.state);
+  if (parsed.json) {
+    emitCommandSuccess(parsed, options.io, { diagnostics: diagnostics.data }, diagnostics.data.state);
+  } else {
+    options.io.stdout(renderHumanDiagnostics(diagnostics.data));
+  }
   return 0;
 }
 
