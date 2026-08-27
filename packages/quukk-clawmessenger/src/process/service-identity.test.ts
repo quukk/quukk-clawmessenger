@@ -92,7 +92,7 @@ function postCreateFailureDependencies(
             throw ioFailure();
           }
         },
-        stat: () => handle.stat(),
+        stat: (...args: Parameters<typeof handle.stat>) => handle.stat(...args),
         close: () => handle.close(),
       } as unknown as Awaited<ReturnType<typeof fsOpen>>;
     },
@@ -119,7 +119,7 @@ function partialWriteFailureDependencies(): Partial<DaemonIdentityDependencies> 
           throw ioFailure();
         },
         sync: () => handle.sync(),
-        stat: () => handle.stat(),
+        stat: (...args: Parameters<typeof handle.stat>) => handle.stat(...args),
         close: () => handle.close(),
       } as unknown as Awaited<ReturnType<typeof fsOpen>>;
     },
@@ -303,6 +303,8 @@ describe('DaemonIdentityStore', () => {
     const filePath = await identityPath('claim-partial-write-rogue');
     const rogue = starting({ pid: 9878, instance_id: `svc_${'62'.repeat(16)}` });
     const dependencies = partialWriteFailureDependencies();
+    let cleanupPath: string | undefined;
+    let recoveryPath: string | undefined;
     const store = new DaemonIdentityStore({
       filePath,
       dependencies: {
@@ -310,8 +312,11 @@ describe('DaemonIdentityStore', () => {
         rename: async (source, destination) => {
           await rename(source, destination);
           if (String(source) === filePath) {
+            cleanupPath = String(destination);
             await fsUnlink(destination);
             await writeFile(destination, `${JSON.stringify(rogue)}\n`);
+          } else if (String(source) === cleanupPath) {
+            recoveryPath = String(destination);
           }
         },
       },
@@ -319,9 +324,127 @@ describe('DaemonIdentityStore', () => {
 
     await expect(store.claim(starting()))
       .rejects.toMatchObject({ code: 'identity_write_failed' });
-    expect(JSON.parse(await readFile(filePath, 'utf8'))).toEqual(rogue);
+    expect(recoveryPath).toBeDefined();
+    expect(JSON.parse(await readFile(recoveryPath!, 'utf8'))).toEqual(rogue);
+    await expect(readFile(filePath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
     expect((await readdir(dirname(filePath)))
       .filter((name) => name.startsWith('daemon.pid.claim-'))).toEqual([]);
+  });
+
+  it('preserves a replacement swapped in after ownership stat and before cleanup', async () => {
+    const filePath = await identityPath('claim-partial-write-stat-race');
+    const rogue = starting({ pid: 9879, instance_id: `svc_${'63'.repeat(16)}` });
+    let cleanupPath: string | undefined;
+    let recoveryPath: string | undefined;
+    let writeFailed = false;
+    let swappedAfterStat = false;
+    const store = new DaemonIdentityStore({
+      filePath,
+      dependencies: {
+        open: async (path, flags, mode) => {
+          const handle = await fsOpen(path, flags, mode);
+          if (String(flags) === 'wx' && !writeFailed) {
+            return {
+              writeFile: async (data: string) => {
+                writeFailed = true;
+                await handle.writeFile(data.slice(0, 17));
+                throw ioFailure();
+              },
+              sync: () => handle.sync(),
+              stat: (...args: Parameters<typeof handle.stat>) => handle.stat(...args),
+              close: () => handle.close(),
+            } as unknown as Awaited<ReturnType<typeof fsOpen>>;
+          }
+          if (String(path) === cleanupPath && String(flags) === 'r') {
+            return {
+              stat: async (...args: Parameters<typeof handle.stat>) => {
+                const result = await handle.stat(...args);
+                await handle.close();
+                await fsUnlink(path);
+                await writeFile(path, `${JSON.stringify(rogue)}\n`);
+                swappedAfterStat = true;
+                return result;
+              },
+              close: () => handle.close(),
+            } as unknown as Awaited<ReturnType<typeof fsOpen>>;
+          }
+          return handle;
+        },
+        rename: async (source, destination) => {
+          await rename(source, destination);
+          if (String(source) === filePath) cleanupPath = String(destination);
+          if (String(source) === cleanupPath) recoveryPath = String(destination);
+        },
+      },
+    });
+
+    await expect(store.claim(starting()))
+      .rejects.toMatchObject({ code: 'identity_write_failed' });
+    expect(swappedAfterStat).toBe(true);
+    expect(recoveryPath).toBeDefined();
+    expect(JSON.parse(await readFile(recoveryPath!, 'utf8'))).toEqual(rogue);
+    await expect(readFile(filePath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('uses bigint file identity when numeric inode values would collide', async () => {
+    const filePath = await identityPath('claim-partial-write-bigint');
+    const rogue = starting({ pid: 9880, instance_id: `svc_${'64'.repeat(16)}` });
+    const ownInode = 22_236_523_163_565_440n;
+    const rogueInode = ownInode + 1n;
+    expect(Number(ownInode)).toBe(Number(rogueInode));
+    let cleanupPath: string | undefined;
+    let recoveryPath: string | undefined;
+    let writeFailed = false;
+    const statOptions: unknown[] = [];
+    let statCalls = 0;
+    const store = new DaemonIdentityStore({
+      filePath,
+      dependencies: {
+        open: async (path, flags, mode) => {
+          const handle = await fsOpen(path, flags, mode);
+          const inode = statCalls++ === 0 ? ownInode : rogueInode;
+          const stat = async (options?: { bigint?: boolean }) => {
+            statOptions.push(options);
+            return options?.bigint
+              ? { birthtimeMs: 0n, dev: 0n, ino: inode }
+              : { birthtimeMs: 0, dev: 0, ino: Number(inode) };
+          };
+          if (String(flags) === 'wx' && !writeFailed) {
+            return {
+              writeFile: async (data: string) => {
+                writeFailed = true;
+                await handle.writeFile(data.slice(0, 17));
+                throw ioFailure();
+              },
+              sync: () => handle.sync(),
+              stat,
+              close: () => handle.close(),
+            } as unknown as Awaited<ReturnType<typeof fsOpen>>;
+          }
+          return {
+            stat,
+            close: () => handle.close(),
+          } as unknown as Awaited<ReturnType<typeof fsOpen>>;
+        },
+        rename: async (source, destination) => {
+          await rename(source, destination);
+          if (String(source) === filePath) {
+            cleanupPath = String(destination);
+            await fsUnlink(destination);
+            await writeFile(destination, `${JSON.stringify(rogue)}\n`);
+          } else if (String(source) === cleanupPath) {
+            recoveryPath = String(destination);
+          }
+        },
+      },
+    });
+
+    await expect(store.claim(starting()))
+      .rejects.toMatchObject({ code: 'identity_write_failed' });
+    expect(statOptions).toEqual([{ bigint: true }, { bigint: true }]);
+    expect(recoveryPath).toContain('daemon.pid.recovery');
+    expect(recoveryPath).toContain('write-unverified-');
+    expect(JSON.parse(await readFile(recoveryPath!, 'utf8'))).toEqual(rogue);
   });
 
   it('removes only its own failed claim when a replacement wins cleanup', async () => {
@@ -569,8 +692,8 @@ describe('DaemonIdentityStore', () => {
     expect(artifacts.filter((name) => name.startsWith('daemon.pid.stale-'))).toHaveLength(1);
   });
 
-  it('returns durable ready with stale evidence when cleanup unlink fails', async () => {
-    const filePath = await identityPath('ready-stale-unlink');
+  it('returns durable ready with stale evidence when cleanup retirement fails', async () => {
+    const filePath = await identityPath('ready-stale-retirement');
     await quarantineReadyArtifact(filePath);
     const nextStarting = starting({ pid: 9877, instance_id: `svc_${'a1'.repeat(16)}` });
     const nextReady: ReadyDaemonIdentity = {
@@ -578,17 +701,15 @@ describe('DaemonIdentityStore', () => {
       state: 'ready',
       address: ready().address,
     };
-    let claimUnlinks = 0;
     const store = new DaemonIdentityStore({
       filePath,
       dependencies: {
-        unlink: async (path) => {
-          const value = String(path);
-          if (value.includes('.claim-')) claimUnlinks += 1;
-          if (value.includes('.stale-') || (value.includes('.claim-') && claimUnlinks > 1)) {
+        rename: async (source, destination) => {
+          if (String(source).includes('-cleanup-')
+            && String(destination).includes('daemon.pid.recovery')) {
             throw ioFailure();
           }
-          await fsUnlink(path);
+          await rename(source, destination);
         },
       },
     });
@@ -601,8 +722,8 @@ describe('DaemonIdentityStore', () => {
     expect(artifacts.filter((name) => name.startsWith('daemon.pid.stale-'))).toHaveLength(1);
   });
 
-  it('rolls back its exact ready identity when the starting tombstone unlink fails', async () => {
-    const filePath = await identityPath('ready-starting-unlink');
+  it('rolls back its exact ready identity when starting tombstone retirement fails', async () => {
+    const filePath = await identityPath('ready-starting-retirement');
     const nextStarting = starting({ pid: 9877, instance_id: `svc_${'a2'.repeat(16)}` });
     const nextReady: ReadyDaemonIdentity = {
       ...nextStarting,
@@ -613,12 +734,14 @@ describe('DaemonIdentityStore', () => {
     const store = new DaemonIdentityStore({
       filePath,
       dependencies: {
-        unlink: async (path) => {
-          if (!failed && String(path).includes('.claim-')) {
+        rename: async (source, destination) => {
+          if (!failed
+            && String(source).includes('.claim-')
+            && String(destination).includes('daemon.pid.recovery')) {
             failed = true;
             throw ioFailure();
           }
-          await fsUnlink(path);
+          await rename(source, destination);
         },
       },
     });

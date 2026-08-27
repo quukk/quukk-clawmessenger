@@ -117,10 +117,12 @@ type IdentityArtifacts = {
 type ExclusiveWriteResult = 'created_failed' | 'exists' | 'written';
 
 type FileIdentity = {
-  birthtimeMs: number;
-  dev: number;
-  ino: number;
+  birthtimeMs: bigint;
+  dev: bigint;
+  ino: bigint;
 };
+
+type RecoveryKind = 'retired' | 'write-owned' | 'write-unverified';
 
 function errorCode(error: unknown): string | undefined {
   return typeof error === 'object' && error !== null && 'code' in error
@@ -247,7 +249,7 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
     }
     let failure: unknown;
     try {
-      await this.#deps.unlink(claimed.path);
+      await this.#moveToRecovery(claimed.path, 'retired');
       await this.#cleanupStaleAfterReady(parsedReady.data);
       if (!(await this.#isDurableReady(parsedReady.data))) {
         throw new DaemonIdentityError('identity_conflict');
@@ -293,7 +295,7 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
       throw new DaemonIdentityError('identity_write_failed');
     }
     try {
-      await this.#deps.unlink(claimed.path);
+      await this.#moveToRecovery(claimed.path, 'retired');
     } catch {
       throw new DaemonIdentityError('identity_write_failed');
     }
@@ -306,7 +308,7 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
     const claimed = await this.#takeExact(parsed.data, serializedDigest(parsed.data), true);
     if (claimed === undefined) return false;
     try {
-      await this.#deps.unlink(claimed.path);
+      await this.#moveToRecovery(claimed.path, 'retired');
       return true;
     } catch {
       throw new DaemonIdentityError('identity_write_failed');
@@ -324,7 +326,7 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
     }
     let createdIdentity: FileIdentity | undefined;
     try {
-      createdIdentity = await handle.stat();
+      createdIdentity = await handle.stat({ bigint: true });
       await handle.writeFile(serialized(value));
       await handle.sync();
       if (this.#deps.platform !== 'win32') await this.#deps.chmod(path, 0o600);
@@ -355,23 +357,18 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
     let cleanupIdentity: FileIdentity;
     try {
       handle = await this.#deps.open(cleanupPath, 'r');
-      cleanupIdentity = await handle.stat();
+      cleanupIdentity = await handle.stat({ bigint: true });
     } catch {
       throw new DaemonIdentityError('identity_write_failed');
     } finally {
       await handle?.close().catch(() => undefined);
     }
-    if (!sameFileIdentity(createdIdentity, cleanupIdentity)) {
-      await this.#restoreClaim(cleanupPath, true);
-      return;
-    }
-    try {
-      await this.#deps.unlink(cleanupPath);
-    } catch (error) {
-      if (errorCode(error) !== 'ENOENT') {
-        throw new DaemonIdentityError('identity_write_failed');
-      }
-    }
+    await this.#moveToRecovery(
+      cleanupPath,
+      sameFileIdentity(createdIdentity, cleanupIdentity)
+        ? 'write-owned'
+        : 'write-unverified',
+    );
   }
 
   async #readSnapshot(path: string): Promise<IdentitySnapshot | undefined> {
@@ -474,7 +471,7 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
     );
     if (claimed === undefined) return false;
     try {
-      await this.#deps.unlink(claimed.path);
+      await this.#moveToRecovery(claimed.path, 'retired');
       return true;
     } catch {
       throw new DaemonIdentityError('identity_write_failed');
@@ -487,6 +484,13 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
 
   #staleCleanupPath(digest: string): string {
     return `${this.#path}.stale-${digest}-cleanup-${this.#randomToken()}`;
+  }
+
+  #recoveryPath(kind: RecoveryKind): string {
+    return join(
+      `${this.#path}.recovery`,
+      `${kind}-${this.#randomToken()}.json`,
+    );
   }
 
   #randomToken(): string {
@@ -519,7 +523,23 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
       if (code !== 'EEXIST') throw new DaemonIdentityError('identity_write_failed');
     }
     try {
-      await this.#deps.unlink(claimPath);
+      await this.#moveToRecovery(claimPath, 'retired');
+    } catch {
+      throw new DaemonIdentityError('identity_write_failed');
+    }
+  }
+
+  async #moveToRecovery(path: string, kind: RecoveryKind): Promise<void> {
+    const recoveryPath = this.#recoveryPath(kind);
+    try {
+      await this.#deps.mkdir(dirname(recoveryPath), { mode: 0o700 });
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') {
+        throw new DaemonIdentityError('identity_write_failed');
+      }
+    }
+    try {
+      await this.#deps.rename(path, recoveryPath);
     } catch (error) {
       if (errorCode(error) !== 'ENOENT') {
         throw new DaemonIdentityError('identity_write_failed');
@@ -553,7 +573,7 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
       throw new DaemonIdentityError(ownsReady ? 'identity_corrupt' : 'identity_conflict');
     }
     try {
-      await this.#deps.unlink(cleanupPath);
+      await this.#moveToRecovery(cleanupPath, 'retired');
     } catch {
       throw new DaemonIdentityError('identity_write_failed');
     }
