@@ -199,6 +199,7 @@ export interface QuukkServiceOptions {
 }
 
 export type ServiceErrorCode =
+  | 'invalid_request'
   | 'operation_unavailable'
   | 'bridge_unavailable'
   | 'runtime_not_found'
@@ -631,6 +632,13 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
 
   enable(runtimeIds: readonly string[], signal: AbortSignal): Promise<EnableResponse> {
     return this.#mutate(signal, async () => {
+      const requested = new Set(runtimeIds);
+      if (runtimeIds.length < 1
+        || runtimeIds.length > 4
+        || requested.size !== runtimeIds.length
+        || !runtimeIds.every((runtimeId) => RUNTIME_ID_PATTERN.test(runtimeId))) {
+        throw new ServiceError('invalid_request');
+      }
       let results: readonly EnableResult[];
       try {
         results = await this.#bindings.enableSelected(runtimeIds);
@@ -638,13 +646,8 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
         throw normalizedServiceError(error, 'operation_unavailable');
       }
       this.#assertConvergence();
-      const requested = new Set(runtimeIds);
       const returned = new Set(results.map((result) => result.runtimeId));
-      const exactResultSet = runtimeIds.length >= 1
-        && runtimeIds.length <= 4
-        && requested.size === runtimeIds.length
-        && runtimeIds.every((runtimeId) => RUNTIME_ID_PATTERN.test(runtimeId))
-        && results.length === runtimeIds.length
+      const exactResultSet = results.length === runtimeIds.length
         && returned.size === results.length
         && results.every((result) => requested.has(result.runtimeId));
       const fresh = this.#bindings.list();

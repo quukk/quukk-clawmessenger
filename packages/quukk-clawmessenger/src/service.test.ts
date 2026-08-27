@@ -765,6 +765,31 @@ describe('QuukkService lifecycle', () => {
 });
 
 describe('QuukkService mutations', () => {
+  it('rejects structurally invalid enable requests before any binding, router, or worker side effect', async () => {
+    const f = await fixture();
+    await start(f);
+    f.trace.length = 0;
+    const invalidRequests: readonly (readonly string[])[] = [
+      [],
+      [IDS.opencode, IDS.openclaw, IDS.codex, IDS.hermes, `rt_${'5'.repeat(32)}`],
+      [IDS.opencode, IDS.opencode],
+      ['../not-a-runtime'],
+    ];
+
+    const outcomes = await Promise.all(invalidRequests.map(async (runtimeIds) => {
+      try {
+        await f.service.enable(runtimeIds, new AbortController().signal);
+        return 'resolved';
+      } catch (error) {
+        return error instanceof ServiceError ? error.code : 'unexpected_error';
+      }
+    }));
+
+    expect(outcomes).toEqual(invalidRequests.map(() => 'invalid_request'));
+    expect(f.trace).toEqual([]);
+    await f.service.stop();
+  });
+
   it('rejects an enable result that is not an exact one-for-one request projection', async () => {
     const f = await fixture();
     await start(f);
