@@ -68,6 +68,9 @@ export function SettingsPage({ api, settings, onSettingsChange }: SettingsPagePr
         <p className="text-body-lg text-muted-foreground">
           Configure local paths and non-secret bridge preferences.
         </p>
+        <p className="text-caption text-muted-foreground">
+          Environment and CLI overrides still take precedence over these saved values.
+        </p>
       </header>
 
       <div className="grid gap-5 rounded-xl border border-surface-border bg-surface p-4 sm:p-5">

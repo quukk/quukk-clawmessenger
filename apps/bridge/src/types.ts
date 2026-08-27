@@ -53,7 +53,7 @@ export type BridgeSettings = {
 };
 
 export type ActivityEntry = {
-  id: string;
+  id: number;
   time: string;
   runtimeId?: string;
   kind: string;
@@ -61,11 +61,37 @@ export type ActivityEntry = {
 };
 
 export type DiagnosticsSnapshot = {
-  status: string;
-  generatedAt: string;
-  version?: string;
-  runtimeCount?: number;
-  [key: string]: unknown;
+  schemaVersion: 1;
+  service: {
+    version: string;
+    state: 'starting' | 'ready' | 'stopping';
+    pid: number;
+    startedAt: string;
+    listenHost: '127.0.0.1';
+    port: number | null;
+    uptimeMs: number;
+  };
+  bridge: {
+    state: 'ready' | 'unavailable';
+    pid?: number;
+    version?: string;
+    startedAt?: string;
+    probeStatus?: 'ready' | 'refreshing';
+    errorCode?: string;
+  };
+  runtimes: Array<{
+    provider: Provider;
+    status: RuntimeStatus;
+    version?: string;
+    executableName?: string;
+  }>;
+  workers: Array<{
+    runtimeId: string;
+    state: 'starting' | 'online' | 'offline' | 'backoff' | 'stopped';
+    restartCount: number;
+  }>;
+  warnings: string[];
+  logging: { dropped: number; retained: number };
 };
 
 export interface BridgeApi {

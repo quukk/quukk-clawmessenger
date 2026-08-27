@@ -10,48 +10,51 @@ import type {
   DiagnosticsSnapshot,
 } from './types';
 
+const providerSchema = z.enum(['opencode', 'openclaw', 'codex', 'hermes']);
+const providerOrder = providerSchema.options;
+const runtimeIdSchema = z.string().regex(/^rt_[0-9a-f]{32}$/);
+const safeCodeSchema = z.string().regex(/^[a-z0-9_]+$/).max(64);
 const capabilitiesSchema = z
   .object({
-    session_resume: z.boolean(),
+    sessionResume: z.boolean(),
     cancel: z.boolean(),
-    text_events: z.boolean(),
-    tool_events: z.boolean(),
-    approval_events: z.boolean(),
+    textEvents: z.boolean(),
+    toolEvents: z.boolean(),
+    approvalEvents: z.literal(false),
   })
-  .strict()
-  .transform((value) => ({
-    sessionResume: value.session_resume,
-    cancel: value.cancel,
-    textEvents: value.text_events,
-    toolEvents: value.tool_events,
-    approvalEvents: value.approval_events,
-  }));
+  .strict();
 
-const bindingSchema = z
+const safeBindingSchema = z
   .object({
+    runtimeId: runtimeIdSchema,
+    nodeId: z.string().min(1).max(137),
+    nodeName: z.string().min(1).max(128),
     enabled: z.boolean(),
-    registration_state: z.enum([
+    registrationState: z.enum([
       'unregistered',
       'registering',
       'online',
       'offline',
       'error',
     ]),
-    last_error_code: z.string().max(64).optional(),
+    lastErrorCode: safeCodeSchema.optional(),
+    updatedAt: z.string().min(1).max(64),
   })
-  .strict()
-  .transform((value) => ({
-    enabled: value.enabled,
-    registrationState: value.registration_state,
-    ...(value.last_error_code === undefined ? {} : { lastErrorCode: value.last_error_code }),
-  }));
+  .strict();
+
+const workerSchema = z
+  .object({
+    state: z.enum(['starting', 'online', 'offline', 'backoff', 'stopped']),
+    restartCount: z.number().int().nonnegative(),
+  })
+  .strict();
 
 const runtimeSchema = z
   .object({
-    id: z.string().max(128).optional(),
-    provider: z.enum(['opencode', 'openclaw', 'codex', 'hermes']),
-    version: z.string().max(256).optional(),
-    path: z.string().max(4096).optional(),
+    provider: providerSchema,
+    runtimeId: runtimeIdSchema.nullable(),
+    version: z.string().min(1).max(256).nullable(),
+    path: z.string().min(1).max(4096).nullable(),
     status: z.enum([
       'ready',
       'needs_auth',
@@ -60,100 +63,228 @@ const runtimeSchema = z
       'probe_failed',
     ]),
     capabilities: capabilitiesSchema,
-    binding: bindingSchema.optional(),
-  })
-  .strict();
-
-const runtimesEnvelopeSchema = z.object({ runtimes: z.array(runtimeSchema).max(4) }).strict();
-
-const mutationResultSchema = z
-  .object({
-    runtime_id: z.string().max(128),
-    ok: z.boolean(),
-    error_code: z.string().max(64).optional(),
-  })
-  .strict()
-  .transform((value): BindingMutationResult =>
-    value.ok
-      ? { runtimeId: value.runtime_id, ok: true }
-      : {
-          runtimeId: value.runtime_id,
-          ok: false,
-          errorCode: value.error_code ?? 'invalid_response',
-        },
-  );
-
-const mutationEnvelopeSchema = z.object({ results: z.array(mutationResultSchema).max(4) }).strict();
-const singleMutationEnvelopeSchema = z.object({ result: mutationResultSchema }).strict();
-
-const settingsSchema = z
-  .object({
-    server_url: z.string().max(4096),
-    default_workdir: z.string().max(4096).nullable(),
-    authorized_work_roots: z.array(z.string().max(4096)).max(32),
-    provider_path_overrides: z
-      .object({
-        opencode: z.string().max(4096).optional(),
-        openclaw: z.string().max(4096).optional(),
-        codex: z.string().max(4096).optional(),
-        hermes: z.string().max(4096).optional(),
-      })
-      .strict(),
-    log_level: z.enum(['silent', 'error', 'warn', 'info', 'debug']),
+    binding: safeBindingSchema.nullable(),
+    worker: workerSchema.nullable(),
   })
   .strict()
   .transform(
-    (value): BridgeSettings => ({
-      serverUrl: value.server_url,
-      defaultWorkdir: value.default_workdir,
-      authorizedWorkRoots: value.authorized_work_roots,
-      providerPathOverrides: value.provider_path_overrides,
-      logLevel: value.log_level,
+    (value): BridgeRuntime => ({
+      provider: value.provider,
+      ...(value.runtimeId === null ? {} : { id: value.runtimeId }),
+      ...(value.version === null ? {} : { version: value.version }),
+      ...(value.path === null ? {} : { path: value.path }),
+      status: value.status,
+      capabilities: value.capabilities,
+      ...(value.binding === null
+        ? {}
+        : {
+            binding: {
+              enabled: value.binding.enabled,
+              registrationState: value.binding.registrationState,
+              ...(value.binding.lastErrorCode === undefined
+                ? {}
+                : { lastErrorCode: value.binding.lastErrorCode }),
+            },
+          }),
     }),
   );
 
-const settingsEnvelopeSchema = z.object({ settings: settingsSchema }).strict();
+const runtimesEnvelopeSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    runtimes: z.array(runtimeSchema).length(providerOrder.length),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    value.runtimes.forEach((runtime, index) => {
+      if (runtime.provider !== providerOrder[index]) {
+        context.addIssue({ code: 'custom', path: ['runtimes', index, 'provider'] });
+      }
+    });
+  });
+
+const apiErrorSchema = z
+  .object({
+    code: safeCodeSchema,
+    category: z.enum([
+      'detection',
+      'authentication',
+      'registration',
+      'transport',
+      'runtime',
+      'policy',
+    ]),
+    retryable: z.boolean(),
+  })
+  .strict();
+
+const mutationResultSchema = z.discriminatedUnion('ok', [
+  z
+    .object({ runtimeId: runtimeIdSchema, ok: z.literal(true), binding: safeBindingSchema })
+    .strict(),
+  z
+    .object({ runtimeId: runtimeIdSchema, ok: z.literal(false), error: apiErrorSchema })
+    .strict(),
+]);
+
+const mutationEnvelopeSchema = z
+  .object({ schemaVersion: z.literal(1), results: z.array(mutationResultSchema).min(1).max(4) })
+  .strict();
+const singleBindingEnvelopeSchema = z
+  .object({ schemaVersion: z.literal(1), binding: safeBindingSchema })
+  .strict();
+
+const providerPathOverridesSchema = z
+  .object({
+    opencode: z.string().min(1).max(4096).optional(),
+    openclaw: z.string().min(1).max(4096).optional(),
+    codex: z.string().min(1).max(4096).optional(),
+    hermes: z.string().min(1).max(4096).optional(),
+  })
+  .strict();
+
+const storedConfigSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    serverUrl: z.string().min(1).max(4096),
+    defaultWorkdir: z.string().min(1).max(4096).nullable(),
+    authorizedWorkRoots: z.array(z.string().min(1).max(4096)).max(32),
+    providerPathOverrides: providerPathOverridesSchema,
+    logLevel: z.enum(['silent', 'error', 'warn', 'info', 'debug']),
+  })
+  .strict();
+
+function viewSettings(value: z.infer<typeof storedConfigSchema>): BridgeSettings {
+  return {
+    serverUrl: value.serverUrl,
+    defaultWorkdir: value.defaultWorkdir,
+    authorizedWorkRoots: value.authorizedWorkRoots,
+    providerPathOverrides: value.providerPathOverrides,
+    logLevel: value.logLevel,
+  };
+}
+
+const settingsEnvelopeSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    stored: storedConfigSchema,
+    effective: storedConfigSchema,
+  })
+  .strict()
+  .transform((value) => ({ settings: viewSettings(value.stored) }));
 
 const activitySchema = z
   .object({
-    id: z.string().max(128),
-    time: z.string().max(64),
-    runtime_id: z.string().max(128).optional(),
-    kind: z.string().max(64),
-    summary: z.string().max(512),
+    id: z.number().int().nonnegative(),
+    time: z.string().min(1).max(64),
+    level: z.enum(['debug', 'info', 'warn', 'error']),
+    event: safeCodeSchema,
+    runtimeId: runtimeIdSchema.optional(),
+    provider: providerSchema.optional(),
+    taskId: z.string().min(1).max(128).optional(),
+    eventType: z
+      .enum([
+        'started',
+        'text_delta',
+        'tool_started',
+        'tool_finished',
+        'status',
+        'completed',
+        'failed',
+        'cancelled',
+      ])
+      .optional(),
+    errorCode: safeCodeSchema.optional(),
+    count: z.number().int().nonnegative().optional(),
+    durationMs: z.number().int().nonnegative().optional(),
   })
   .strict()
   .transform(
     (value): ActivityEntry => ({
       id: value.id,
       time: value.time,
-      ...(value.runtime_id === undefined ? {} : { runtimeId: value.runtime_id }),
-      kind: value.kind,
-      summary: value.summary,
+      ...(value.runtimeId === undefined ? {} : { runtimeId: value.runtimeId }),
+      kind: value.level,
+      summary: value.event,
     }),
   );
 
-const activityEnvelopeSchema = z.object({ activity: z.array(activitySchema).max(200) }).strict();
+const activityEnvelopeSchema = z
+  .object({ schemaVersion: z.literal(1), events: z.array(activitySchema).max(100) })
+  .strict()
+  .transform((value) => ({ activity: value.events }));
 
 const diagnosticsSchema = z
   .object({
-    status: z.string().max(64),
-    generated_at: z.string().max(64),
-    version: z.string().max(128).optional(),
-    runtime_count: z.number().int().nonnegative().max(4).optional(),
+    schemaVersion: z.literal(1),
+    service: z
+      .object({
+        version: z.string().max(128),
+        state: z.enum(['starting', 'ready', 'stopping']),
+        pid: z.number().int().nonnegative(),
+        startedAt: z.string().max(64),
+        listenHost: z.literal('127.0.0.1'),
+        port: z.number().int().min(1).max(65_535).nullable(),
+        uptimeMs: z.number().int().nonnegative(),
+      })
+      .strict(),
+    bridge: z
+      .object({
+        state: z.enum(['ready', 'unavailable']),
+        pid: z.number().int().positive().optional(),
+        version: z.string().max(128).optional(),
+        startedAt: z.string().max(64).optional(),
+        probeStatus: z.enum(['ready', 'refreshing']).optional(),
+        errorCode: safeCodeSchema.optional(),
+      })
+      .strict(),
+    runtimes: z
+      .array(
+        z
+          .object({
+            provider: providerSchema,
+            status: z.enum([
+              'ready',
+              'needs_auth',
+              'found_not_runnable',
+              'not_found',
+              'probe_failed',
+            ]),
+            version: z.string().max(256).optional(),
+            executableName: z.string().max(256).optional(),
+          })
+          .strict(),
+      )
+      .max(4),
+    workers: z
+      .array(
+        z
+          .object({
+            runtimeId: runtimeIdSchema,
+            state: z.enum(['starting', 'online', 'offline', 'backoff', 'stopped']),
+            restartCount: z.number().int().nonnegative(),
+          })
+          .strict(),
+      )
+      .max(4),
+    warnings: z.array(safeCodeSchema).max(64),
+    logging: z
+      .object({
+        dropped: z.number().int().nonnegative(),
+        retained: z.number().int().nonnegative(),
+      })
+      .strict(),
   })
-  .loose()
-  .transform(
-    (value): DiagnosticsSnapshot => ({
-      ...value,
-      generatedAt: value.generated_at,
-      generated_at: undefined,
-      ...(value.runtime_count === undefined ? {} : { runtimeCount: value.runtime_count }),
-      runtime_count: undefined,
-    }),
-  );
+  .strict();
 
-const exchangeSchema = z.object({ csrf_token: z.string().min(32).max(256) }).strict();
+const base64UrlTokenSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
+const exchangeSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    csrfToken: base64UrlTokenSchema,
+    expiresInMs: z.literal(28_800_000),
+  })
+  .strict();
 
 type BrowserPorts = {
   fetch: typeof globalThis.fetch;
@@ -181,20 +312,21 @@ function browserPorts(): BrowserPorts {
 
 function scrubTicket(ports: BrowserPorts): string | undefined {
   const url = new URL(ports.href);
-  const ticket = url.searchParams.get('ticket') ?? undefined;
-  if (ticket === undefined) return undefined;
-  url.searchParams.delete('ticket');
-  ports.replaceUrl(`${url.pathname}${url.search}${url.hash}`);
-  return ticket;
+  if (url.hash.length === 0) return undefined;
+
+  const match = /^#ticket=([A-Za-z0-9_-]{43})$/.exec(url.hash);
+  ports.replaceUrl(url.pathname);
+  return match?.[1];
 }
 
 function wireSettings(settings: BridgeSettings) {
   return {
-    server_url: settings.serverUrl,
-    default_workdir: settings.defaultWorkdir,
-    authorized_work_roots: settings.authorizedWorkRoots,
-    provider_path_overrides: settings.providerPathOverrides,
-    log_level: settings.logLevel,
+    schemaVersion: 1 as const,
+    serverUrl: settings.serverUrl,
+    defaultWorkdir: settings.defaultWorkdir,
+    authorizedWorkRoots: settings.authorizedWorkRoots,
+    providerPathOverrides: settings.providerPathOverrides,
+    logLevel: settings.logLevel,
   };
 }
 
@@ -214,7 +346,7 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
           const data: unknown = await response.json().catch(() => undefined);
           const parsed = exchangeSchema.safeParse(data);
           if (!response.ok || !parsed.success) throw new BridgeApiError('session_exchange_failed');
-          csrfToken = parsed.data.csrf_token;
+          csrfToken = parsed.data.csrfToken;
         })
     : Promise.resolve();
 
@@ -230,16 +362,14 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
       headers: {
         Accept: 'application/json',
         ...(init.body === undefined ? {} : { 'Content-Type': 'application/json' }),
-        ...(mutating ? { 'X-CSRF-Token': csrfToken } : {}),
+        ...(mutating ? { 'X-Quukk-CSRF': csrfToken } : {}),
         ...init.headers,
       },
     });
     const data: unknown = await response.json().catch(() => undefined);
     if (!response.ok) {
-      const code = z
-        .object({ error: z.string().max(64) })
-        .safeParse(data);
-      throw new BridgeApiError(code.success ? code.data.error : 'request_failed');
+      const error = z.object({ error: apiErrorSchema }).strict().safeParse(data);
+      throw new BridgeApiError(error.success ? error.data.error.code : 'request_failed');
     }
     return data;
   }
@@ -252,7 +382,7 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
       }).runtimes;
     },
     async rescanRuntimes() {
-      const data = await request('/api/runtimes/rescan', { method: 'POST', body: '{}' });
+      const data = await request('/api/runtimes/rescan', { method: 'POST' });
       return parseWithFallback(data, runtimesEnvelopeSchema, { runtimes: [] as BridgeRuntime[] }, {
         endpoint: 'bridge.runtimes.rescan',
       }).runtimes;
@@ -260,46 +390,50 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
     async enableBindings(runtimeIds) {
       const data = await request('/api/bindings/enable', {
         method: 'POST',
-        body: JSON.stringify({ runtime_ids: runtimeIds }),
+        body: JSON.stringify({ runtimeIds }),
       });
-      return parseWithFallback(
+      const parsed = parseWithFallback(
         data,
         mutationEnvelopeSchema,
         {
           results: runtimeIds.map(
-            (runtimeId): BindingMutationResult => ({
+            (runtimeId): z.infer<typeof mutationResultSchema> => ({
               runtimeId,
               ok: false,
-              errorCode: 'invalid_response',
+              error: {
+                code: 'invalid_response',
+                category: 'runtime',
+                retryable: false,
+              },
             }),
           ),
         },
         { endpoint: 'bridge.bindings.enable' },
-      ).results;
+      );
+      return parsed.results.map(
+        (result): BindingMutationResult =>
+          result.ok
+            ? { runtimeId: result.runtimeId, ok: true }
+            : { runtimeId: result.runtimeId, ok: false, errorCode: result.error.code },
+      );
     },
     async disableBinding(runtimeId) {
-      await request(`/api/bindings/${encodeURIComponent(runtimeId)}/disable`, {
+      const data = await request(`/api/bindings/${encodeURIComponent(runtimeId)}/disable`, {
         method: 'POST',
-        body: '{}',
       });
+      const parsed = singleBindingEnvelopeSchema.safeParse(data);
+      if (!parsed.success || parsed.data.binding.runtimeId !== runtimeId) {
+        throw new BridgeApiError('invalid_response');
+      }
     },
     async reregisterBinding(runtimeId) {
       const data = await request(`/api/bindings/${encodeURIComponent(runtimeId)}/reregister`, {
         method: 'POST',
-        body: '{}',
       });
-      return parseWithFallback(
-        data,
-        singleMutationEnvelopeSchema,
-        {
-          result: {
-            runtimeId,
-            ok: false,
-            errorCode: 'invalid_response',
-          } as BindingMutationResult,
-        },
-        { endpoint: 'bridge.bindings.reregister' },
-      ).result;
+      const parsed = singleBindingEnvelopeSchema.safeParse(data);
+      return parsed.success && parsed.data.binding.runtimeId === runtimeId
+        ? { runtimeId, ok: true }
+        : { runtimeId, ok: false, errorCode: 'invalid_response' };
     },
     async getActivity() {
       const data = await request('/api/activity');
@@ -312,7 +446,23 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
       return parseWithFallback(
         data,
         diagnosticsSchema,
-        { status: 'unavailable', generatedAt: '' } satisfies DiagnosticsSnapshot,
+        {
+          schemaVersion: 1,
+          service: {
+            version: '',
+            state: 'starting',
+            pid: 0,
+            startedAt: '',
+            listenHost: '127.0.0.1',
+            port: null,
+            uptimeMs: 0,
+          },
+          bridge: { state: 'unavailable', errorCode: 'invalid_response' },
+          runtimes: [],
+          workers: [],
+          warnings: ['diagnostics_unavailable'],
+          logging: { dropped: 0, retained: 0 },
+        } satisfies DiagnosticsSnapshot,
         { endpoint: 'bridge.diagnostics' },
       );
     },
@@ -336,11 +486,11 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
     async updateSettings(settings) {
       const data = await request('/api/settings', {
         method: 'PUT',
-        body: JSON.stringify(wireSettings(settings)),
+        body: JSON.stringify({ settings: wireSettings(settings) }),
       });
-      return parseWithFallback(data, settingsEnvelopeSchema, { settings }, {
-        endpoint: 'bridge.settings.update',
-      }).settings;
+      const parsed = settingsEnvelopeSchema.safeParse(data);
+      if (!parsed.success) throw new BridgeApiError('invalid_response');
+      return parsed.data.settings;
     },
   };
 }

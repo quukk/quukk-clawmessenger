@@ -6,7 +6,7 @@ import { StrictMode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { App } from './app';
-import type { BridgeApi, BridgeRuntime, BridgeSettings } from './types';
+import type { BridgeApi, BridgeRuntime, BridgeSettings, DiagnosticsSnapshot } from './types';
 
 const capabilities = {
   sessionResume: true,
@@ -43,6 +43,26 @@ const settings: BridgeSettings = {
   logLevel: 'info',
 };
 
+function diagnostics(version: string, startedAt = '2026-08-27T08:00:00Z'): DiagnosticsSnapshot {
+  return {
+    schemaVersion: 1,
+    service: {
+      version,
+      state: 'ready',
+      pid: 123,
+      startedAt,
+      listenHost: '127.0.0.1',
+      port: 48321,
+      uptimeMs: 1_000,
+    },
+    bridge: { state: 'ready' },
+    runtimes: [],
+    workers: [],
+    warnings: [],
+    logging: { dropped: 0, retained: 1 },
+  };
+}
+
 function createApi(overrides: Partial<BridgeApi> = {}): BridgeApi {
   return {
     getRuntimes: vi.fn().mockResolvedValue(runtimes),
@@ -55,19 +75,14 @@ function createApi(overrides: Partial<BridgeApi> = {}): BridgeApi {
     }),
     getActivity: vi.fn().mockResolvedValue([
       {
-        id: 'activity-1',
+        id: 1,
         time: '2026-08-27T08:00:00Z',
         runtimeId: runtimes[0]!.id,
         kind: 'message',
         summary: 'Message routed',
       },
     ]),
-    getDiagnostics: vi.fn().mockResolvedValue({
-      status: 'ok',
-      generatedAt: '2026-08-27T08:00:00Z',
-      version: '0.1.0-beta.1',
-      runtimeCount: 2,
-    }),
+    getDiagnostics: vi.fn().mockResolvedValue(diagnostics('0.1.0-beta.1')),
     getSettings: vi.fn().mockResolvedValue(settings),
     updateSettings: vi.fn().mockImplementation(async (next) => next),
     ...overrides,
@@ -124,14 +139,14 @@ describe('bridge app', () => {
     const api = createApi({
       getActivity: vi.fn().mockResolvedValue([
         {
-          id: 'activity-1',
+          id: 1,
           time: '2026-08-27T08:00:00Z',
           runtimeId: runtimes[0]!.id,
           kind: 'message',
           summary: 'Message routed',
         },
         {
-          id: 'activity-2',
+          id: 2,
           time: '2026-08-27T08:01:00Z',
           runtimeId: 'rt_unknown',
           kind: 'message',
@@ -173,13 +188,13 @@ describe('bridge app', () => {
     expect(getDiagnostics).toHaveBeenCalledTimes(2);
 
     await act(async () => {
-      newer.resolve({ status: 'ok', generatedAt: '2026-08-27T08:01:00Z', version: 'newer' });
+      newer.resolve(diagnostics('newer', '2026-08-27T08:01:00Z'));
       await newer.promise;
     });
     expect(screen.getByText(/newer/i)).toBeVisible();
 
     await act(async () => {
-      older.resolve({ status: 'ok', generatedAt: '2026-08-27T08:00:00Z', version: 'older' });
+      older.resolve(diagnostics('older'));
       await older.promise;
     });
     expect(screen.getByText(/newer/i)).toBeVisible();
@@ -240,6 +255,7 @@ describe('bridge app', () => {
     await screen.findByRole('heading', { name: /choose local agents/i });
 
     await user.click(screen.getByRole('button', { name: /^settings$/i }));
+    expect(screen.getByText(/environment and cli overrides still take precedence/i)).toBeVisible();
     const defaultDirectory = await screen.findByLabelText(/default work directory/i);
     await user.clear(defaultDirectory);
     await user.type(defaultDirectory, 'C:\\work\\second-project');
