@@ -1,12 +1,16 @@
 import { spawn as spawnProcess } from 'node:child_process';
 import { randomBytes as cryptoRandomBytes } from 'node:crypto';
+import { realpath as fsRealpath } from 'node:fs';
+import { lstat as fsLstat, open as fsOpen } from 'node:fs/promises';
 import {
   request as nodeHttpRequest,
   type ClientRequest,
   type IncomingMessage,
   type RequestOptions,
 } from 'node:http';
-import { isAbsolute, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 import { z } from 'zod';
@@ -14,6 +18,7 @@ import { z } from 'zod';
 import {
   CredentialFileSchema,
   DEFAULT_CONFIG,
+  LocalStateSchema,
   PROVIDERS,
   StoredConfigSchema,
   type ConfigOverrides,
@@ -1047,6 +1052,11 @@ export type ProductionDaemonSpawn = (
   },
 ) => ProductionDaemonChild;
 
+export interface ProductionLogSnapshot {
+  fileId: string;
+  bytes: Buffer;
+}
+
 export interface ProductionCliRuntimeDependencies {
   identityStore?: DaemonIdentityPersistence;
   processId?: number;
@@ -1060,9 +1070,13 @@ export interface ProductionCliRuntimeDependencies {
   ) => Promise<ProductionCliServicePort>;
   signals?: ProductionSignalPort;
   spawn?: ProductionDaemonSpawn;
-  sleep?: (milliseconds: number) => Promise<unknown>;
+  sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<unknown>;
   monotonicNow?: () => number;
   kill?: (pid: number, signal: 0) => unknown;
+  readLogSnapshot?: (
+    filePath: string,
+    maximumBytes: number,
+  ) => Promise<ProductionLogSnapshot | undefined>;
 }
 
 export interface ProductionCliRuntimeOptions {
@@ -1082,7 +1096,9 @@ class ProductionCliFailure extends Error {
 
 const CONTROL_RESPONSE_LIMIT = 1 << 20;
 const CREDENTIAL_FILE_LIMIT = 4 << 20;
+const METADATA_FILE_LIMIT = 1 << 20;
 const CHILD_INPUT_LIMIT = 64 << 10;
+const LOG_SNAPSHOT_LIMIT = 8 << 20;
 const START_WAIT_MS = 65_000;
 const SHUTDOWN_WAIT_MS = 20_000;
 const POLL_MS = 100;
@@ -1191,6 +1207,87 @@ async function defaultReadStdin(maximumBytes: number): Promise<Buffer> {
     chunks.push(bytes);
   }
   return Buffer.concat(chunks);
+}
+
+function sameLogFile(
+  left: { dev: number | bigint; ino: number | bigint; birthtimeMs: number },
+  right: { dev: number | bigint; ino: number | bigint; birthtimeMs: number },
+): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.birthtimeMs === right.birthtimeMs;
+}
+
+async function defaultReadLogSnapshot(
+  filePath: string,
+  maximumBytes: number,
+): Promise<ProductionLogSnapshot | undefined> {
+  let before: Awaited<ReturnType<typeof fsLstat>>;
+  try {
+    before = await fsLstat(filePath);
+  } catch (error) {
+    if (errorCodeOf(error) === 'ENOENT') return undefined;
+    throw productionFailure('operation_unavailable');
+  }
+  if (!before.isFile() || before.isSymbolicLink()) {
+    throw productionFailure('operation_unavailable');
+  }
+  let handle: Awaited<ReturnType<typeof fsOpen>>;
+  try {
+    handle = await fsOpen(filePath, 'r');
+  } catch (error) {
+    if (errorCodeOf(error) === 'ENOENT') return undefined;
+    throw productionFailure('operation_unavailable');
+  }
+  try {
+    const opened = await handle.stat();
+    if (
+      !opened.isFile()
+      || !sameLogFile(before, opened)
+      || !Number.isSafeInteger(opened.size)
+      || opened.size < 0
+      || opened.size > maximumBytes
+    ) throw productionFailure('operation_unavailable');
+    const bytes = Buffer.alloc(opened.size);
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const read = await handle.read(bytes, offset, bytes.byteLength - offset, offset);
+      if (read.bytesRead === 0) break;
+      offset += read.bytesRead;
+    }
+    const after = await handle.stat();
+    if (offset !== bytes.byteLength || after.size !== opened.size || !sameLogFile(opened, after)) {
+      return undefined;
+    }
+    return {
+      fileId: `${String(opened.dev)}:${String(opened.ino)}:${opened.birthtimeMs}`,
+      bytes,
+    };
+  } catch (error) {
+    if (error instanceof ProductionCliFailure) throw error;
+    throw productionFailure('operation_unavailable');
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+function completeLogLines(bytes: Buffer, offset: number): { lines: string[]; offset: number } {
+  const lastLineFeed = bytes.lastIndexOf(0x0a);
+  if (lastLineFeed < offset) return { lines: [], offset };
+  let decoded: string;
+  try {
+    decoded = new TextDecoder('utf-8', { fatal: true }).decode(
+      bytes.subarray(offset, lastLineFeed + 1),
+    );
+  } catch {
+    throw productionFailure('operation_unavailable');
+  }
+  const lines = decoded.split('\n');
+  lines.pop();
+  if (lines.some((line) => line.includes('\r') || Buffer.byteLength(line, 'utf8') > 8_192)) {
+    throw productionFailure('operation_unavailable');
+  }
+  return { lines, offset: lastLineFeed + 1 };
 }
 
 function rawResponseHeaders(response: IncomingMessage, name: string): string[] {
@@ -1401,11 +1498,21 @@ export function createProductionCliRuntime(
   const request = dependencies.request ?? defaultProductionRequest;
   const spawn = dependencies.spawn ?? defaultProductionDaemonSpawn;
   const sleep = dependencies.sleep
-    ?? ((milliseconds: number) => new Promise<void>((resolvePromise) => {
-      setTimeout(resolvePromise, milliseconds);
+    ?? ((milliseconds: number, signal?: AbortSignal) => new Promise<void>((resolvePromise, rejectPromise) => {
+      const aborted = (): void => {
+        clearTimeout(timer);
+        rejectPromise(productionFailure('operation_unavailable'));
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', aborted);
+        resolvePromise();
+      }, milliseconds);
+      signal?.addEventListener('abort', aborted, { once: true });
+      if (signal?.aborted === true) aborted();
     }));
   const monotonicNow = dependencies.monotonicNow ?? (() => performance.now());
   const kill = dependencies.kill ?? ((pid: number, signal: 0) => process.kill(pid, signal));
+  const readLogSnapshot = dependencies.readLogSnapshot ?? defaultReadLogSnapshot;
   const startService = dependencies.startService
     ?? (startProductionService as (value: ComposeProductionServiceOptions) => Promise<QuukkService>);
   const signals = dependencies.signals ?? process;
@@ -1470,12 +1577,14 @@ export function createProductionCliRuntime(
 
   const readCredential = async (identity: ReadyDaemonIdentity): Promise<string> => {
     try {
-      const credentials = await readJson(
+      const rawCredentials = await readJson(
         paths.credentials,
         CredentialFileSchema,
         CREDENTIAL_FILE_LIMIT,
       );
-      return deriveControlCredential(credentials.bridgeSecret, identity.instance_id);
+      const credentials = CredentialFileSchema.safeParse(rawCredentials);
+      if (!credentials.success) throw productionFailure('process_unverified');
+      return deriveControlCredential(credentials.data.bridgeSecret, identity.instance_id);
     } catch {
       throw productionFailure('process_unverified');
     }
@@ -1700,6 +1809,23 @@ export function createProductionCliRuntime(
     }
   };
 
+  const doctorWarnings = async (): Promise<string[]> => {
+    const warnings: string[] = [];
+    try {
+      const config = await readJson(paths.config, StoredConfigSchema, METADATA_FILE_LIMIT);
+      if (!StoredConfigSchema.safeParse(config).success) throw productionFailure('invalid_config');
+    } catch {
+      warnings.push('config_unavailable');
+    }
+    try {
+      const state = await readJson(paths.state, LocalStateSchema, METADATA_FILE_LIMIT);
+      if (!LocalStateSchema.safeParse(state).success) throw productionFailure('invalid_config');
+    } catch {
+      warnings.push('state_unavailable');
+    }
+    return warnings;
+  };
+
   return {
     inspect,
     start: startBackground,
@@ -1794,12 +1920,86 @@ export function createProductionCliRuntime(
       }
       return recoverExactStale(identity.data, stale.contentDigest);
     },
-    async *readLogs(): AsyncIterable<string> {},
+    async *readLogs(input): AsyncIterable<string> {
+      if (
+        !Number.isSafeInteger(input.lines)
+        || input.lines < 1
+        || input.lines > 1_000
+        || typeof input.follow !== 'boolean'
+      ) throw productionFailure('invalid_config');
+      const controller = new AbortController();
+      const interrupted = (): void => controller.abort();
+      signals.once('SIGINT', interrupted);
+      signals.once('SIGTERM', interrupted);
+      let previous: ProductionLogSnapshot | undefined;
+      let emittedOffset = 0;
+      let initial = true;
+      try {
+        while (!controller.signal.aborted) {
+          let snapshot: ProductionLogSnapshot | undefined;
+          try {
+            snapshot = await readLogSnapshot(paths.bridgeLog, LOG_SNAPSHOT_LIMIT);
+          } catch {
+            throw productionFailure('operation_unavailable');
+          }
+          if (controller.signal.aborted) return;
+          if (
+            snapshot !== undefined
+            && (
+              typeof snapshot.fileId !== 'string'
+              || snapshot.fileId.length < 1
+              || snapshot.fileId.length > 256
+              || !Buffer.isBuffer(snapshot.bytes)
+              || snapshot.bytes.byteLength > LOG_SNAPSHOT_LIMIT
+            )
+          ) throw productionFailure('operation_unavailable');
+          if (snapshot === undefined) {
+            previous = undefined;
+            emittedOffset = 0;
+          } else if (initial) {
+            const complete = completeLogLines(snapshot.bytes, 0);
+            for (const line of complete.lines.slice(-input.lines)) yield line;
+            emittedOffset = complete.offset;
+            previous = { fileId: snapshot.fileId, bytes: Buffer.from(snapshot.bytes) };
+          } else {
+            const appended = previous !== undefined
+              && previous.fileId === snapshot.fileId
+              && snapshot.bytes.byteLength >= previous.bytes.byteLength
+              && snapshot.bytes.subarray(0, previous.bytes.byteLength).equals(previous.bytes);
+            const complete = completeLogLines(snapshot.bytes, appended ? emittedOffset : 0);
+            for (const line of complete.lines) yield line;
+            emittedOffset = complete.offset;
+            previous = { fileId: snapshot.fileId, bytes: Buffer.from(snapshot.bytes) };
+          }
+          initial = false;
+          if (!input.follow) return;
+          try {
+            await sleep(250, controller.signal);
+          } catch {
+            if (controller.signal.aborted) return;
+            throw productionFailure('operation_unavailable');
+          }
+        }
+      } finally {
+        controller.abort();
+        signals.off('SIGINT', interrupted);
+        signals.off('SIGTERM', interrupted);
+      }
+    },
     async doctor(): Promise<CliDiagnostics> {
+      const warnings = await doctorWarnings();
+      const withWarnings = warnings.length === 0 ? {} : { warnings };
       const value = await inspect();
-      if (value.kind === 'not_running') return { schemaVersion: 1, state: 'offline' };
+      if (value.kind === 'not_running') {
+        return { schemaVersion: 1, state: 'offline', ...withWarnings };
+      }
       if (value.kind === 'corrupt') {
-        return { schemaVersion: 1, state: 'corrupt', errorCode: 'identity_corrupt' };
+        return {
+          schemaVersion: 1,
+          state: 'corrupt',
+          errorCode: 'identity_corrupt',
+          ...withWarnings,
+        };
       }
       if (value.kind === 'starting') {
         return {
@@ -1810,6 +2010,7 @@ export function createProductionCliRuntime(
             version: value.identity.version,
             startedAt: value.identity.started_at,
           },
+          ...withWarnings,
         };
       }
       const status = await control(value.identity, 'status');
@@ -1824,7 +2025,155 @@ export function createProductionCliRuntime(
           controlState: status.command === 'status' ? status.value.state : 'ready',
         },
         runtimes: [],
+        ...withWarnings,
       };
     },
   };
+}
+
+export interface PackagedCliCandidate {
+  invokedBinPath: string;
+  packagedBinPath: string;
+  argv: readonly string[];
+}
+
+export interface PackagedCliEntryDependencies {
+  realpathNative(path: string): Promise<string>;
+  homeDirectory(): string;
+  environment: NodeJS.ProcessEnv;
+  execPath: string;
+  processId: number;
+  signals: ProductionSignalPort;
+  platform: NodeJS.Platform;
+  runtimeFactory(options: ProductionCliRuntimeOptions): CliRuntimePort;
+  browserFactory(options: SystemBrowserPortOptions): BrowserPort;
+  cliRunner(argv: readonly string[], options: RunCliOptions): Promise<number>;
+  io: CliIO;
+  setExitCode(code: number): void;
+}
+
+export function packagedCliCandidate(
+  processArgv: readonly string[],
+  moduleUrl: string,
+): PackagedCliCandidate | undefined {
+  if (processArgv.length < 2 || processArgv.some((value) => typeof value !== 'string')) {
+    return undefined;
+  }
+  let modulePath: string;
+  try {
+    modulePath = fileURLToPath(moduleUrl);
+  } catch {
+    return undefined;
+  }
+  if (basename(modulePath) !== 'cli.js' || basename(dirname(modulePath)) !== 'dist') {
+    return undefined;
+  }
+  const packageRoot = dirname(dirname(modulePath));
+  const packagedBinPath = resolve(packageRoot, 'bin', 'quukk-clawmessenger.js');
+  const invokedBinPath = resolve(processArgv[1]!);
+  const localShimPath = resolve(dirname(packageRoot), '.bin', 'quukk-clawmessenger');
+  if (invokedBinPath !== packagedBinPath && invokedBinPath !== localShimPath) {
+    return undefined;
+  }
+  return {
+    invokedBinPath,
+    packagedBinPath,
+    argv: processArgv.slice(2),
+  };
+}
+
+function defaultNativeRealpath(path: string): Promise<string> {
+  return new Promise<string>((resolvePromise, rejectPromise) => {
+    fsRealpath.native(path, (error, resolvedPath) => {
+      if (error === null) resolvePromise(resolvedPath);
+      else rejectPromise(error);
+    });
+  });
+}
+
+let packagedEntryStarted = false;
+
+export async function runPackagedCliEntry(
+  candidate: PackagedCliCandidate,
+  dependencies: PackagedCliEntryDependencies,
+): Promise<boolean> {
+  if (packagedEntryStarted) return false;
+  if (
+    !isAbsolute(candidate.invokedBinPath)
+    || !isAbsolute(candidate.packagedBinPath)
+    || !Array.isArray(candidate.argv)
+    || candidate.argv.some((value) => typeof value !== 'string')
+  ) return false;
+  let invokedRealpath: string;
+  let packagedRealpath: string;
+  try {
+    [invokedRealpath, packagedRealpath] = await Promise.all([
+      dependencies.realpathNative(candidate.invokedBinPath),
+      dependencies.realpathNative(candidate.packagedBinPath),
+    ]);
+  } catch {
+    return false;
+  }
+  const comparable = (value: string): string => dependencies.platform === 'win32'
+    ? resolve(value).toLowerCase()
+    : resolve(value);
+  if (comparable(invokedRealpath) !== comparable(packagedRealpath) || packagedEntryStarted) {
+    return false;
+  }
+  packagedEntryStarted = true;
+  let code = 1;
+  try {
+    const homeDirectory = dependencies.homeDirectory();
+    const runtime = dependencies.runtimeFactory({
+      homeDirectory,
+      processEnvironment: dependencies.environment,
+      execPath: dependencies.execPath,
+      packagedBinPath: candidate.packagedBinPath,
+      dependencies: {
+        processId: dependencies.processId,
+        signals: dependencies.signals,
+      },
+    });
+    const browser = dependencies.browserFactory({
+      platform: dependencies.platform,
+      environment: dependencies.environment,
+    });
+    code = await dependencies.cliRunner(candidate.argv, {
+      runtime,
+      browser,
+      io: dependencies.io,
+      environment: dependencies.environment,
+    });
+    if (!Number.isInteger(code) || code < 0 || code > 255) code = 1;
+  } catch {
+    dependencies.io.stderr('quukk-clawmessenger: internal_failure');
+    code = 1;
+  }
+  dependencies.setExitCode(code);
+  return true;
+}
+
+const automaticCandidate = packagedCliCandidate(process.argv, import.meta.url);
+if (automaticCandidate !== undefined) {
+  const io: CliIO = {
+    stdout: (value) => { process.stdout.write(`${value}\n`); },
+    stderr: (value) => { process.stderr.write(`${value}\n`); },
+  };
+  void runPackagedCliEntry(automaticCandidate, {
+    realpathNative: defaultNativeRealpath,
+    homeDirectory: homedir,
+    environment: process.env,
+    execPath: process.execPath,
+    processId: process.pid,
+    signals: process,
+    platform: process.platform,
+    runtimeFactory: createProductionCliRuntime,
+    browserFactory: createSystemBrowserPort,
+    cliRunner: runCli,
+    io,
+    setExitCode: (code) => { process.exitCode = code; },
+  }).catch(() => {
+    io.stderr('quukk-clawmessenger: internal_failure');
+    process.exitCode = 1;
+  });
 }

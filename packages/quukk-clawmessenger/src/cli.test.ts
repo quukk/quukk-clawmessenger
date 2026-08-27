@@ -1,16 +1,20 @@
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { describe, expect, it, vi } from 'vitest';
 
 import {
   createProductionCliRuntime,
   createSystemBrowserPort,
+  packagedCliCandidate,
+  runPackagedCliEntry,
   runCli,
   type CliRuntimePort,
 } from './cli.js';
 import { localPaths } from './config/paths.js';
+import { DEFAULT_CONFIG } from './config/schema.js';
 import { deriveControlCredential } from './http/security.js';
 import { VERSION } from './version.js';
 
@@ -2000,5 +2004,187 @@ describe('createProductionCliRuntime', () => {
 
     expect(error).toMatchObject({ code: 'process_unverified', message: 'process_unverified' });
     expect(JSON.stringify(error)).not.toMatch(/SECRET|unsafe/);
+  });
+
+  it('tails only complete bounded log lines and follows append, rotation, and truncation', async () => {
+    const store = identityStore();
+    const signals = new EventEmitter();
+    const snapshots = [
+      { fileId: 'file-a', bytes: Buffer.from('old-one\nold-two\npartial', 'utf8') },
+      { fileId: 'file-a', bytes: Buffer.from('old-one\nold-two\npartial-new\n', 'utf8') },
+      { fileId: 'file-b', bytes: Buffer.from('rotated\n', 'utf8') },
+      { fileId: 'file-b', bytes: Buffer.from('truncated\n', 'utf8') },
+    ];
+    let snapshotIndex = 0;
+    const readLogSnapshot = vi.fn(async () => {
+      const value = snapshots[snapshotIndex++];
+      if (value !== undefined) return value;
+      signals.emit('SIGINT');
+      return snapshots.at(-1);
+    });
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readLogSnapshot,
+      signals,
+      sleep: vi.fn(async () => undefined),
+    }) as never);
+    const lines: string[] = [];
+
+    for await (const line of runtime.readLogs({ lines: 1, follow: true })) lines.push(line);
+
+    expect(lines).toEqual(['old-two', 'partial-new', 'rotated', 'truncated']);
+    expect(readLogSnapshot).toHaveBeenCalledTimes(5);
+    for (const call of readLogSnapshot.mock.calls) {
+      expect(call).toEqual([localPaths(HOME).bridgeLog, 8 << 20]);
+    }
+    expect(signals.listenerCount('SIGINT')).toBe(0);
+    expect(signals.listenerCount('SIGTERM')).toBe(0);
+  });
+
+  it('treats a missing fixed bridge log as an empty bounded tail', async () => {
+    const store = identityStore();
+    const readLogSnapshot = vi.fn(async () => undefined);
+    const runtime = createProductionCliRuntime(productionOptions(store, { readLogSnapshot }) as never);
+    const lines: string[] = [];
+
+    for await (const line of runtime.readLogs({ lines: 100, follow: false })) lines.push(line);
+
+    expect(lines).toEqual([]);
+    expect(readLogSnapshot).toHaveBeenCalledWith(localPaths(HOME).bridgeLog, 8 << 20);
+  });
+
+  it('doctor reads only bounded strict metadata, identity, credentials, and authenticated status', async () => {
+    const store = identityStore({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
+    const paths = localPaths(HOME);
+    const installSentinel = '00000000-0000-4000-8000-000000000000';
+    const readJson = vi.fn(async (filePath: string) => {
+      if (filePath === paths.config) return DEFAULT_CONFIG;
+      if (filePath === paths.state) {
+        return { schemaVersion: 1 as const, installId: installSentinel, bindings: [] };
+      }
+      if (filePath === paths.credentials) {
+        return { schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {} };
+      }
+      throw new Error('unexpected_metadata_path');
+    });
+    const transport = requestSequence([
+      controlFrame({ schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' }),
+    ]);
+    const forbiddenLogRead = vi.fn(async () => {
+      throw new Error('doctor_must_not_read_log');
+    });
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readJson,
+      request: transport.request,
+      readLogSnapshot: forbiddenLogRead,
+    }) as never);
+
+    const diagnostics = await runtime.doctor();
+
+    expect(diagnostics).toEqual({
+      schemaVersion: 1,
+      state: 'ready',
+      service: {
+        pid: READY_IDENTITY.pid,
+        version: VERSION,
+        startedAt: READY_IDENTITY.started_at,
+        port: 43210,
+        controlState: 'ready',
+      },
+      runtimes: [],
+    });
+    expect(readJson).toHaveBeenCalledWith(paths.config, expect.anything(), 1 << 20);
+    expect(readJson).toHaveBeenCalledWith(paths.state, expect.anything(), 1 << 20);
+    expect(readJson).toHaveBeenCalledWith(paths.credentials, expect.anything(), 4 << 20);
+    expect(transport.bodies).toEqual(['{"command":"status"}']);
+    expect(forbiddenLogRead).not.toHaveBeenCalled();
+    const serialized = JSON.stringify(diagnostics);
+    expect(serialized).not.toContain(HOME);
+    expect(serialized).not.toContain(installSentinel);
+    expect(serialized).not.toContain(BRIDGE_SECRET);
+    expect(serialized).not.toMatch(/tokenRef|nodeId|path/i);
+  });
+
+  it('uses a pure packaged-path guard before any self-execution I/O', () => {
+    const packageRoot = resolve('selfexec', 'node_modules', 'quukk-clawmessenger');
+    const moduleUrl = pathToFileURL(resolve(packageRoot, 'dist', 'cli.js')).href;
+
+    expect(packagedCliCandidate([
+      EXECUTABLE, resolve('ordinary-importer.js'), 'status',
+    ], moduleUrl)).toBeUndefined();
+    expect(packagedCliCandidate([
+      EXECUTABLE, resolve(packageRoot, 'bin', 'quukk-clawmessenger.js'), 'status', '--json',
+    ], moduleUrl)).toEqual({
+      invokedBinPath: resolve(packageRoot, 'bin', 'quukk-clawmessenger.js'),
+      packagedBinPath: resolve(packageRoot, 'bin', 'quukk-clawmessenger.js'),
+      argv: ['status', '--json'],
+    });
+    expect(packagedCliCandidate([
+      EXECUTABLE,
+      resolve(packageRoot, '..', '.bin', 'quukk-clawmessenger'),
+      'doctor',
+    ], moduleUrl)).toEqual(expect.objectContaining({ argv: ['doctor'] }));
+    expect(packagedCliCandidate([
+      EXECUTABLE, resolve(packageRoot, 'bin', 'quukk-clawmessenger.js'),
+    ], pathToFileURL(resolve(packageRoot, 'src', 'cli.ts')).href)).toBeUndefined();
+  });
+
+  it('runs once only after native realpaths match and passes explicit production defaults', async () => {
+    const packageRoot = resolve('selfexec-entry', 'node_modules', 'quukk-clawmessenger');
+    const packagedBinPath = resolve(packageRoot, 'bin', 'quukk-clawmessenger.js');
+    const invokedBinPath = resolve(packageRoot, '..', '.bin', 'quukk-clawmessenger');
+    const candidate = {
+      invokedBinPath,
+      packagedBinPath,
+      argv: ['status', '--json'],
+    };
+    const realpathNative = vi.fn(async (path: string) => {
+      if (path === invokedBinPath || path === packagedBinPath) return packagedBinPath;
+      throw new Error('unexpected_realpath');
+    });
+    const runtime = harness().runtime;
+    const runtimeFactory = vi.fn(() => runtime);
+    const browser = { open: vi.fn(async () => undefined) };
+    const browserFactory = vi.fn(() => browser);
+    const cliRunner = vi.fn(async () => 4);
+    const setExitCode = vi.fn();
+    const homeDirectory = vi.fn(() => HOME);
+    const signals = new EventEmitter();
+    const environment = { OPENCODE_API_KEY: 'PROVIDER-SELFEXEC-SENTINEL' };
+    const io = { stdout: vi.fn(), stderr: vi.fn() };
+    const dependencies = {
+      realpathNative,
+      homeDirectory,
+      environment,
+      execPath: EXECUTABLE,
+      processId: READY_IDENTITY.pid,
+      signals,
+      platform: 'win32' as const,
+      runtimeFactory,
+      browserFactory,
+      cliRunner,
+      io,
+      setExitCode,
+    };
+
+    await expect(runPackagedCliEntry(candidate, dependencies as never)).resolves.toBe(true);
+    await expect(runPackagedCliEntry(candidate, dependencies as never)).resolves.toBe(false);
+
+    expect(realpathNative).toHaveBeenCalledTimes(2);
+    expect(homeDirectory).toHaveBeenCalledOnce();
+    expect(runtimeFactory).toHaveBeenCalledWith({
+      homeDirectory: HOME,
+      processEnvironment: environment,
+      execPath: EXECUTABLE,
+      packagedBinPath,
+      dependencies: { processId: READY_IDENTITY.pid, signals },
+    });
+    expect(browserFactory).toHaveBeenCalledWith({
+      platform: 'win32', environment,
+    });
+    expect(cliRunner).toHaveBeenCalledWith(candidate.argv, {
+      runtime, browser, io, environment,
+    });
+    expect(setExitCode).toHaveBeenCalledOnce();
+    expect(setExitCode).toHaveBeenCalledWith(4);
   });
 });
