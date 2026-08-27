@@ -1,4 +1,3 @@
-import { parseWithFallback } from '@multica/core/api/schema';
 import { z } from 'zod';
 
 import type {
@@ -286,6 +285,11 @@ const exchangeSchema = z
   })
   .strict();
 
+function parseSafely<T>(data: unknown, schema: z.ZodType, fallback: T): T {
+  const parsed = schema.safeParse(data);
+  return parsed.success ? (parsed.data as T) : fallback;
+}
+
 type BrowserPorts = {
   fetch: typeof globalThis.fetch;
   href: string;
@@ -377,22 +381,26 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
   return {
     async getRuntimes() {
       const data = await request('/api/runtimes');
-      return parseWithFallback(data, runtimesEnvelopeSchema, { runtimes: [] as BridgeRuntime[] }, {
-        endpoint: 'bridge.runtimes',
-      }).runtimes;
+      return parseSafely(
+        data,
+        runtimesEnvelopeSchema,
+        { runtimes: [] as BridgeRuntime[] },
+      ).runtimes;
     },
     async rescanRuntimes() {
       const data = await request('/api/runtimes/rescan', { method: 'POST' });
-      return parseWithFallback(data, runtimesEnvelopeSchema, { runtimes: [] as BridgeRuntime[] }, {
-        endpoint: 'bridge.runtimes.rescan',
-      }).runtimes;
+      return parseSafely(
+        data,
+        runtimesEnvelopeSchema,
+        { runtimes: [] as BridgeRuntime[] },
+      ).runtimes;
     },
     async enableBindings(runtimeIds) {
       const data = await request('/api/bindings/enable', {
         method: 'POST',
         body: JSON.stringify({ runtimeIds }),
       });
-      const parsed = parseWithFallback(
+      const parsed = parseSafely(
         data,
         mutationEnvelopeSchema,
         {
@@ -408,7 +416,6 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
             }),
           ),
         },
-        { endpoint: 'bridge.bindings.enable' },
       );
       return parsed.results.map(
         (result): BindingMutationResult =>
@@ -437,13 +444,15 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
     },
     async getActivity() {
       const data = await request('/api/activity');
-      return parseWithFallback(data, activityEnvelopeSchema, { activity: [] as ActivityEntry[] }, {
-        endpoint: 'bridge.activity',
-      }).activity;
+      return parseSafely(
+        data,
+        activityEnvelopeSchema,
+        { activity: [] as ActivityEntry[] },
+      ).activity;
     },
     async getDiagnostics() {
       const data = await request('/api/diagnostics');
-      return parseWithFallback(
+      return parseSafely(
         data,
         diagnosticsSchema,
         {
@@ -463,12 +472,11 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
           warnings: ['diagnostics_unavailable'],
           logging: { dropped: 0, retained: 0 },
         } satisfies DiagnosticsSnapshot,
-        { endpoint: 'bridge.diagnostics' },
       );
     },
     async getSettings() {
       const data = await request('/api/settings');
-      return parseWithFallback(
+      return parseSafely(
         data,
         settingsEnvelopeSchema,
         {
@@ -480,7 +488,6 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
             logLevel: 'info',
           } satisfies BridgeSettings,
         },
-        { endpoint: 'bridge.settings' },
       ).settings;
     },
     async updateSettings(settings) {
