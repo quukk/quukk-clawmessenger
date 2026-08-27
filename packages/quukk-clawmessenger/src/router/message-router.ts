@@ -248,6 +248,11 @@ interface Lane {
   queue: LaneItem[];
 }
 
+interface InflightBindingOperations {
+  identity: WorkerIdentity;
+  operations: Set<Promise<void>>;
+}
+
 interface ActiveTask {
   identity: WorkerIdentity;
   conversation: ConversationIdentity;
@@ -307,7 +312,7 @@ interface DiscussionActive {
   watchdogTimer?: unknown;
   watchdogPromise?: Promise<void>;
   cleanupPromise?: Promise<void>;
-  directOwner?: V2DirectOwner;
+  logicalOwner?: V2LogicalOwner;
 }
 
 interface V1Owner {
@@ -317,11 +322,21 @@ interface V1Owner {
   task?: V1Active;
 }
 
-interface V2DirectOwner {
+interface V2LogicalOwner {
   logicalKey: string;
-  token: string;
-  state: 'prestart' | 'active' | 'terminal';
+  senderId: string;
+  discussionId: string;
+  stateVersion: number;
+  round: number;
+  state: 'prestart' | 'committing' | 'active' | 'terminal';
   expiresAt: number;
+}
+
+interface V2Cancellation {
+  senderId: string;
+  discussionId: string;
+  stateVersion: number;
+  round: number;
 }
 
 interface V1Active {
@@ -350,7 +365,8 @@ interface BindingDiscussionState {
   wire: DiscussionWireReassembler;
   active: Map<string, DiscussionActive>;
   v1: Map<string, V1Owner>;
-  directV2: Map<string, V2DirectOwner>;
+  logicalV2: Map<string, V2LogicalOwner>;
+  v2Cancellations: Map<string, V2Cancellation>;
   ackWaiters: Map<string, ArtifactAckWaiter>;
 }
 
@@ -507,6 +523,8 @@ export class MessageRouter {
   readonly #bufferDrains = new Map<string, Promise<void>>();
   readonly #bufferDrainTasks = new Map<string, string>();
   readonly #discussion = new Map<string, BindingDiscussionState>();
+  readonly #inflightByBinding = new Map<string, InflightBindingOperations>();
+  readonly #bindingDisposals = new Map<string, Promise<void>>();
   readonly #disposedBindings = new Set<string>();
   readonly #bindingGenerations = new Map<string, number>();
   #bufferOrder = 0;
@@ -532,6 +550,28 @@ export class MessageRouter {
   }
 
   async onWorkerEvent(identity: WorkerIdentity, event: WorkerEvent): Promise<void> {
+    if (this.#disposed
+      || this.#disposedBindings.has(bindingKey(identity))
+      || event.runtimeId !== identity.runtimeId) return;
+    const key = bindingKey(identity);
+    let inflight = this.#inflightByBinding.get(key);
+    if (!inflight) {
+      inflight = { identity: { ...identity }, operations: new Set() };
+      this.#inflightByBinding.set(key, inflight);
+    }
+    const operation = Promise.resolve().then(() => this.#routeWorkerEvent(identity, event));
+    inflight.operations.add(operation);
+    try {
+      await operation;
+    } finally {
+      inflight.operations.delete(operation);
+      if (inflight.operations.size === 0 && this.#inflightByBinding.get(key) === inflight) {
+        this.#inflightByBinding.delete(key);
+      }
+    }
+  }
+
+  async #routeWorkerEvent(identity: WorkerIdentity, event: WorkerEvent): Promise<void> {
     if (this.#disposed
       || this.#disposedBindings.has(bindingKey(identity))
       || event.runtimeId !== identity.runtimeId) return;
@@ -586,9 +626,17 @@ export class MessageRouter {
     );
   }
 
-  async disposeBinding(identity: WorkerIdentity): Promise<void> {
+  disposeBinding(identity: WorkerIdentity): Promise<void> {
     const key = bindingKey(identity);
-    if (this.#disposedBindings.has(key)) return;
+    const existing = this.#bindingDisposals.get(key);
+    if (existing) return existing;
+    const disposal = this.#disposeBindingOnce(identity);
+    this.#bindingDisposals.set(key, disposal);
+    return disposal;
+  }
+
+  async #disposeBindingOnce(identity: WorkerIdentity): Promise<void> {
+    const key = bindingKey(identity);
     this.#disposedBindings.add(key);
     this.#bindingGenerations.set(key, (this.#bindingGenerations.get(key) ?? 0) + 1);
     this.#bufferedOutput.delete(key);
@@ -646,7 +694,7 @@ export class MessageRouter {
       discussion.ackWaiters.clear();
       this.#discussion.delete(key);
     }
-    await Promise.all(cancellations);
+    await Promise.allSettled(cancellations);
   }
 
   async dispose(): Promise<void> {
@@ -659,6 +707,7 @@ export class MessageRouter {
     for (const [key, entries] of this.#bufferedOutput) {
       if (entries[0]) identities.set(key, entries[0].identity);
     }
+    for (const [key, inflight] of this.#inflightByBinding) identities.set(key, inflight.identity);
     await Promise.all([...identities.values()].map((identity) => this.disposeBinding(identity)));
   }
 
@@ -815,7 +864,8 @@ export class MessageRouter {
         wire: new DiscussionWireReassembler({ clock: this.#clock }),
         active: new Map(),
         v1: new Map(),
-        directV2: new Map(),
+        logicalV2: new Map(),
+        v2Cancellations: new Map(),
         ackWaiters: new Map(),
       };
       this.#discussion.set(key, state);
@@ -853,12 +903,15 @@ export class MessageRouter {
     message: NormalizedRongCloudMessage,
     value: Record<string, unknown>,
   ): Promise<void> {
+    const generation = this.#bindingGeneration(identity);
     const conversation = conversationFrom(message, identity);
-    const claim = await this.#claimLocal(identity, message.messageUid, conversation);
+    const claim = await this.#claimLocal(identity, message.messageUid, conversation, generation);
     if (!claim) return;
     const result = this.#discussionState(identity).wire.accept(message.senderId, value);
-    const admitted = await this.#admitOnly(identity, message, claim);
-    if (!admitted || (result.status !== 'complete' && result.status !== 'passthrough')) return;
+    const admitted = await this.#admitOnly(identity, message, claim, generation, true);
+    if (!admitted
+      || !this.#bindingGenerationCurrent(identity, generation)
+      || (result.status !== 'complete' && result.status !== 'passthrough')) return;
     const payload = result.payload;
     if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return;
     const valuePayload = payload as Record<string, unknown>;
@@ -898,14 +951,14 @@ export class MessageRouter {
       || parsed.payload.group_id !== message.targetId
       || parsed.action !== 'pass_turn'
       || parsed.payload.current_speaker !== identity.nodeId) {
-      if (claim) await this.#admitOnly(identity, message, claim);
+      if (claim) await this.#admitOnly(identity, message, claim, generation);
       return;
     }
     const state = this.#discussionState(identity);
     this.#pruneV1(state);
     const logicalKey = JSON.stringify([bindingKey(identity), discussionV1Key(parsed)]);
     if (state.v1.has(logicalKey) || state.v1.size >= 1_024) {
-      if (claim) await this.#admitOnly(identity, message, claim);
+      if (claim) await this.#admitOnly(identity, message, claim, generation);
       return;
     }
     const owner: V1Owner = {
@@ -969,7 +1022,7 @@ export class MessageRouter {
           this.#terminalV1(state, owner);
           return;
         }
-        await this.#sendReceipt(identity, this.#receipt(message, message.messageUid));
+        await this.#sendReceipt(identity, this.#receipt(message, message.messageUid), generation);
         if (!this.#bindingGenerationCurrent(identity, generation)) {
           active.suppressed = true;
           this.#terminalV1(state, owner);
@@ -1112,18 +1165,66 @@ export class MessageRouter {
     }
   }
 
-  #terminalDirectV2(state: BindingDiscussionState, owner: V2DirectOwner | undefined): void {
-    if (owner === undefined || state.directV2.get(owner.logicalKey) !== owner) return;
+  #terminalV2Reservation(state: BindingDiscussionState, owner: V2LogicalOwner | undefined): void {
+    if (owner === undefined || state.logicalV2.get(owner.logicalKey) !== owner) return;
     owner.state = 'terminal';
     owner.expiresAt = this.#time() + DISCUSSION_V2_LIMITS.logicalTombstoneTtlMs;
-    this.#pruneDirectV2(state);
+    this.#pruneV2Reservations(state);
   }
 
-  #pruneDirectV2(state: BindingDiscussionState): void {
+  #pruneV2Reservations(state: BindingDiscussionState): void {
     const now = this.#time();
-    for (const [key, owner] of state.directV2) {
-      if (owner.state === 'terminal' && owner.expiresAt <= now) state.directV2.delete(key);
+    for (const [key, owner] of state.logicalV2) {
+      if (owner.state === 'terminal' && owner.expiresAt <= now) state.logicalV2.delete(key);
     }
+  }
+
+  #v2CancellationKey(cancellation: V2Cancellation): string {
+    return JSON.stringify([
+      cancellation.senderId,
+      cancellation.discussionId,
+      cancellation.stateVersion,
+      cancellation.round,
+    ]);
+  }
+
+  #v2CancellationMatches(
+    cancellation: V2Cancellation,
+    value: Pick<V2LogicalOwner, 'senderId' | 'discussionId' | 'stateVersion' | 'round'>,
+  ): boolean {
+    return cancellation.senderId === value.senderId
+      && cancellation.discussionId === value.discussionId
+      && (cancellation.stateVersion > value.stateVersion
+        || (cancellation.stateVersion === value.stateVersion && cancellation.round === value.round));
+  }
+
+  #recordV2Cancellation(state: BindingDiscussionState, cancellation: V2Cancellation): void {
+    const key = this.#v2CancellationKey(cancellation);
+    if (!state.v2Cancellations.has(key)) {
+      if (state.v2Cancellations.size >= DISCUSSION_V2_LIMITS.maxCancelTombstones) {
+        const oldest = state.v2Cancellations.keys().next().value;
+        if (oldest !== undefined) state.v2Cancellations.delete(oldest);
+      }
+      state.v2Cancellations.set(key, cancellation);
+    }
+    for (const owner of state.logicalV2.values()) {
+      if (owner.state === 'prestart' && this.#v2CancellationMatches(cancellation, owner)) {
+        this.#terminalV2Reservation(state, owner);
+      }
+    }
+  }
+
+  #v2Cancelled(state: BindingDiscussionState, owner: V2LogicalOwner): boolean {
+    return [...state.v2Cancellations.values()].some((cancellation) =>
+      this.#v2CancellationMatches(cancellation, owner));
+  }
+
+  #v2ReservationCurrent(state: BindingDiscussionState, owner: V2LogicalOwner): boolean {
+    return state.logicalV2.get(owner.logicalKey) === owner && owner.state === 'prestart';
+  }
+
+  #requireV2Reservation(state: BindingDiscussionState, owner: V2LogicalOwner): void {
+    if (!this.#v2ReservationCurrent(state, owner)) throw new Error('logical_reservation_invalidated');
   }
 
   async #sendV1Advance(
@@ -1202,48 +1303,49 @@ export class MessageRouter {
       || identity.nodeId.length > DISCUSSION_V2_LIMITS.maxId
       || message.senderId.length > DISCUSSION_V2_LIMITS.maxId
       || (parsed.msg_type === 'discussion_assignment' && parsed.targetId !== identity.nodeId)) {
-      if (claim) await this.#admitOnly(identity, message, claim);
+      if (claim) await this.#admitOnly(identity, message, claim, generation);
       return;
     }
     if (parsed.msg_type === 'discussion_host_turn'
       && !Object.values(parsed.roles).some((role) =>
         role.nodeId === identity.nodeId && role.isHost === true)) {
-      if (claim) await this.#admitOnly(identity, message, claim);
+      if (claim) await this.#admitOnly(identity, message, claim, generation);
       return;
     }
     const state = this.#discussionState(identity);
-    let logicalKey: string | undefined;
-    let directOwner: V2DirectOwner | undefined;
-    if (physicalAdmitted) {
-      const logical = state.guard.claim(message.senderId, parsed, identity.nodeId);
-      if (logical.status !== 'accepted') return;
-      logicalKey = logical.key;
-    } else {
-      this.#pruneDirectV2(state);
-      const key = discussionV2LogicalKey(message.senderId, parsed);
-      if (state.directV2.has(key)
-        || state.directV2.size >= DISCUSSION_V2_LIMITS.maxLogicalTombstones) {
-        if (claim) await this.#admitOnly(identity, message, claim);
-        return;
-      }
-      directOwner = {
-        logicalKey: key,
-        token: claim!.claimId,
-        state: 'prestart',
-        expiresAt: Number.POSITIVE_INFINITY,
-      };
-      state.directV2.set(key, directOwner);
+    this.#pruneV2Reservations(state);
+    const logicalKey = discussionV2LogicalKey(message.senderId, parsed);
+    const logicalOwner: V2LogicalOwner = {
+      logicalKey,
+      senderId: message.senderId,
+      discussionId: parsed.discussionId,
+      stateVersion: parsed.stateVersion,
+      round: parsed.round,
+      state: 'prestart',
+      expiresAt: Number.POSITIVE_INFINITY,
+    };
+    if (this.#v2Cancelled(state, logicalOwner)
+      || state.logicalV2.has(logicalKey)
+      || state.logicalV2.size >= DISCUSSION_V2_LIMITS.maxLogicalTombstones) {
+      if (claim) await this.#admitOnly(identity, message, claim, generation);
+      return;
     }
+    state.logicalV2.set(logicalKey, logicalOwner);
     let started = false;
+    let logicalClaimed = false;
     try {
       await this.#recheckBinding(identity);
       this.#requireBindingGeneration(identity, generation);
+      this.#requireV2Reservation(state, logicalOwner);
       const submittedResumeSessionId = await this.#state.currentSession(conversation);
       this.#requireBindingGeneration(identity, generation);
+      this.#requireV2Reservation(state, logicalOwner);
       const workdir = await this.#binding.authorizeDefaultWorkdir(identity);
       this.#requireBindingGeneration(identity, generation);
+      this.#requireV2Reservation(state, logicalOwner);
       await this.#recheckBinding(identity);
       this.#requireBindingGeneration(identity, generation);
+      this.#requireV2Reservation(state, logicalOwner);
       const prompt = this.#v2Prompt(parsed);
       if (!prompt || Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES) throw new Error('prompt_too_large');
       const response = await this.#task.startTask({
@@ -1254,29 +1356,22 @@ export class MessageRouter {
         ...(submittedResumeSessionId === undefined ? {} : { resumeSessionId: submittedResumeSessionId }),
       });
       started = true;
-      if (!this.#bindingGenerationCurrent(identity, generation)) {
+      if (!this.#bindingGenerationCurrent(identity, generation)
+        || !this.#v2ReservationCurrent(state, logicalOwner)) {
         await this.#task.cancelTask(response.taskId).catch(() => undefined);
-        if (logicalKey !== undefined) state.guard.complete(logicalKey);
-        if (directOwner !== undefined) this.#terminalDirectV2(state, directOwner);
+        this.#terminalV2Reservation(state, logicalOwner);
+        if (claim) await this.#admitOnly(identity, message, claim, generation, true);
         return;
       }
-      if (directOwner !== undefined) {
-        if (state.directV2.get(directOwner.logicalKey) !== directOwner
-          || directOwner.token !== claim?.claimId) {
-          await this.#task.cancelTask(response.taskId).catch(() => undefined);
-          return;
-        }
-        const logical = state.guard.claim(message.senderId, parsed, identity.nodeId);
-        if (logical.status !== 'accepted') {
-          this.#terminalDirectV2(state, directOwner);
-          await this.#task.cancelTask(response.taskId).catch(() => undefined);
-          if (claim) await this.#admitOnly(identity, message, claim);
-          return;
-        }
-        logicalKey = logical.key;
-        directOwner.state = 'active';
+      const logical = state.guard.claim(message.senderId, parsed, identity.nodeId);
+      if (logical.status !== 'accepted' || logical.key !== logicalKey) {
+        this.#terminalV2Reservation(state, logicalOwner);
+        await this.#task.cancelTask(response.taskId).catch(() => undefined);
+        if (claim) await this.#admitOnly(identity, message, claim, generation, true);
+        return;
       }
-      if (logicalKey === undefined) throw new Error('logical_owner_missing');
+      logicalClaimed = true;
+      logicalOwner.state = 'committing';
       const active: DiscussionActive = {
         identity: { ...identity },
         conversation: { ...conversation },
@@ -1296,7 +1391,7 @@ export class MessageRouter {
         outputFinalQueued: false,
         suppressed: false,
         terminal: false,
-        ...(directOwner === undefined ? {} : { directOwner }),
+        logicalOwner,
       };
       state.active.set(logicalKey, active);
       if (claim) {
@@ -1305,25 +1400,24 @@ export class MessageRouter {
           active.suppressed = true;
           state.active.delete(logicalKey);
           state.guard.complete(logicalKey);
-          this.#terminalDirectV2(state, directOwner);
+          this.#terminalV2Reservation(state, logicalOwner);
           await this.#task.cancelTask(active.taskId).catch(() => undefined);
           return;
         }
-        if (!this.#bindingGenerationCurrent(identity, generation)) {
-          active.suppressed = true;
-          state.active.delete(logicalKey);
-          state.guard.complete(logicalKey);
-          this.#terminalDirectV2(state, directOwner);
+        if (!this.#bindingGenerationCurrent(identity, generation)
+          || state.logicalV2.get(logicalKey) !== logicalOwner
+          || logicalOwner.state !== 'committing') {
+          await this.#cancelDiscussionV2Active(state, active);
           return;
         }
-        await this.#sendReceipt(identity, this.#receipt(message, message.messageUid));
+        logicalOwner.state = 'active';
+        await this.#sendReceipt(identity, this.#receipt(message, message.messageUid), generation);
         if (!this.#bindingGenerationCurrent(identity, generation)) {
-          active.suppressed = true;
-          state.active.delete(logicalKey);
-          state.guard.complete(logicalKey);
-          this.#terminalDirectV2(state, directOwner);
+          await this.#cancelDiscussionV2Active(state, active);
           return;
         }
+      } else {
+        logicalOwner.state = 'active';
       }
       if (active.suppressed) {
         if (active.cleanupPromise !== undefined) await active.cleanupPromise;
@@ -1331,17 +1425,18 @@ export class MessageRouter {
       }
       await this.#consumeDiscussionV2(state, active);
     } catch {
-      if (logicalKey !== undefined) {
+      if (logicalClaimed) {
         state.guard.complete(logicalKey);
         state.active.delete(logicalKey);
       }
-      if (!started && claim && directOwner !== undefined
-        && directOwner.token === claim.claimId
-        && state.directV2.get(directOwner.logicalKey) === directOwner) {
-        state.directV2.delete(directOwner.logicalKey);
-        await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
-      } else if (directOwner !== undefined) {
-        this.#terminalDirectV2(state, directOwner);
+      if (!started
+        && logicalOwner.state === 'prestart'
+        && state.logicalV2.get(logicalOwner.logicalKey) === logicalOwner) {
+        state.logicalV2.delete(logicalOwner.logicalKey);
+        if (claim) await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
+      } else {
+        this.#terminalV2Reservation(state, logicalOwner);
+        if (claim) await this.#admitOnly(identity, message, claim, generation, true);
       }
       if (physicalAdmitted && this.#bindingGenerationCurrent(identity, generation)) {
         await this.#sendV2NodeError(identity, conversation, parsed, 'model_error');
@@ -1473,7 +1568,7 @@ export class MessageRouter {
         await active.outputTail;
         if (state.active.get(active.logicalKey) === active) state.active.delete(active.logicalKey);
         state.guard.complete(active.logicalKey);
-        this.#terminalDirectV2(state, active.directOwner);
+        this.#terminalV2Reservation(state, active.logicalOwner);
       }
     }
   }
@@ -1786,7 +1881,7 @@ export class MessageRouter {
     }
     state.active.delete(active.logicalKey);
     state.guard.complete(active.logicalKey);
-    this.#terminalDirectV2(state, active.directOwner);
+    this.#terminalV2Reservation(state, active.logicalOwner);
   }
 
   async #sendV2NodeError(
@@ -1840,15 +1935,27 @@ export class MessageRouter {
     value: Record<string, unknown>,
     physicalAdmitted: boolean,
   ): Promise<void> {
+    const generation = this.#bindingGeneration(identity);
     const conversation = conversationFrom(message, identity);
     const claim = physicalAdmitted
       ? undefined
-      : await this.#claimLocal(identity, message.messageUid, conversation);
+      : await this.#claimLocal(identity, message.messageUid, conversation, generation);
     if (!physicalAdmitted && !claim) return;
     const state = this.#discussionState(identity);
+    let mutationAccepted = false;
     if (msgType === 'discussion_cancel') {
       const result = state.guard.cancel(message.senderId, value);
       if (result.status === 'accepted') {
+        mutationAccepted = true;
+        const parsed = parseDiscussionV2Command(value);
+        if (parsed?.msg_type === 'discussion_cancel') {
+          this.#recordV2Cancellation(state, {
+            senderId: message.senderId,
+            discussionId: parsed.discussionId,
+            stateVersion: parsed.stateVersion,
+            round: parsed.round,
+          });
+        }
         state.wire.clearDiscussion(result.clearSenderId, result.clearDiscussionId);
         await Promise.all(result.abortedKeys.map((key) => {
           const active = state.active.get(key);
@@ -1856,6 +1963,7 @@ export class MessageRouter {
             ? Promise.resolve()
             : this.#cancelDiscussionV2Active(state, active);
         }));
+        if (!this.#bindingGenerationCurrent(identity, generation) && !claim) return;
       }
     } else {
       const parsed = parseDiscussionV2Command(value);
@@ -1864,6 +1972,7 @@ export class MessageRouter {
         ? state.guard.acceptArtifactAck(message.senderId, parsed)
         : { status: 'invalid' as const };
       if (accepted.status === 'accepted' && parsed?.msg_type === 'discussion_artifact_ack') {
+        mutationAccepted = true;
         const key = this.#artifactAckKey({
           senderId: message.senderId,
           discussionId: parsed.discussionId,
@@ -1880,7 +1989,7 @@ export class MessageRouter {
         }
       }
     }
-    if (claim) await this.#admitOnly(identity, message, claim);
+    if (claim) await this.#admitOnly(identity, message, claim, generation, mutationAccepted);
   }
 
   #cancelDiscussionV2Active(
@@ -1912,7 +2021,7 @@ export class MessageRouter {
       }
       if (state.active.get(active.logicalKey) === active) state.active.delete(active.logicalKey);
       state.guard.complete(active.logicalKey);
-      this.#terminalDirectV2(state, active.directOwner);
+      this.#terminalV2Reservation(state, active.logicalOwner);
     });
     active.cleanupPromise = cleanup;
     return cleanup;
@@ -1924,33 +2033,41 @@ export class MessageRouter {
     value: Record<string, unknown>,
     physicalAdmitted: boolean,
   ): Promise<void> {
+    const generation = this.#bindingGeneration(identity);
     const conversation = conversationFrom(message, identity);
     const claim = physicalAdmitted
       ? undefined
-      : await this.#claimLocal(identity, message.messageUid, conversation);
+      : await this.#claimLocal(identity, message.messageUid, conversation, generation);
     if (!physicalAdmitted && !claim) return;
     const request = parseDiscussionModelCatalogRequest(value);
     if (!request) {
-      if (claim) await this.#admitOnly(identity, message, claim);
+      if (claim) await this.#admitOnly(identity, message, claim, generation);
       return;
     }
+    let outputSent = false;
     try {
+      const catalog = await this.#control.modelCatalog(identity);
+      this.#requireBindingGeneration(identity, generation);
       const payload = buildModelCatalogResponse(
         request,
-        await this.#control.modelCatalog(identity),
+        catalog,
         this.#time(),
       );
+      this.#requireBindingGeneration(identity, generation);
       await this.#sendDiscussionPayload(
         identity,
         conversation,
         'command_result',
         payload as unknown as Record<string, unknown>,
+        undefined,
+        generation,
       );
+      outputSent = true;
     } catch {
       if (claim) await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
       return;
     }
-    if (claim) await this.#admitOnly(identity, message, claim);
+    if (claim) await this.#admitOnly(identity, message, claim, generation, outputSent);
   }
 
   async #recheckBinding(identity: WorkerIdentity): Promise<void> {
@@ -1981,10 +2098,18 @@ export class MessageRouter {
     identity: WorkerIdentity,
     message: NormalizedRongCloudMessage,
     claim: ClaimedMessage,
+    generation: number,
+    mutationAccepted = false,
   ): Promise<boolean> {
+    if (!this.#bindingGenerationCurrent(identity, generation) && !mutationAccepted) {
+      await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
+      return false;
+    }
     const admitted = await this.#state.admitMessage(claim.key, claim.claimId).catch(() => false);
     if (!admitted) return false;
-    await this.#sendReceipt(identity, this.#receipt(message, message.messageUid));
+    if (this.#bindingGenerationCurrent(identity, generation)) {
+      await this.#sendReceipt(identity, this.#receipt(message, message.messageUid), generation);
+    }
     return true;
   }
 
@@ -2000,6 +2125,7 @@ export class MessageRouter {
       generation: number;
       active: { suppressed: boolean };
     },
+    generation?: number,
   ): Promise<void> {
     const messages = encodeDiscussionWire(payload).map((frame) => {
       const content = JSON.parse(frame) as Record<string, unknown>;
@@ -2010,11 +2136,16 @@ export class MessageRouter {
       );
     });
     for (let index = 0; index < messages.length; index += 1) {
+      const expectedGeneration = buffer?.generation ?? generation;
+      if (expectedGeneration !== undefined
+        && !this.#bindingGenerationCurrent(identity, expectedGeneration)) return;
       if (buffer !== undefined
         && (buffer.active.suppressed
           || !this.#bindingGenerationCurrent(identity, buffer.generation))) return;
       try {
         await this.#worker.send(identity, messages[index]!);
+        if (expectedGeneration !== undefined
+          && !this.#bindingGenerationCurrent(identity, expectedGeneration)) return;
         if (buffer !== undefined
           && (buffer.active.suppressed
             || !this.#bindingGenerationCurrent(identity, buffer.generation))) return;
@@ -2091,7 +2222,8 @@ export class MessageRouter {
     raw: Record<string, unknown>,
     routed: CardActionRoute,
   ): Promise<void> {
-    const claim = await this.#claimLocal(identity, message.messageUid, conversation);
+    const generation = this.#bindingGeneration(identity);
+    const claim = await this.#claimLocal(identity, message.messageUid, conversation, generation);
     if (!claim) return;
     if (!routed.ok) {
       const response = routed.code === 'unsupported_interactive_approval'
@@ -2106,11 +2238,11 @@ export class MessageRouter {
         conversation,
         'command_result',
         response,
-      ));
+      ), generation);
       return;
     }
     if (routed.kind === 'none' || routed.kind === 'navigate') {
-      await this.#admitOnly(identity, message, claim);
+      await this.#admitOnly(identity, message, claim, generation);
       return;
     }
     if (routed.kind === 'command') {
@@ -2118,7 +2250,7 @@ export class MessageRouter {
         kind: 'command',
         name: routed.name,
         ...(routed.argument === undefined ? {} : { argument: routed.argument }),
-      }, claim);
+      }, claim, generation);
       return;
     }
     if (routed.kind === 'session') {
@@ -2126,7 +2258,7 @@ export class MessageRouter {
         kind: 'command',
         name: routed.op === 'switch' ? '/switch' : '/delete',
         argument: routed.sessionId,
-      }, claim);
+      }, claim, generation);
       return;
     }
     const scope = routed.kind === 'answer' ? 'card.answer' : 'card.custom';
@@ -2136,6 +2268,10 @@ export class MessageRouter {
       senderId: conversation.senderId,
       scope,
     }).catch(() => false);
+    if (!this.#bindingGenerationCurrent(identity, generation)) {
+      await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
+      return;
+    }
     if (!allowed) {
       await this.#finishRead(identity, message, conversation, claim, this.#structuredResponse(
         conversation,
@@ -2146,7 +2282,7 @@ export class MessageRouter {
           'unsupported_action',
           'unsupported_action',
         ),
-      ));
+      ), generation);
       return;
     }
     const intent: AuthorizedCardIntent = {
@@ -2160,6 +2296,10 @@ export class MessageRouter {
     try {
       const received = await this.#control.card(intent);
       sideEffectAccepted = true;
+      if (!this.#bindingGenerationCurrent(identity, generation)) {
+        await this.#admitOnly(identity, message, claim, generation, true);
+        return;
+      }
       result = this.#validCardResult(received, routed.cardId)
         ? received
         : { status: 'error', code: 'unsupported_action', message: 'unsupported_action' };
@@ -2195,11 +2335,14 @@ export class MessageRouter {
     );
     const admitted = await this.#state.admitMessage(claim.key, claim.claimId).catch(() => false);
     if (!admitted) return;
+    if (!this.#bindingGenerationCurrent(identity, generation)) return;
     await this.#worker.send(identity, response).catch(() => undefined);
+    if (!this.#bindingGenerationCurrent(identity, generation)) return;
     if (update !== undefined && result.status === 'success') {
       await this.#worker.send(identity, update).catch(() => undefined);
+      if (!this.#bindingGenerationCurrent(identity, generation)) return;
     }
-    await this.#sendReceipt(identity, this.#receipt(message, message.messageUid));
+    await this.#sendReceipt(identity, this.#receipt(message, message.messageUid), generation);
   }
 
   #cardCommandResult(
@@ -2235,9 +2378,10 @@ export class MessageRouter {
     conversation: ConversationIdentity,
     slash: Extract<ReturnType<typeof parseSlashCommand>, { kind: 'command' }>,
   ): Promise<void> {
-    const claim = await this.#claimLocal(identity, message.messageUid, conversation);
+    const generation = this.#bindingGeneration(identity);
+    const claim = await this.#claimLocal(identity, message.messageUid, conversation, generation);
     if (!claim) return;
-    await this.#runSlashClaimed(identity, message, conversation, slash, claim);
+    await this.#runSlashClaimed(identity, message, conversation, slash, claim, generation);
   }
 
   async #runSlashClaimed(
@@ -2246,7 +2390,9 @@ export class MessageRouter {
     conversation: ConversationIdentity,
     slash: Extract<ReturnType<typeof parseSlashCommand>, { kind: 'command' }>,
     claim: ClaimedMessage,
+    generation: number,
   ): Promise<void> {
+    let mutationAccepted = false;
     try {
       if (slash.name === '/stop') {
         const active = this.#active.get(conversationKey(conversation));
@@ -2254,14 +2400,15 @@ export class MessageRouter {
           await this.#finishRead(identity, message, conversation, claim, this.#textResponse(
             conversation,
             '[no_active_task]',
-          ));
+          ), generation);
           return;
         }
         await this.#task.cancelTask(active.taskId);
+        mutationAccepted = true;
         await this.#finishMutation(identity, message, conversation, claim, this.#textResponse(
           conversation,
           '[stop_requested]',
-        ));
+        ), generation);
         await active.done;
         return;
       }
@@ -2272,7 +2419,7 @@ export class MessageRouter {
           targetId: replyTargetId(conversation),
           messageType: 'text',
           content: `[session] ${current ?? 'none'}`,
-        });
+        }, generation);
         return;
       }
       if (slash.name === '/sessions') {
@@ -2282,7 +2429,7 @@ export class MessageRouter {
           targetId: replyTargetId(conversation),
           messageType: 'text',
           content: sessions.length === 0 ? '[sessions] none' : `[sessions]\n${sessions.join('\n')}`,
-        });
+        }, generation);
         return;
       }
       if (slash.name === '/status') {
@@ -2292,15 +2439,20 @@ export class MessageRouter {
           senderId: conversation.senderId,
           scope: 'device.read',
         });
-        const content = allowed
-          ? this.#statusText(await this.#control.status(identity))
+        if (!this.#bindingGenerationCurrent(identity, generation)) {
+          await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
+          return;
+        }
+        const status = allowed ? await this.#control.status(identity) : undefined;
+        const content = allowed && status !== undefined
+          ? this.#statusText(status)
           : '[authorization_denied]';
         await this.#finishRead(identity, message, conversation, claim, {
           conversationType: conversation.conversationType,
           targetId: replyTargetId(conversation),
           messageType: 'text',
           content,
-        });
+        }, generation);
         return;
       }
       if (slash.name === '/switch') {
@@ -2309,13 +2461,14 @@ export class MessageRouter {
           await this.#finishRead(identity, message, conversation, claim, this.#textResponse(
             conversation,
             '[session_not_found]',
-          ));
+          ), generation);
           return;
         }
+        mutationAccepted = true;
         await this.#finishMutation(identity, message, conversation, claim, this.#textResponse(
           conversation,
           '[session_switched]',
-        ));
+        ), generation);
         return;
       }
       if (slash.name === '/delete') {
@@ -2324,23 +2477,31 @@ export class MessageRouter {
           await this.#finishRead(identity, message, conversation, claim, this.#textResponse(
             conversation,
             '[session_not_found]',
-          ));
+          ), generation);
           return;
         }
+        mutationAccepted = true;
         await this.#finishMutation(identity, message, conversation, claim, this.#textResponse(
           conversation,
           '[session_deleted]',
-        ));
+        ), generation);
         return;
       }
       await this.#state.clearCurrent(conversation);
+      mutationAccepted = true;
       await this.#finishMutation(identity, message, conversation, claim, this.#textResponse(
         conversation,
         '[new_session]',
-      ));
+      ), generation);
     } catch {
-      await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
-      await this.#safeSendText(identity, conversation, '[router_state_invalid]');
+      if (mutationAccepted) {
+        await this.#state.admitMessage(claim.key, claim.claimId).catch(() => false);
+      } else {
+        await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
+      }
+      if (this.#bindingGenerationCurrent(identity, generation)) {
+        await this.#safeSendText(identity, conversation, '[router_state_invalid]');
+      }
     }
   }
 
@@ -2349,27 +2510,30 @@ export class MessageRouter {
     message: NormalizedRongCloudMessage,
     conversation: ConversationIdentity,
   ): Promise<void> {
-    const claim = await this.#claimLocal(identity, message.messageUid, conversation);
+    const generation = this.#bindingGeneration(identity);
+    const claim = await this.#claimLocal(identity, message.messageUid, conversation, generation);
     if (!claim) return;
     const active = this.#active.get(conversationKey(conversation));
     if (!active || active.bindingKey !== bindingKey(identity)) {
       await this.#finishRead(identity, message, conversation, claim, this.#textResponse(
         conversation,
         '[no_active_task]',
-      ));
+      ), generation);
       return;
     }
     try {
       await this.#task.cancelTask(active.taskId);
     } catch {
       await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
-      await this.#safeSendText(identity, conversation, '[runtime_transport_error]');
+      if (this.#bindingGenerationCurrent(identity, generation)) {
+        await this.#safeSendText(identity, conversation, '[runtime_transport_error]');
+      }
       return;
     }
     await this.#finishMutation(identity, message, conversation, claim, this.#textResponse(
       conversation,
       '[stop_requested]',
-    ));
+    ), generation);
     await active.done;
   }
 
@@ -2380,7 +2544,8 @@ export class MessageRouter {
     msgType: 'create_opencode_session' | 'delete_opencode_session' | 'device_status_request' | 'device_control',
     value: Record<string, unknown>,
   ): Promise<void> {
-    const claim = await this.#claimLocal(identity, message.messageUid, conversation);
+    const generation = this.#bindingGeneration(identity);
+    const claim = await this.#claimLocal(identity, message.messageUid, conversation, generation);
     if (!claim) return;
     const requestId = typeof value.request_id === 'string' ? value.request_id : undefined;
     let mutationAccepted = false;
@@ -2401,7 +2566,7 @@ export class MessageRouter {
           conversation,
           'command_result',
           envelope,
-        ));
+        ), generation);
         return;
       }
       if (msgType === 'delete_opencode_session') {
@@ -2409,17 +2574,18 @@ export class MessageRouter {
           ? value.session_id
           : typeof value.opencode_session_id === 'string' ? value.opencode_session_id : '';
         const deleted = sessionId.length > 0 && await this.#state.deleteKnown(conversation, sessionId);
+        mutationAccepted = deleted;
         const response = this.#commandResult(requestId, deleted ? 'success' : 'error', deleted ? 'ok' : 'session_not_found');
         if (deleted) await this.#finishMutation(identity, message, conversation, claim, this.#structuredResponse(
           conversation,
           'command_result',
           response,
-        ));
+        ), generation);
         else await this.#finishRead(identity, message, conversation, claim, this.#structuredResponse(
           conversation,
           'command_result',
           response,
-        ));
+        ), generation);
         return;
       }
       if (msgType === 'device_status_request') {
@@ -2429,6 +2595,10 @@ export class MessageRouter {
           senderId: conversation.senderId,
           scope: 'device.read',
         });
+        if (!this.#bindingGenerationCurrent(identity, generation)) {
+          await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
+          return;
+        }
         const status = allowed ? await this.#control.status(identity) : undefined;
         const content = status !== undefined && this.#validDeviceStatus(status)
           ? { status: 'success', code: 'ok', message: 'ok', data: status }
@@ -2445,7 +2615,7 @@ export class MessageRouter {
           conversation,
           'command_result',
           envelope,
-        ));
+        ), generation);
         return;
       }
       const command = value.command as DeviceCommand;
@@ -2456,6 +2626,10 @@ export class MessageRouter {
         senderId: conversation.senderId,
         scope,
       });
+      if (!this.#bindingGenerationCurrent(identity, generation)) {
+        await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
+        return;
+      }
       let result: SafeDeviceResult;
       let accepted = false;
       if (!allowed) {
@@ -2470,6 +2644,10 @@ export class MessageRouter {
         });
         accepted = true;
         mutationAccepted = command !== 'status';
+        if (!this.#bindingGenerationCurrent(identity, generation)) {
+          await this.#admitOnly(identity, message, claim, generation, mutationAccepted);
+          return;
+        }
         result = this.#validDeviceResult(received)
           ? received
           : { status: 'error', code: 'unsupported_action', message: 'unsupported_action' };
@@ -2484,9 +2662,9 @@ export class MessageRouter {
       });
       const response = this.#structuredResponse(conversation, 'command_result', envelope);
       if (accepted && command !== 'status') {
-        await this.#finishMutation(identity, message, conversation, claim, response);
+        await this.#finishMutation(identity, message, conversation, claim, response, generation);
       } else {
-        await this.#finishRead(identity, message, conversation, claim, response);
+        await this.#finishRead(identity, message, conversation, claim, response, generation);
       }
     } catch {
       if (mutationAccepted) {
@@ -2494,7 +2672,9 @@ export class MessageRouter {
       } else {
         await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
       }
-      await this.#safeSendText(identity, conversation, '[runtime_failed]');
+      if (this.#bindingGenerationCurrent(identity, generation)) {
+        await this.#safeSendText(identity, conversation, '[runtime_failed]');
+      }
     }
   }
 
@@ -2504,7 +2684,8 @@ export class MessageRouter {
     conversation: ConversationIdentity,
     roomId: string,
   ): Promise<void> {
-    const claim = await this.#claimLocal(identity, message.messageUid, conversation);
+    const generation = this.#bindingGeneration(identity);
+    const claim = await this.#claimLocal(identity, message.messageUid, conversation, generation);
     if (!claim) return;
     try {
       await this.#worker.joinChatroom(identity, { roomId, historyCount: 0 });
@@ -2512,16 +2693,14 @@ export class MessageRouter {
       await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
       return;
     }
-    const admitted = await this.#state.admitMessage(claim.key, claim.claimId).catch(() => false);
-    if (!admitted) return;
-    await this.#sendReceipt(identity, this.#receipt(message, message.messageUid));
+    await this.#admitOnly(identity, message, claim, generation, true);
   }
 
   async #claimLocal(
     identity: WorkerIdentity,
     messageUid: string,
     conversation: ConversationIdentity,
-    generation?: number,
+    generation: number,
   ): Promise<ClaimedMessage | undefined> {
     const claimId = this.#claimId();
     if (!claimId) return undefined;
@@ -2529,19 +2708,19 @@ export class MessageRouter {
     try {
       claim = await this.#state.claimMessage(identity.runtimeId, messageUid, claimId);
     } catch {
-      if (generation === undefined || this.#bindingGenerationCurrent(identity, generation)) {
+      if (this.#bindingGenerationCurrent(identity, generation)) {
         await this.#safeSendText(identity, conversation, '[dedup_capacity]');
       }
       return undefined;
     }
     if (claim.status === 'duplicate') return undefined;
-    if (generation !== undefined && !this.#bindingGenerationCurrent(identity, generation)) {
+    if (!this.#bindingGenerationCurrent(identity, generation)) {
       await this.#state.releaseMessage(claim.key, claimId).catch(() => undefined);
       return undefined;
     }
     try {
       const bound = await this.#binding.binding(identity);
-      if (generation !== undefined) this.#requireBindingGeneration(identity, generation);
+      this.#requireBindingGeneration(identity, generation);
       if (!bound
         || bound.runtimeId !== identity.runtimeId
         || bound.nodeId !== identity.nodeId
@@ -2550,7 +2729,7 @@ export class MessageRouter {
       }
     } catch {
       await this.#state.releaseMessage(claim.key, claimId).catch(() => undefined);
-      if (generation === undefined || this.#bindingGenerationCurrent(identity, generation)) {
+      if (this.#bindingGenerationCurrent(identity, generation)) {
         await this.#safeSendText(identity, conversation, '[binding_unavailable]');
       }
       return undefined;
@@ -2564,7 +2743,12 @@ export class MessageRouter {
     _conversation: ConversationIdentity,
     claim: ClaimedMessage,
     response: RouterWorkerSend,
+    generation: number,
   ): Promise<void> {
+    if (!this.#bindingGenerationCurrent(identity, generation)) {
+      await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
+      return;
+    }
     try {
       await this.#worker.send(identity, response);
     } catch {
@@ -2573,7 +2757,9 @@ export class MessageRouter {
     }
     const admitted = await this.#state.admitMessage(claim.key, claim.claimId).catch(() => false);
     if (!admitted) return;
-    await this.#sendReceipt(identity, this.#receipt(message, message.messageUid));
+    if (this.#bindingGenerationCurrent(identity, generation)) {
+      await this.#sendReceipt(identity, this.#receipt(message, message.messageUid), generation);
+    }
   }
 
   async #finishMutation(
@@ -2582,14 +2768,22 @@ export class MessageRouter {
     _conversation: ConversationIdentity,
     claim: ClaimedMessage,
     response: RouterWorkerSend,
+    generation: number,
   ): Promise<void> {
     const admitted = await this.#state.admitMessage(claim.key, claim.claimId).catch(() => false);
     if (!admitted) return;
+    if (!this.#bindingGenerationCurrent(identity, generation)) return;
     await this.#worker.send(identity, response).catch(() => undefined);
-    await this.#sendReceipt(identity, this.#receipt(message, message.messageUid));
+    if (!this.#bindingGenerationCurrent(identity, generation)) return;
+    await this.#sendReceipt(identity, this.#receipt(message, message.messageUid), generation);
   }
 
-  async #sendReceipt(identity: WorkerIdentity, receipt: RouterReceipt): Promise<void> {
+  async #sendReceipt(
+    identity: WorkerIdentity,
+    receipt: RouterReceipt,
+    generation: number,
+  ): Promise<void> {
+    if (!this.#bindingGenerationCurrent(identity, generation)) return;
     await this.#worker.receipt(identity, receipt).catch(() => undefined);
   }
 

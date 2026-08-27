@@ -24,6 +24,7 @@ import {
   type RouterControlPort,
   type RouterLogger,
   type RouterReceipt,
+  type SafeCardResult,
   type RouterWorkerPort,
   type RouterWorkerSend,
 } from './message-router.js';
@@ -933,6 +934,35 @@ describe('MessageRouter plain task admission', () => {
     await routing;
 
     expect(fixture.starts).toEqual([]);
+    expect(fixture.state.releaseCalls).toBe(1);
+  });
+
+  it('global dispose tracks a direct stop that is still claiming and suppresses all late feedback', async () => {
+    const fixture = await routerHarness();
+    const originalClaim = fixture.state.claimMessage.bind(fixture.state);
+    let claimEntered!: () => void;
+    let releaseClaim!: () => void;
+    const claimWasEntered = new Promise<void>((resolve) => { claimEntered = resolve; });
+    const claimGate = new Promise<void>((resolve) => { releaseClaim = resolve; });
+    fixture.state.claimMessage = async (runtimeId, messageUid, claimId) => {
+      if (messageUid === 'dispose-pending-stop') {
+        claimEntered();
+        await claimGate;
+      }
+      return originalClaim(runtimeId, messageUid, claimId);
+    };
+
+    const routing = fixture.router.onWorkerEvent(
+      IDENTITY_A,
+      inbound(IDENTITY_A, message('dispose-pending-stop', '/stop')),
+    );
+    await claimWasEntered;
+    await fixture.router.dispose();
+    releaseClaim();
+    await routing;
+
+    expect(fixture.sent).toEqual([]);
+    expect(fixture.receipts).toEqual([]);
     expect(fixture.state.releaseCalls).toBe(1);
   });
 
@@ -1995,6 +2025,83 @@ describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
       && input.content.msg_type === 'discussion_contribution_completed')).toBe(true);
   });
 
+  it('honors a cancel tombstone before a direct v2 assignment without starting provider work', async () => {
+    const fixture = await routerHarness();
+    const assignment = discussionAssignment({ discussionId: 'cancel-before-direct' });
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'cancel-before-direct-cancel',
+      discussionCancel({ discussionId: 'cancel-before-direct' }),
+    )));
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'cancel-before-direct-assignment',
+      assignment,
+    )));
+
+    expect(fixture.starts).toEqual([]);
+    expect(fixture.cancellations).toEqual([]);
+    expect(fixture.receipts).toHaveLength(2);
+  });
+
+  it('shares one v2 replay reservation between a completed wire command and a direct duplicate', async () => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', { output: 'one public contribution' });
+    })());
+    const assignment = discussionAssignment({
+      discussionId: 'wire-first-direct-replay',
+      task: 'T'.repeat(12_000),
+    });
+    const frames = encodeDiscussionWire(assignment);
+    expect(frames.length).toBeGreaterThan(1);
+    for (let index = 0; index < frames.length; index += 1) {
+      await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+        `wire-first-${index}`,
+        JSON.parse(frames[index]!) as Record<string, unknown>,
+      )));
+    }
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'wire-first-direct-duplicate',
+      assignment,
+    )));
+
+    expect(fixture.starts).toHaveLength(1);
+    expect(fixture.cancellations).toEqual([]);
+  });
+
+  it('releases only a failed wire v2 reservation so the same logical direct command can retry', async () => {
+    const fixture = await routerHarness();
+    let attempts = 0;
+    fixture.setStart(async (input) => {
+      fixture.starts.push(input);
+      attempts += 1;
+      if (attempts === 1) throw new Error('wire start rejected');
+      return { taskId: 'task-wire-retry-success', eventsUrl: '/events' };
+    });
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', { output: 'wire reservation retry succeeded' });
+    })());
+    const assignment = discussionAssignment({
+      discussionId: 'wire-start-failure-retry',
+      task: 'T'.repeat(12_000),
+    });
+    const frames = encodeDiscussionWire(assignment);
+    expect(frames.length).toBeGreaterThan(1);
+    for (let index = 0; index < frames.length; index += 1) {
+      await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+        `wire-start-failure-${index}`,
+        JSON.parse(frames[index]!) as Record<string, unknown>,
+      )));
+    }
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'direct-after-wire-start-failure',
+      assignment,
+    )));
+
+    expect(fixture.starts).toHaveLength(2);
+    expect(fixture.cancellations).toEqual([]);
+    expect(JSON.stringify(fixture.sent)).toContain('wire reservation retry succeeded');
+  });
+
   it('does not tombstone a wrong-target assignment and emits bounded delta/final output for the exact node', async () => {
     const fixture = await routerHarness();
     fixture.setEvents((taskId) => (async function* () {
@@ -2472,6 +2579,38 @@ describe('MessageRouter CardKit action dispatch', () => {
     action: cardAction,
     timestamp: 1,
     ...overrides,
+  });
+
+  it('suppresses a card result that resolves after binding disposal while retaining its accepted claim', async () => {
+    const fixture = await routerHarness();
+    fixture.control.authorize = async (input) => {
+      fixture.authorized.push(structuredClone(input));
+      return true;
+    };
+    let cardEntered!: () => void;
+    let resolveCard!: (result: SafeCardResult) => void;
+    const cardWasEntered = new Promise<void>((resolve) => { cardEntered = resolve; });
+    fixture.control.card = async () => {
+      cardEntered();
+      return new Promise<SafeCardResult>((resolve) => { resolveCard = resolve; });
+    };
+
+    const routing = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'card-dispose-pending',
+      action({ type: 'answer', questionId: 'question-one', value: ['A'] }),
+    )));
+    await cardWasEntered;
+    await fixture.router.disposeBinding(IDENTITY_A);
+    resolveCard({ status: 'success', code: 'ok', message: 'accepted' });
+    await routing;
+
+    expect(fixture.sent).toEqual([]);
+    expect(fixture.receipts).toEqual([]);
+    await expect(fixture.state.claimMessage(
+      IDENTITY_A.runtimeId,
+      'card-dispose-pending',
+      '05'.repeat(16),
+    )).resolves.toMatchObject({ status: 'duplicate' });
   });
 
   it('returns the deterministic 501 result for permission actions without invoking control', async () => {
