@@ -289,6 +289,11 @@ jobs:
             echo "::error::entry package version is not valid semver"
             exit 1
           fi
+          expected_tag="refs/tags/quukk-clawmessenger-v$expected_version"
+          if [[ "$GITHUB_REF" == refs/tags/* ]] && [ "$GITHUB_REF" != "$expected_tag" ]; then
+            echo "::error::release tag must be $expected_tag"
+            exit 1
+          fi
 
           runtime_names=(
             '@quukk/clawmessenger-runtime-win32-x64'

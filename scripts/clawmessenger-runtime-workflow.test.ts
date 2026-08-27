@@ -271,6 +271,12 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
     expect(validate.run).toContain('tar -xOf "$archive" package/package.json');
     expect(validate.run).toContain('optionalDependencies');
     expect(validate.run).toContain('release-set.tsv');
+    expect(validate.run).toContain(
+      'expected_tag="refs/tags/quukk-clawmessenger-v$expected_version"',
+    );
+    expect(validate.run).toContain(
+      'if [[ "$GITHUB_REF" == refs/tags/* ]] && [ "$GITHUB_REF" != "$expected_tag" ]; then',
+    );
     for (const packageName of EXPECTED_PACKAGE_NAMES) {
       expect(validate.run, packageName).toContain(packageName);
     }
