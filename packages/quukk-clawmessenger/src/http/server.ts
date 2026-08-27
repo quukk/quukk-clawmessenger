@@ -9,6 +9,7 @@ import type { AddressInfo } from 'node:net';
 import { extname, isAbsolute, relative, resolve } from 'node:path';
 
 import {
+  assertBodylessRequest,
   type HttpLogger,
   LocalRoutes,
   type LocalRequestContext,
@@ -91,10 +92,14 @@ function validateTarget(target: string | undefined): ValidatedTarget {
   }
   const query = target.indexOf('?');
   if (query !== -1) throw new ServerFailure('invalid_request');
+  let decoded: string;
   try {
-    decodeURIComponent(target);
+    decoded = decodeURIComponent(target);
   } catch {
     throw new ServerFailure('invalid_request');
+  }
+  if (decoded !== target && /^\/(?:api|internal)(?:\/|$)/.test(decoded)) {
+    throw new ServerFailure('not_found');
   }
   return { pathname: target };
 }
@@ -173,12 +178,14 @@ export class LocalHttpServer {
       (request, response) => { void this.#handle(request, response); },
     );
     this.#server = server;
-    server.maxHeadersCount = MAX_HEADERS;
+    // Preserve raw pairs so the application can reject over-limit requests with hardened headers.
+    server.maxHeadersCount = 0;
     server.headersTimeout = HEADERS_TIMEOUT_MS;
     server.requestTimeout = REQUEST_TIMEOUT_MS;
     server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
     server.maxConnections = MAX_CONNECTIONS;
     server.on('checkContinue', (request, response) => { void this.#handle(request, response); });
+    server.on('checkExpectation', (request, response) => { void this.#handle(request, response); });
     server.on('clientError', (_error, socket) => sendClientError(socket));
 
     await new Promise<void>((resolvePromise, rejectPromise) => {
@@ -242,6 +249,7 @@ export class LocalHttpServer {
       if (request.socket.remoteAddress !== HOST) throw new ServerFailure('host_rejected');
       const hosts = rawHeaderValues(request, 'host');
       if (hosts.length !== 1 || hosts[0] !== this.#hostHeader) throw new ServerFailure('host_rejected');
+      if (request.rawHeaders.length > MAX_HEADERS * 2) throw new ServerFailure('invalid_request');
       const target = validateTarget(request.url);
       const context: LocalRequestContext = {
         peer: HOST,
@@ -261,6 +269,12 @@ export class LocalHttpServer {
   async #static(request: IncomingMessage, response: ServerResponse, rawPathname: string): Promise<void> {
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       writeHttpError(request, response, 'method_not_allowed', { Allow: 'GET, HEAD' });
+      return;
+    }
+    try {
+      assertBodylessRequest(request);
+    } catch {
+      writeHttpError(request, response, 'invalid_request');
       return;
     }
     const root = this.#canonicalStaticRoot;

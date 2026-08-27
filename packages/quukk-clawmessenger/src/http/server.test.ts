@@ -1,9 +1,9 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile as readFixture, rm, writeFile } from 'node:fs/promises';
 import { request, type IncomingHttpHeaders } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   LocalRoutes,
@@ -53,6 +53,7 @@ type HttpResponse = { status: number; headers: IncomingHttpHeaders; body: Buffer
 type Harness = {
   origin: string;
   address: { host: '127.0.0.1'; port: number; origin: string };
+  controlCalls: string[];
   send(input?: { method?: string; path?: string; headers?: Record<string, string>; body?: string }): Promise<HttpResponse>;
 };
 
@@ -71,8 +72,12 @@ async function startServer(staticRoot: string, dependencies?: ConstructorParamet
     async settings() { throw Object.assign(new Error(), { code: 'operation_unavailable' }); },
     async saveSettings() { throw Object.assign(new Error(), { code: 'operation_unavailable' }); },
   };
+  const controlCalls: string[] = [];
   const control: LocalControlPort = {
-    async status() { return { schemaVersion: 1, identity: currentIdentity, state: 'ready' }; },
+    async status() {
+      controlCalls.push('status');
+      return { schemaVersion: 1, identity: currentIdentity, state: 'ready' };
+    },
     async rescan() { return emptyRuntimes; },
     shutdownAfterResponse() {},
   };
@@ -93,6 +98,7 @@ async function startServer(staticRoot: string, dependencies?: ConstructorParamet
   return {
     origin: address.origin,
     address,
+    controlCalls,
     send: (input = {}) => new Promise<HttpResponse>((resolve, reject) => {
       const body = input.body ?? '';
       const outgoing = request({
@@ -124,6 +130,7 @@ async function populatedRoot(): Promise<string> {
     writeFile(join(root, 'index.html'), '<!doctype html><title>Quukk</title>'),
     writeFile(join(root, 'assets', 'app.js'), 'globalThis.__quukk = true;'),
     writeFile(join(root, 'data.json'), '{"schemaVersion":1}'),
+    writeFile(join(root, 'hello world.json'), '{"encoded":true}'),
     writeFile(join(root, '.secret'), 'hidden'),
     writeFile(join(root, 'debug.map'), '{}'),
     writeFile(join(root, 'notes.txt'), 'hidden'),
@@ -141,6 +148,27 @@ describe('LocalHttpServer perimeter', () => {
     expect(rejected.status).toBe(403);
     expect(rejected.json).toEqual({ error: { code: 'host_rejected', category: 'policy', retryable: false } });
     expect(rejected.headers['content-security-policy']).toBe(securityHeaders()['Content-Security-Policy']);
+  });
+
+  it('rejects more than 64 raw header pairs before dispatching a route', async () => {
+    const value = await startServer(await populatedRoot());
+    const body = '{"command":"status"}';
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${CREDENTIAL}`,
+      'Content-Type': 'application/json',
+      'Content-Length': String(Buffer.byteLength(body)),
+    };
+    for (let index = 0; index < 62; index += 1) headers[`X-Filler-${index}`] = 'x';
+    const response = await value.send({
+      method: 'POST', path: '/internal/control', headers,
+      body,
+    });
+    expect(response.status).toBe(400);
+    expect(response.json).toEqual({
+      error: { code: 'invalid_request', category: 'policy', retryable: false },
+    });
+    expect(response.headers['content-security-policy']).toBe(securityHeaders()['Content-Security-Policy']);
+    expect(value.controlCalls).toEqual([]);
   });
 
   it('rejects non-origin-form targets, API queries, malformed percent and OPTIONS without CORS', async () => {
@@ -176,6 +204,27 @@ describe('LocalHttpServer perimeter', () => {
 });
 
 describe('LocalHttpServer static assets', () => {
+  it('rejects framed or encoded GET/HEAD requests before reading a static file', async () => {
+    const readStatic = vi.fn(async (path: Parameters<typeof readFixture>[0]) => readFixture(path));
+    const value = await startServer(await populatedRoot(), {
+      readFile: readStatic as unknown as typeof readFixture,
+    });
+    const cases: Array<{ method: string; headers: Record<string, string>; body?: string }> = [
+      { method: 'GET', headers: { 'Content-Length': '1' }, body: 'x' },
+      { method: 'HEAD', headers: { 'Content-Length': '1' }, body: 'x' },
+      { method: 'GET', headers: { 'Content-Type': 'text/plain' } },
+      { method: 'GET', headers: { 'Transfer-Encoding': 'chunked' } },
+      { method: 'GET', headers: { 'Content-Encoding': 'gzip' } },
+      { method: 'GET', headers: { Expect: 'quukk-unknown' } },
+    ];
+    for (const input of cases) {
+      const response = await value.send(input);
+      expect(response.status).toBe(400);
+      expect(response.headers['content-security-policy']).toBe(securityHeaders()['Content-Security-Policy']);
+    }
+    expect(readStatic).not.toHaveBeenCalled();
+  });
+
   it('serves allowlisted MIME types, identical HEAD headers, and HTML-only SPA navigation', async () => {
     const value = await startServer(await populatedRoot());
     const index = await value.send();
@@ -209,6 +258,23 @@ describe('LocalHttpServer static assets', () => {
       ['/data.json?download=1', 400],
     ];
     for (const [path, status] of cases) expect((await value.send({ path })).status).toBe(status);
+  });
+
+  it('blocks decoded API/internal namespaces without banning legitimate encoded static names', async () => {
+    const value = await startServer(await populatedRoot());
+    for (const path of ['/%61pi/runtimes', '/%69nternal/control']) {
+      const response = await value.send({ path, headers: { Accept: 'text/html' } });
+      expect(response.status).toBe(404);
+      expect(response.json).toEqual({
+        error: { code: 'not_found', category: 'policy', retryable: false },
+      });
+    }
+    expect((await value.send({
+      method: 'POST', path: '/%61pi/runtimes', headers: { Accept: 'text/html' },
+    })).status).toBe(404);
+    const legitimate = await value.send({ path: '/hello%20world.json' });
+    expect(legitimate.status).toBe(200);
+    expect(legitimate.json).toEqual({ encoded: true });
   });
 
   it('never falls back API/internal paths to index and rejects methods outside GET/HEAD', async () => {

@@ -41,7 +41,7 @@ export type SafeBindingView = z.infer<typeof SafeBindingSchema>;
 export const RuntimeViewSchema = z.strictObject({
   provider: ProviderSchema,
   runtimeId: z.string().regex(RUNTIME_ID_PATTERN).nullable(),
-  version: z.string().min(1).max(128).nullable(),
+  version: z.string().min(1).max(256).nullable(),
   path: z.string().min(1).max(4096).nullable(),
   status: RuntimeStatusSchema,
   capabilities: z.strictObject({
@@ -148,7 +148,7 @@ export const DiagnosticsResponseSchema = z.strictObject({
   runtimes: z.array(z.strictObject({
     provider: ProviderSchema,
     status: RuntimeStatusSchema,
-    version: z.string().min(1).max(128).optional(),
+    version: z.string().min(1).max(256).optional(),
     executableName: z.string().min(1).max(255).refine((value) => !/[\\/\0]/.test(value)).optional(),
   })).max(PROVIDERS.length),
   workers: z.array(z.strictObject({
@@ -371,6 +371,10 @@ function validateFraming(request: IncomingMessage, maximumBytes: number, json: b
   return declared;
 }
 
+export function assertBodylessRequest(request: IncomingMessage): void {
+  validateFraming(request, 0, false);
+}
+
 async function readJson(request: IncomingMessage, maximumBytes: number): Promise<unknown> {
   validateFraming(request, maximumBytes, true);
   const chunks: Buffer[] = [];
@@ -562,7 +566,7 @@ export class LocalRoutes {
       return;
     }
 
-    validateFraming(request, 0, false);
+    assertBodylessRequest(request);
     if (route.kind === 'runtimes') {
       const value = await this.#operation(request, response, 12_000, (signal) => this.#api.runtimes(signal));
       sendJson(request, response, 200, value, RuntimesResponseSchema);

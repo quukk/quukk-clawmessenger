@@ -338,6 +338,29 @@ describe('LocalRoutes browser boundary', () => {
     expect(response.body).not.toContain(secret);
   });
 
+  it('accepts 256-character runtime versions in runtimes and diagnostics responses', async () => {
+    const value = await harness();
+    const session = await browserSession(value);
+    const version = 'v'.repeat(256);
+    value.api.runtimes = vi.fn(async () => ({
+      ...runtimes,
+      runtimes: runtimes.runtimes.map((runtime, index) => index === 0
+        ? { ...runtime, version }
+        : runtime),
+    })) as never;
+    value.api.diagnostics = vi.fn(async () => ({
+      ...diagnostics,
+      runtimes: diagnostics.runtimes.map((runtime) => ({ ...runtime, version })),
+    })) as never;
+    const headers = { Cookie: session.cookie };
+    const runtimeResponse = await value.send({ path: '/api/runtimes', headers });
+    expect(runtimeResponse.status).toBe(200);
+    expect((runtimeResponse.json as RuntimesResponse).runtimes[0]!.version).toBe(version);
+    const diagnosticsResponse = await value.send({ path: '/api/diagnostics', headers });
+    expect(diagnosticsResponse.status).toBe(200);
+    expect((diagnosticsResponse.json as DiagnosticsResponse).runtimes[0]!.version).toBe(version);
+  });
+
   it('consumes a valid ticket before session creation and maps route timeouts safely', async () => {
     class FailingSessionStore extends BrowserSessionStore {
       override create(): { cookieValue: string; csrfToken: string; expiresInMs: number } {
