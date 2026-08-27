@@ -1034,7 +1034,12 @@ export interface ProductionSignalPort {
 }
 
 export interface ProductionDaemonChild {
-  stdin: { end(data: string, encoding: 'utf8'): unknown } | null;
+  pid?: number;
+  stdin: {
+    end(data: string, encoding: 'utf8'): unknown;
+    once(event: 'error', listener: (error: Error) => void): unknown;
+    off(event: 'error', listener: (error: Error) => void): unknown;
+  } | null;
   once(event: 'error', listener: (error: Error) => void): unknown;
   off(event: 'error', listener: (error: Error) => void): unknown;
   unref(): void;
@@ -1150,7 +1155,13 @@ function normalizedProductionFailure(error: unknown): ProductionCliFailure {
   if (code === 'operation_timeout' || code === 'shutdown_timeout') {
     return productionFailure(code);
   }
-  return productionFailure('operation_unavailable');
+  if (
+    code === 'bridge_unavailable'
+    || code === 'operation_unavailable'
+    || code === 'service_unavailable'
+    || code === 'unavailable'
+  ) return productionFailure('operation_unavailable');
+  return productionFailure('internal_failure');
 }
 
 function normalizedChildOverrides(value: z.infer<typeof ChildConfigOverridesSchema>): ConfigOverrides {
@@ -1305,6 +1316,14 @@ async function readStrictControlResponse(
   response: IncomingMessage,
   expectedStatus: number,
 ): Promise<unknown> {
+  const rejectResponse = (): never => {
+    try {
+      response.destroy();
+    } catch {
+      // The fixed validation failure remains authoritative.
+    }
+    throw productionFailure('process_unverified');
+  };
   const contentTypes = rawResponseHeaders(response, 'content-type');
   const contentLengths = rawResponseHeaders(response, 'content-length');
   if (
@@ -1315,10 +1334,10 @@ async function readStrictControlResponse(
     || !/^(?:0|[1-9]\d*)$/.test(contentLengths[0]!)
     || rawResponseHeaders(response, 'transfer-encoding').length !== 0
     || rawResponseHeaders(response, 'content-encoding').length !== 0
-  ) throw productionFailure('process_unverified');
+  ) rejectResponse();
   const declared = Number(contentLengths[0]);
   if (!Number.isSafeInteger(declared) || declared < 1 || declared > CONTROL_RESPONSE_LIMIT) {
-    throw productionFailure('process_unverified');
+    rejectResponse();
   }
   const chunks: Buffer[] = [];
   let total = 0;
@@ -1327,24 +1346,24 @@ async function readStrictControlResponse(
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
       total += bytes.byteLength;
       if (total > declared || total > CONTROL_RESPONSE_LIMIT) {
-        throw productionFailure('process_unverified');
+        rejectResponse();
       }
       chunks.push(bytes);
     }
   } catch (error) {
-    if (error instanceof ProductionCliFailure) throw error;
-    throw productionFailure('process_unverified');
+    if (!(error instanceof ProductionCliFailure)) rejectResponse();
+    throw error;
   }
   if (
     total !== declared
     || response.complete !== true
     || Object.keys(response.trailers).length !== 0
-  ) throw productionFailure('process_unverified');
+  ) rejectResponse();
   try {
     const text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
     return JSON.parse(text) as unknown;
   } catch {
-    throw productionFailure('process_unverified');
+    return rejectResponse();
   }
 }
 
@@ -1408,6 +1427,7 @@ function controlRequest(
   return new Promise<unknown>((resolvePromise, rejectPromise) => {
     let settled = false;
     let outgoing: ClientRequest | undefined;
+    let activeResponse: IncomingMessage | undefined;
     const finish = (error: unknown, value?: unknown): void => {
       if (settled) return;
       settled = true;
@@ -1416,12 +1436,13 @@ function controlRequest(
       else rejectPromise(error);
     };
     const timer = setTimeout(() => {
+      finish(productionFailure('operation_timeout'));
       try {
         outgoing?.destroy();
+        activeResponse?.destroy();
       } catch {
         // The fixed timeout classification is authoritative.
       }
-      finish(productionFailure('operation_timeout'));
     }, timeoutMs);
     try {
       outgoing = request({
@@ -1439,6 +1460,15 @@ function controlRequest(
           Connection: 'close',
         },
       }, (response) => {
+        if (settled) {
+          try {
+            response.destroy();
+          } catch {
+            // The already-settled result remains authoritative.
+          }
+          return;
+        }
+        activeResponse = response;
         const expectedStatus = command === 'launch_ticket' ? 201 : command === 'shutdown' ? 202 : 200;
         void readStrictControlResponse(response, expectedStatus).then(
           (value) => finish(undefined, value),
@@ -1501,6 +1531,7 @@ export function createProductionCliRuntime(
     ?? ((milliseconds: number, signal?: AbortSignal) => new Promise<void>((resolvePromise, rejectPromise) => {
       const aborted = (): void => {
         clearTimeout(timer);
+        signal?.removeEventListener('abort', aborted);
         rejectPromise(productionFailure('operation_unavailable'));
       };
       const timer = setTimeout(() => {
@@ -1516,6 +1547,35 @@ export function createProductionCliRuntime(
   const startService = dependencies.startService
     ?? (startProductionService as (value: ComposeProductionServiceOptions) => Promise<QuukkService>);
   const signals = dependencies.signals ?? process;
+
+  type OperationDeadline = {
+    startedAt: number;
+    durationMs: number;
+    failureCode: 'operation_timeout' | 'shutdown_timeout';
+  };
+  const beginDeadline = (
+    durationMs: number,
+    failureCode: OperationDeadline['failureCode'],
+  ): OperationDeadline => {
+    const startedAt = monotonicNow();
+    if (!Number.isFinite(startedAt) || startedAt < 0) throw productionFailure(failureCode);
+    return { startedAt, durationMs, failureCode };
+  };
+  const remainingDeadline = (deadline: OperationDeadline): number => {
+    const elapsed = monotonicNow() - deadline.startedAt;
+    const remaining = deadline.durationMs - elapsed;
+    if (!Number.isFinite(elapsed) || elapsed < 0 || !Number.isFinite(remaining) || remaining <= 0) {
+      throw productionFailure(deadline.failureCode);
+    }
+    return remaining;
+  };
+  const sleepWithinDeadline = async (
+    deadline: OperationDeadline,
+    milliseconds: number,
+  ): Promise<void> => {
+    await sleep(Math.min(milliseconds, remainingDeadline(deadline)));
+    remainingDeadline(deadline);
+  };
 
   const readStoredIdentity = async (): Promise<{
     identity?: DaemonIdentity;
@@ -1593,10 +1653,14 @@ export function createProductionCliRuntime(
   const authenticateStatus = async (
     identity: ReadyDaemonIdentity,
     timeoutMs: number,
-    credential?: string,
+    deadline?: OperationDeadline,
   ): Promise<ControlStatusResponse> => {
-    const presented = credential ?? await readCredential(identity);
-    const raw = await controlRequest(request, identity, presented, 'status', timeoutMs);
+    const presented = await readCredential(identity);
+    const requestTimeout = deadline === undefined
+      ? timeoutMs
+      : Math.min(timeoutMs, remainingDeadline(deadline));
+    const raw = await controlRequest(request, identity, presented, 'status', requestTimeout);
+    if (deadline !== undefined) remainingDeadline(deadline);
     const parsed = ControlStatusResponseSchema.safeParse(raw);
     if (!parsed.success || !sameIdentity(identity, parsed.data.identity)) {
       throw productionFailure('process_unverified');
@@ -1608,6 +1672,7 @@ export function createProductionCliRuntime(
     identity: ReadyDaemonIdentity,
     contentDigest: string,
     completedUnreachableAttempts = 0,
+    deadline = beginDeadline(START_WAIT_MS, 'operation_timeout'),
   ): Promise<boolean> => {
     if (
       !ReadyDaemonIdentitySchema.safeParse(identity).success
@@ -1617,15 +1682,17 @@ export function createProductionCliRuntime(
       || completedUnreachableAttempts > 3
     ) throw productionFailure('stale_unverified');
     for (let attempt = completedUnreachableAttempts; attempt < 3; attempt += 1) {
-      if (attempt === 1) await sleep(100);
-      if (attempt === 2) await sleep(250);
+      if (attempt === 1) await sleepWithinDeadline(deadline, 100);
+      if (attempt === 2) await sleepWithinDeadline(deadline, 250);
       try {
-        await authenticateStatus(identity, 1_000);
+        await authenticateStatus(identity, 1_000, deadline);
         throw productionFailure('stale_unverified');
       } catch (error) {
+        if (errorCodeOf(error) === deadline.failureCode) throw error;
         if (!explicitlyUnreachable(error)) throw productionFailure('stale_unverified');
       }
     }
+    remainingDeadline(deadline);
     try {
       kill(identity.pid, 0);
       throw productionFailure('stale_unverified');
@@ -1633,6 +1700,7 @@ export function createProductionCliRuntime(
       if (error instanceof ProductionCliFailure) throw error;
       if (errorCodeOf(error) !== 'ESRCH') throw productionFailure('stale_unverified');
     }
+    remainingDeadline(deadline);
     let quarantined = false;
     try {
       quarantined = await identityStore.quarantineStaleIfExact({
@@ -1643,30 +1711,27 @@ export function createProductionCliRuntime(
       throw productionFailure('stale_unverified');
     }
     if (!quarantined) throw productionFailure('stale_unverified');
+    remainingDeadline(deadline);
     return true;
   };
 
   const waitForShutdown = async (
     identity: ReadyDaemonIdentity,
-    credential: string,
+    deadline: OperationDeadline,
   ): Promise<void> => {
-    const started = monotonicNow();
-    if (!Number.isFinite(started) || started < 0) throw productionFailure('shutdown_timeout');
     while (true) {
-      const elapsed = monotonicNow() - started;
-      if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed > SHUTDOWN_WAIT_MS) {
-        throw productionFailure('shutdown_timeout');
-      }
+      const remaining = remainingDeadline(deadline);
       let oldAuthenticationFailed = false;
       try {
         await authenticateStatus(
           identity,
-          Math.max(1, Math.min(1_000, SHUTDOWN_WAIT_MS - Math.trunc(elapsed))),
-          credential,
+          Math.min(1_000, remaining),
+          deadline,
         );
       } catch {
         oldAuthenticationFailed = true;
       }
+      remainingDeadline(deadline);
       let oldIdentityGone = false;
       try {
         const current = await readStoredIdentity();
@@ -1676,23 +1741,35 @@ export function createProductionCliRuntime(
       } catch {
         oldIdentityGone = false;
       }
+      remainingDeadline(deadline);
       if (oldAuthenticationFailed && oldIdentityGone) return;
-      const afterProbe = monotonicNow() - started;
-      if (!Number.isFinite(afterProbe) || afterProbe >= SHUTDOWN_WAIT_MS) {
-        throw productionFailure('shutdown_timeout');
-      }
-      await sleep(POLL_MS);
+      await sleepWithinDeadline(deadline, POLL_MS);
     }
   };
 
   const control: CliRuntimePort['control'] = async (identity, command) => {
     const parsedIdentity = ReadyDaemonIdentitySchema.safeParse(identity);
     if (!parsedIdentity.success) throw productionFailure('process_unverified');
-    const credential = await readCredential(parsedIdentity.data);
+    const shutdownDeadline = command === 'shutdown'
+      ? beginDeadline(SHUTDOWN_WAIT_MS, 'shutdown_timeout')
+      : undefined;
     let authenticated: ControlStatusResponse;
     try {
-      authenticated = await authenticateStatus(parsedIdentity.data, 5_000, credential);
+      authenticated = await authenticateStatus(
+        parsedIdentity.data,
+        shutdownDeadline === undefined
+          ? 5_000
+          : Math.min(5_000, remainingDeadline(shutdownDeadline)),
+        shutdownDeadline,
+      );
+      if (shutdownDeadline !== undefined) remainingDeadline(shutdownDeadline);
     } catch (error) {
+      if (
+        shutdownDeadline !== undefined
+        && (errorCodeOf(error) === 'operation_timeout' || errorCodeOf(error) === 'shutdown_timeout')
+      ) {
+        throw productionFailure('shutdown_timeout');
+      }
       if (errorCodeOf(error) === 'operation_timeout') throw error;
       throw productionFailure('process_unverified');
     }
@@ -1701,8 +1778,25 @@ export function createProductionCliRuntime(
     }
     let raw: unknown;
     try {
-      raw = await controlRequest(request, parsedIdentity.data, credential, command);
+      const credential = await readCredential(parsedIdentity.data);
+      const requestTimeout = shutdownDeadline === undefined
+        ? 5_000
+        : Math.min(5_000, remainingDeadline(shutdownDeadline));
+      raw = await controlRequest(
+        request,
+        parsedIdentity.data,
+        credential,
+        command,
+        requestTimeout,
+      );
+      if (shutdownDeadline !== undefined) remainingDeadline(shutdownDeadline);
     } catch (error) {
+      if (
+        shutdownDeadline !== undefined
+        && (errorCodeOf(error) === 'operation_timeout' || errorCodeOf(error) === 'shutdown_timeout')
+      ) {
+        throw productionFailure('shutdown_timeout');
+      }
       if (errorCodeOf(error) === 'operation_timeout') throw error;
       throw productionFailure('process_unverified');
     }
@@ -1718,11 +1812,14 @@ export function createProductionCliRuntime(
     }
     const parsed = RawShutdownResponseSchema.safeParse(raw);
     if (!parsed.success) throw productionFailure('process_unverified');
-    await waitForShutdown(parsedIdentity.data, credential);
+    await waitForShutdown(parsedIdentity.data, shutdownDeadline!);
     return { command, value: { accepted: true } };
   };
 
-  const spawnBackground = (input: StartInput): (() => void) => {
+  const spawnBackground = (input: StartInput): {
+    check(): void;
+    ownedPid?: number;
+  } => {
     if (input.foreground !== false || typeof input.noOpen !== 'boolean') {
       throw productionFailure('invalid_config');
     }
@@ -1760,52 +1857,69 @@ export function createProductionCliRuntime(
     try {
       child.once('error', failed);
       if (child.stdin === null) throw productionFailure('operation_unavailable');
+      child.stdin.once('error', failed);
       child.stdin.end(frame, 'utf8');
       child.unref();
     } catch {
       throw productionFailure('operation_unavailable');
     }
-    return () => {
-      if (failure !== undefined) throw failure;
+    const ownedPid = Number.isSafeInteger(child.pid) && child.pid! > 0
+      ? child.pid
+      : undefined;
+    return {
+      ownedPid,
+      check(): void {
+        if (failure !== undefined) throw failure;
+      },
     };
   };
 
   const startBackground = async (input: StartInput): Promise<StartResult> => {
-    const started = monotonicNow();
-    if (!Number.isFinite(started) || started < 0) throw productionFailure('operation_timeout');
+    const deadline = beginDeadline(START_WAIT_MS, 'operation_timeout');
     let spawned = false;
     let checkChild = (): void => {};
+    let ownedPid: number | undefined;
     let snapshot = await readStoredIdentity();
     while (true) {
+      remainingDeadline(deadline);
       checkChild();
       if (snapshot.identity === undefined) {
         if (!spawned) {
-          checkChild = spawnBackground(input);
+          remainingDeadline(deadline);
+          const child = spawnBackground(input);
+          checkChild = child.check;
+          ownedPid = child.ownedPid;
           spawned = true;
         }
       } else if (snapshot.identity.state === 'ready') {
         try {
-          await authenticateStatus(snapshot.identity, 1_000);
-          return { identity: snapshot.identity, alreadyRunning: !spawned };
+          await authenticateStatus(
+            snapshot.identity,
+            1_000,
+            deadline,
+          );
+          return {
+            identity: snapshot.identity,
+            alreadyRunning: ownedPid === undefined || snapshot.identity.pid !== ownedPid,
+          };
         } catch (error) {
           if (!explicitlyUnreachable(error)) {
             if (errorCodeOf(error) === 'operation_timeout') throw error;
             throw productionFailure('process_unverified');
           }
-          await recoverExactStale(snapshot.identity, snapshot.contentDigest!, 1);
+          await recoverExactStale(snapshot.identity, snapshot.contentDigest!, 1, deadline);
           spawned = false;
           checkChild = (): void => {};
+          ownedPid = undefined;
           snapshot = {};
           continue;
         }
       }
-      const elapsed = monotonicNow() - started;
-      if (!Number.isFinite(elapsed) || elapsed < 0 || elapsed >= START_WAIT_MS) {
-        throw productionFailure('operation_timeout');
-      }
-      await sleep(POLL_MS);
+      await sleep(Math.min(POLL_MS, remainingDeadline(deadline)));
       checkChild();
+      remainingDeadline(deadline);
       snapshot = await readStoredIdentity();
+      remainingDeadline(deadline);
     }
   };
 
@@ -1833,21 +1947,84 @@ export function createProductionCliRuntime(
       const identity = createStartingIdentity(processId, now, randomBytes);
       if (!(await identityStore.claim(identity))) throw productionFailure('identity_conflict');
       let service: ProductionCliServicePort | undefined;
+      let serviceStarting = false;
+      let interrupted = false;
+      let monitoring = false;
+      let cleanupPromise: Promise<void> | undefined;
+      let resolveStopRequested!: () => void;
+      const stopRequested = new Promise<void>((resolvePromise) => {
+        resolveStopRequested = resolvePromise;
+      });
+      const cleanup = (): Promise<void> => {
+        cleanupPromise ??= (async () => {
+          let failure: ProductionCliFailure | undefined;
+          if (service !== undefined) {
+            try {
+              await service.stop();
+            } catch (error) {
+              failure = normalizedProductionFailure(error);
+            }
+          }
+          try {
+            await identityStore.removeIfMatches(identity);
+          } catch (error) {
+            failure ??= normalizedProductionFailure(error);
+          }
+          if (failure !== undefined) throw failure;
+        })();
+        return cleanupPromise;
+      };
+      const requestStop = (): void => {
+        if (!interrupted) {
+          interrupted = true;
+          resolveStopRequested();
+        }
+        if (!serviceStarting) void cleanup().catch(() => undefined);
+      };
+      signals.once('SIGINT', requestStop);
+      signals.once('SIGTERM', requestStop);
       try {
-        const effectiveInput = foreground.daemonChild
-          ? parseChildStartInput(await readStdin(CHILD_INPUT_LIMIT))
-          : input;
-        service = await startService({
-          identity,
-          identityStore,
-          homeDirectory,
-          processEnvironment,
-          configEnvironment: processEnvironment,
-          configOverrides: effectiveInput.configOverrides,
-        });
+        let effectiveInput = input;
+        if (foreground.daemonChild) {
+          const childInput = await Promise.race([
+            readStdin(CHILD_INPUT_LIMIT).then((bytes) => ({ interrupted: false as const, bytes })),
+            stopRequested.then(() => ({ interrupted: true as const })),
+          ]);
+          if (childInput.interrupted || interrupted) {
+            await cleanup();
+            return 0;
+          }
+          effectiveInput = parseChildStartInput(childInput.bytes);
+        }
+        if (interrupted) {
+          await cleanup();
+          return 0;
+        }
+        serviceStarting = true;
+        try {
+          const serviceEnvironment = daemonEnvironment(processEnvironment);
+          service = await startService({
+            identity,
+            identityStore,
+            homeDirectory,
+            processEnvironment: serviceEnvironment,
+            configEnvironment: serviceEnvironment,
+            configOverrides: effectiveInput.configOverrides,
+          });
+        } finally {
+          serviceStarting = false;
+        }
+        if (interrupted) {
+          await cleanup();
+          return 0;
+        }
         const ready = ControlStatusResponseSchema.safeParse(
           await service.status(new AbortController().signal),
         );
+        if (interrupted) {
+          await cleanup();
+          return 0;
+        }
         if (
           !ready.success
           || ready.data.state !== 'ready'
@@ -1856,60 +2033,45 @@ export function createProductionCliRuntime(
           || ready.data.identity.instance_id !== identity.instance_id
           || ready.data.identity.started_at !== identity.started_at
         ) throw productionFailure('process_unverified');
-
-        let stopPromise: Promise<void> | undefined;
-        let settleStop!: () => void;
-        let rejectStop!: (error: ProductionCliFailure) => void;
-        const stopped = new Promise<void>((resolvePromise, rejectPromise) => {
-          settleStop = resolvePromise;
-          rejectStop = rejectPromise;
-        });
-        const requestStop = (): void => {
-          stopPromise ??= Promise.resolve()
-            .then(() => service!.stop())
-            .then(settleStop, (error) => rejectStop(normalizedProductionFailure(error)));
-          void stopPromise.catch(() => undefined);
-        };
-        signals.once('SIGINT', requestStop);
-        signals.once('SIGTERM', requestStop);
-        let monitoring = false;
-        try {
-          await foreground.onReady(ready.data.identity);
-          if (stopPromise === undefined) {
-            monitoring = true;
-            void (async () => {
-              while (monitoring && stopPromise === undefined) {
-                try {
-                  const current = await readStoredIdentity();
-                  if (
-                    current.identity === undefined
-                    || current.identity.state !== 'ready'
-                    || !sameIdentity(ready.data.identity, current.identity)
-                  ) {
-                    requestStop();
-                    return;
-                  }
-                } catch {
-                  // A transient/corrupt read is never proof that the owned service stopped.
-                }
-                if (monitoring && stopPromise === undefined) await sleep(POLL_MS);
-              }
-            })();
-          }
-          await stopped;
+        await foreground.onReady(ready.data.identity);
+        if (interrupted) {
+          await cleanup();
           return 0;
-        } finally {
-          monitoring = false;
-          signals.off('SIGINT', requestStop);
-          signals.off('SIGTERM', requestStop);
         }
+        monitoring = true;
+        void (async () => {
+          while (monitoring && !interrupted) {
+            try {
+              const current = await readStoredIdentity();
+              if (
+                current.identity === undefined
+                || current.identity.state !== 'ready'
+                || !sameIdentity(ready.data.identity, current.identity)
+              ) {
+                requestStop();
+                return;
+              }
+            } catch {
+              // A transient/corrupt read is never proof that the owned service stopped.
+            }
+            if (monitoring && !interrupted) await sleep(POLL_MS);
+          }
+        })().catch(() => requestStop());
+        await stopRequested;
+        await cleanup();
+        return 0;
       } catch (error) {
-        if (service === undefined) {
-          await identityStore.removeIfMatches(identity).catch(() => false);
-        } else {
-          await service.stop().catch(() => undefined);
+        try {
+          await cleanup();
+        } catch (cleanupError) {
+          throw normalizedProductionFailure(cleanupError);
         }
+        if (interrupted) return 0;
         throw normalizedProductionFailure(error);
+      } finally {
+        monitoring = false;
+        signals.off('SIGINT', requestStop);
+        signals.off('SIGTERM', requestStop);
       }
     },
     control,
