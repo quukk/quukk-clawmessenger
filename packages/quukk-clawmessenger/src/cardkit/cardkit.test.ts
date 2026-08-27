@@ -550,7 +550,26 @@ describe('CardKit shared wire fixture and provenance gate', () => {
     expect(notices).toContain('declares `LGPL 2.1`');
     expect(notices).toContain('This discrepancy is unresolved.');
     expect(notices).toContain('Task 14 legal gate');
-    expect(notices.match(/Permission is hereby granted/g)).toHaveLength(3);
+    for (const [heading, copyright] of [
+      ['Codex ClawMessenger', 'Copyright (c) 2026 Quukk'],
+      ['OpenClaw ClawMessenger', 'Copyright (c) 2024 quukk'],
+      ['RongCloud JavaScript SDK', 'Copyright (c) 2016 RongCloud.'],
+    ]) {
+      const sectionStart = notices.indexOf(`## ${heading}`);
+      const nextSectionStart = notices.indexOf('\n## ', sectionStart + 1);
+      const section = notices.slice(
+        sectionStart,
+        nextSectionStart === -1 ? undefined : nextSectionStart,
+      );
+
+      expect(sectionStart).toBeGreaterThan(-1);
+      expect(section).toContain(copyright);
+      expect(section).toContain('Permission is hereby granted');
+      expect(section).toContain('THE SOFTWARE IS PROVIDED "AS IS"');
+    }
+    expect(notices).toContain('## Bridge UI bundled software');
+    expect(notices).toContain('`@base-ui/react@1.3.0`');
+    expect(notices).toContain('`zod@4.3.6`');
 
     for (const source of [
       'schema.ts', 'builders.ts', 'validate.ts', 'parse-marker.ts', 'templates.ts', 'action-router.ts',
