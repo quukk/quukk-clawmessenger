@@ -120,7 +120,12 @@ type SanitizedEvent = Omit<ActivityRecord, 'id' | 'time' | 'level'> & {
   command?: string;
 };
 type SerializedRecord = SanitizedEvent & { time: string; level: LogMethodLevel };
-type PendingRecord = { level: LogMethodLevel; line: string };
+type PendingRecord = {
+  level: LogMethodLevel;
+  line: string;
+  cancelled?: boolean;
+  countedAsDropped?: boolean;
+};
 
 const DEFAULT_DEPENDENCIES: Required<LoggerDependencies> = {
   mkdir,
@@ -217,6 +222,10 @@ function isNotFound(error: unknown): boolean {
   }
 }
 
+function isCancelled(record: PendingRecord): boolean {
+  return record.cancelled === true;
+}
+
 function activityRecord(
   id: number,
   record: SerializedRecord,
@@ -248,6 +257,7 @@ export class LocalLogger {
   #nextActivityId = 1;
   #dropped = 0;
   #drainPromise: Promise<void> | undefined;
+  #inFlight: PendingRecord | undefined;
   #closePromise: Promise<void> | undefined;
   #accepting = true;
 
@@ -348,14 +358,14 @@ export class LocalLogger {
           (candidate) => candidate.level === 'debug' || candidate.level === 'info',
         );
         if (lowerPriority >= 0) {
-          this.#pending.splice(lowerPriority, 1);
-          this.#dropped += 1;
+          const evicted = this.#pending.splice(lowerPriority, 1)[0];
+          if (evicted !== undefined) this.#countDropped(evicted);
         } else {
-          this.#dropped += 1;
+          this.#countDropped(record);
           return;
         }
       } else {
-        this.#dropped += 1;
+        this.#countDropped(record);
         return;
       }
     }
@@ -379,38 +389,60 @@ export class LocalLogger {
     while (this.#pending.length > 0) {
       const record = this.#pending.shift();
       if (record === undefined) return;
+      if (isCancelled(record)) continue;
+      this.#inFlight = record;
       try {
-        await this.#write(record.line);
+        await this.#write(record);
       } catch {
-        this.#dropped += 1;
+        if (!isCancelled(record)) this.#countDropped(record);
+      } finally {
+        if (this.#inFlight === record) this.#inFlight = undefined;
       }
     }
   }
 
-  async #write(line: string): Promise<void> {
+  async #write(record: PendingRecord): Promise<void> {
+    if (isCancelled(record)) return;
     let currentSize = 0;
     try {
       currentSize = (await this.#dependencies.stat(this.#filePath)).size;
     } catch (error) {
       if (!isNotFound(error)) throw error;
     }
-    if (currentSize + Buffer.byteLength(line, 'utf8') > MAX_LOG_BYTES) {
+    if (isCancelled(record)) return;
+    if (currentSize + Buffer.byteLength(record.line, 'utf8') > MAX_LOG_BYTES) {
       try {
         await this.#dependencies.unlink(this.#backupPath);
       } catch (error) {
         if (!isNotFound(error)) throw error;
       }
+      if (isCancelled(record)) return;
       try {
         await this.#dependencies.rename(this.#filePath, this.#backupPath);
       } catch (error) {
         if (!isNotFound(error)) throw error;
       }
+      if (isCancelled(record)) return;
     }
-    await this.#dependencies.appendFile(this.#filePath, line, {
+    await this.#dependencies.appendFile(this.#filePath, record.line, {
       encoding: 'utf8',
       ...(process.platform === 'win32' ? {} : { mode: 0o600 }),
     });
+    if (isCancelled(record)) return;
     if (process.platform !== 'win32') await this.#dependencies.chmod(this.#filePath, 0o600);
+  }
+
+  #countDropped(record: PendingRecord): void {
+    if (record.countedAsDropped === true) return;
+    record.countedAsDropped = true;
+    this.#dropped += 1;
+  }
+
+  #cancel(record: PendingRecord): void {
+    // appendFile has no cancellation API. This generation fence discards an already-started
+    // append's result and prevents every subsequent sink operation after close times out.
+    record.cancelled = true;
+    this.#countDropped(record);
   }
 
   async #close(): Promise<void> {
@@ -418,16 +450,19 @@ export class LocalLogger {
     this.#scheduleDrain();
     const draining = this.#drainPromise ?? Promise.resolve();
     let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      draining,
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, CLOSE_TIMEOUT_MS);
-        timer.unref?.();
+    const drained = await Promise.race([
+      draining.then(
+        () => true,
+        () => true,
+      ),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), CLOSE_TIMEOUT_MS);
       }),
     ]);
     if (timer !== undefined) clearTimeout(timer);
-    if (this.#pending.length > 0) {
-      this.#dropped += this.#pending.length;
+    if (!drained) {
+      if (this.#inFlight !== undefined) this.#cancel(this.#inFlight);
+      for (const record of this.#pending) this.#cancel(record);
       this.#pending = [];
     }
   }

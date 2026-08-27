@@ -98,6 +98,55 @@ describe('shouldAutoSetup', () => {
       ).toBe(true);
     }
   });
+
+  it('keeps install gates exact while trimming only desktop and display markers', () => {
+    expect(
+      shouldAutoSetup({
+        ...WINDOWS_DESKTOP,
+        env: {
+          ...WINDOWS_DESKTOP.env,
+          npm_lifecycle_event: ' postinstall ',
+          npm_config_global: ' true ',
+          SESSIONNAME: ' Console ',
+        },
+      }),
+    ).toBe(false);
+    expect(
+      shouldAutoSetup({
+        ...WINDOWS_DESKTOP,
+        env: {
+          ...WINDOWS_DESKTOP.env,
+          npm_config_global: undefined,
+          npm_config_location: ' global ',
+        },
+      }),
+    ).toBe(false);
+    expect(
+      shouldAutoSetup({
+        ...WINDOWS_DESKTOP,
+        env: { ...WINDOWS_DESKTOP.env, QUUKK_CLAWMESSENGER_NO_OPEN: ' 1 ' },
+      }),
+    ).toBe(true);
+    expect(
+      shouldAutoSetup({
+        ...WINDOWS_DESKTOP,
+        env: { ...WINDOWS_DESKTOP.env, SESSIONNAME: ' sErViCeS ' },
+      }),
+    ).toBe(false);
+    expect(
+      shouldAutoSetup({
+        platform: 'linux',
+        stdoutIsTTY: true,
+        stderrIsTTY: false,
+        env: {
+          ...WINDOWS_DESKTOP.env,
+          SESSIONNAME: undefined,
+          DISPLAY: ' \t ',
+          WAYLAND_DISPLAY: '\n ',
+        },
+      }),
+    ).toBe(false);
+  });
 });
 
 describe('runPostinstall', () => {
@@ -113,8 +162,8 @@ describe('runPostinstall', () => {
     };
     const spawn = vi.fn(() => child);
     const writeLine = vi.fn();
-    const binPath = 'D:\\package\\bin\\quukk-clawmessenger.js';
-    const execPath = 'D:\\node\\node.exe';
+    const binPath = fileURLToPath(new URL('../bin/quukk-clawmessenger.js', import.meta.url));
+    const execPath = process.execPath;
     const env = {
       ...WINDOWS_DESKTOP.env,
       SystemRoot: 'C:\\Windows',
@@ -185,6 +234,35 @@ describe('runPostinstall', () => {
     expect(spawn).not.toHaveBeenCalled();
     expect(writeLine).toHaveBeenCalledOnce();
     expect(writeLine.mock.calls[0]?.[0]).toContain('quukk-clawmessenger setup');
+  });
+
+  it('never spawns and prints exactly one hint for padded service or headless markers', () => {
+    const inputs = [
+      {
+        ...WINDOWS_DESKTOP,
+        env: { ...WINDOWS_DESKTOP.env, SESSIONNAME: ' SeRvIcEs ' },
+      },
+      {
+        platform: 'linux',
+        stdoutIsTTY: true,
+        stderrIsTTY: false,
+        env: {
+          ...WINDOWS_DESKTOP.env,
+          SESSIONNAME: undefined,
+          DISPLAY: '   ',
+          WAYLAND_DISPLAY: '\t',
+        },
+      },
+    ];
+
+    for (const input of inputs) {
+      const spawn = vi.fn();
+      const writeLine = vi.fn();
+      expect(runPostinstall({ ...input, spawn, writeLine })).toBe(false);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(writeLine).toHaveBeenCalledOnce();
+      expect(writeLine.mock.calls[0]?.[0]).toContain('quukk-clawmessenger setup');
+    }
   });
 
   it('contains synchronous spawn errors and asynchronous child errors', () => {

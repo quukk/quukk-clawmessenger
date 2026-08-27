@@ -1,5 +1,8 @@
+import { existsSync } from 'node:fs';
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
@@ -9,7 +12,7 @@ import {
   type SafeLogEvent,
 } from './logger.js';
 
-const TASK_TEMP_ROOT = 'D:\\A-DM\\dm-im\\.task-tmp';
+const TASK_TEMP_ROOT = join(tmpdir(), 'quukk-task11-tests');
 const LOG_BYTES = 5 * 1024 * 1024;
 const TIME = '2026-08-27T08:00:00.000Z';
 const RUNTIME_ID = `rt_${'a'.repeat(32)}`;
@@ -307,5 +310,153 @@ describe('LocalLogger bounded file sink', () => {
     const closing = logger.close();
     await vi.advanceTimersByTimeAsync(2_000);
     await expect(closing).resolves.toBeUndefined();
+  });
+
+  it('keeps the timeout referenced so close reliably resolves in a standalone process', async () => {
+    const loggerTypeScriptUrl = new URL('./logger.ts', import.meta.url);
+    const loggerUrl = (
+      existsSync(loggerTypeScriptUrl) ? loggerTypeScriptUrl : new URL('./logger.js', import.meta.url)
+    ).href;
+    const filePath = await temporaryLog('close-child.log');
+    const source = `
+      import { LocalLogger } from ${JSON.stringify(loggerUrl)};
+      const logger = await LocalLogger.open({
+        filePath: ${JSON.stringify(filePath)},
+        level: 'error',
+        dependencies: {
+          mkdir: async () => undefined,
+          chmod: async () => undefined,
+          stat: async () => ({ size: 0 }),
+          rename: async () => undefined,
+          unlink: async () => undefined,
+          appendFile: async (_path, data) => {
+            if (String(data).length > 0) await new Promise(() => undefined);
+          },
+        },
+      });
+      logger.error({ event: 'service_failed' });
+      await logger.close();
+      process.stdout.write(JSON.stringify(logger.diagnostics()));
+    `;
+    const startedAt = Date.now();
+    const result = spawnSync(
+      process.execPath,
+      ['--no-warnings', '--experimental-strip-types', '--input-type=module', '--eval', source],
+      {
+        encoding: 'utf8',
+        timeout: 3_000,
+        env: {
+          ...process.env,
+          NODE_OPTIONS: undefined,
+          NODE_TLS_REJECT_UNAUTHORIZED: undefined,
+        },
+      },
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('{"dropped":1,"retained":1}');
+    expect(elapsedMs).toBeGreaterThanOrEqual(800);
+    expect(elapsedMs).toBeLessThan(2_500);
+  });
+
+  it('counts timed-out work and discards active completion without follow-up sink calls', async () => {
+    vi.useFakeTimers();
+    const filePath = await temporaryLog();
+    let enterWrite!: () => void;
+    const enteredWrite = new Promise<void>((resolve) => {
+      enterWrite = resolve;
+    });
+    let releaseWrite!: () => void;
+    const blockedWrite = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const initiated: string[] = [];
+    const completed: string[] = [];
+    let settleWrite!: () => void;
+    const settledWrite = new Promise<void>((resolve) => {
+      settleWrite = resolve;
+    });
+    const appendFile: LoggerDependencies['appendFile'] = async (_path, data) => {
+      const line = String(data);
+      if (line.length === 0) return;
+      initiated.push(line);
+      enterWrite();
+      await blockedWrite;
+      completed.push(line);
+      settleWrite();
+    };
+    const fakeStat = (async () => ({ size: 0 })) as unknown as LoggerDependencies['stat'];
+    const chmodSpy = vi.fn(async () => undefined);
+    const chmod = chmodSpy as unknown as NonNullable<LoggerDependencies['chmod']>;
+    const logger = await LocalLogger.open({
+      filePath,
+      level: 'error',
+      dependencies: { appendFile, stat: fakeStat, chmod },
+    });
+    chmodSpy.mockClear();
+    logger.error({ event: 'first_failed' });
+    logger.error({ event: 'second_failed' });
+    logger.error({ event: 'third_failed' });
+    await enteredWrite;
+
+    const closing = logger.close();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await closing;
+
+    expect(logger.diagnostics()).toEqual({ dropped: 3, retained: 3 });
+    expect(initiated).toHaveLength(1);
+    expect(completed).toHaveLength(0);
+    releaseWrite();
+    await settledWrite;
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(completed).toHaveLength(1);
+    expect(initiated).toHaveLength(1);
+    expect(chmodSpy).not.toHaveBeenCalled();
+  });
+
+  it('fences rotation and append when a delayed stat resumes after close timeout', async () => {
+    vi.useFakeTimers();
+    const filePath = await temporaryLog();
+    let enterStat!: () => void;
+    const enteredStat = new Promise<void>((resolve) => {
+      enterStat = resolve;
+    });
+    let releaseStat!: () => void;
+    const blockedStat = new Promise<void>((resolve) => {
+      releaseStat = resolve;
+    });
+    const fakeStat = (async () => {
+      enterStat();
+      await blockedStat;
+      return { size: LOG_BYTES };
+    }) as unknown as LoggerDependencies['stat'];
+    const unlink = vi.fn(async () => undefined) as unknown as LoggerDependencies['unlink'];
+    const rename = vi.fn(async () => undefined) as unknown as LoggerDependencies['rename'];
+    const nonEmptyAppends: string[] = [];
+    const appendFile: LoggerDependencies['appendFile'] = async (_path, data) => {
+      if (String(data).length > 0) nonEmptyAppends.push(String(data));
+    };
+    const logger = await LocalLogger.open({
+      filePath,
+      level: 'error',
+      dependencies: { appendFile, stat: fakeStat, unlink, rename },
+    });
+    logger.error({ event: 'service_failed' });
+    await enteredStat;
+
+    const closing = logger.close();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await closing;
+    expect(logger.diagnostics()).toEqual({ dropped: 1, retained: 1 });
+
+    releaseStat();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(unlink).not.toHaveBeenCalled();
+    expect(rename).not.toHaveBeenCalled();
+    expect(nonEmptyAppends).toHaveLength(0);
   });
 });

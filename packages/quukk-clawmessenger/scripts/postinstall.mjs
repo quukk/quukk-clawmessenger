@@ -35,7 +35,11 @@ const SAFE_ENVIRONMENT_KEYS = new Set([
 ]);
 
 function hasText(value) {
-  return typeof value === 'string' && value.length > 0;
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function marker(value) {
+  return typeof value === 'string' ? value.trim() : undefined;
 }
 
 function isTruthyEnvironmentValue(value) {
@@ -62,7 +66,7 @@ export function shouldAutoSetup(input) {
     if (env.QUUKK_CLAWMESSENGER_NO_OPEN === '1') return false;
 
     if (input.platform === 'win32') {
-      return typeof env.SESSIONNAME !== 'string' || env.SESSIONNAME.toLowerCase() !== 'services';
+      return marker(env.SESSIONNAME)?.toLowerCase() !== 'services';
     }
     if (input.platform === 'darwin') return true;
     if (input.platform === 'linux') {
