@@ -314,7 +314,7 @@ describe('runPostinstall', () => {
 });
 
 describe('package install contract', () => {
-  it('ships only the production postinstall script and preserves the lifecycle command', async () => {
+  it('ships only the production lifecycle and publish-audit scripts', async () => {
     const packageJson = JSON.parse(
       await readFile(new URL('../package.json', import.meta.url), 'utf8'),
     ) as { files?: string[]; scripts?: Record<string, string> };
@@ -323,6 +323,7 @@ describe('package install contract', () => {
     expect(packageJson.files).toContain('scripts/postinstall.mjs');
     expect(packageJson.files).not.toContain('scripts/postinstall.test.ts');
     expect(packageJson.files?.filter((file) => file.startsWith('scripts/'))).toEqual([
+      'scripts/audit-tarball.mjs',
       'scripts/postinstall.mjs',
     ]);
   });

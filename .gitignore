@@ -67,6 +67,10 @@ _features/
 # runtime
 *.pid
 .quukk-clawmessenger/
+.artifacts/
+packages/quukk-clawmessenger-runtime-*/manifest.json
+packages/quukk-clawmessenger-runtime-*/multica
+packages/quukk-clawmessenger-runtime-*/multica.exe
 
 # platform specific
 *.dmg

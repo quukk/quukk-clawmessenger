@@ -51,6 +51,26 @@ async function makeLegalRoot(root: string): Promise<void> {
   }
 }
 
+describe('publish lifecycle', () => {
+  it('runs the exact tarball audit before any direct npm publish', async () => {
+    const packageJson = JSON.parse(
+      await readFile(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'),
+    ) as {
+      files?: string[];
+      publishConfig?: Record<string, unknown>;
+      scripts?: Record<string, string>;
+    };
+
+    expect(packageJson.scripts?.prepublishOnly).toBe('node scripts/audit-tarball.mjs');
+    expect(packageJson.files).toContain('scripts/audit-tarball.mjs');
+    expect(packageJson.publishConfig).toEqual({
+      access: 'public',
+      provenance: true,
+      tag: 'beta',
+    });
+  });
+});
+
 describe('prepare-package', () => {
   it('copies the exact root legal bytes into the required entry package with no platform packages', async () => {
     const root = await temporaryDirectory();
@@ -186,6 +206,7 @@ const ENTRY_FILES = [...new Set([
   'MODIFICATIONS.md',
   'THIRD_PARTY_NOTICES.md',
   'bin/quukk-clawmessenger.js',
+  'scripts/audit-tarball.mjs',
   'scripts/postinstall.mjs',
   'dist/cli.js',
   'dist/index.js',
@@ -214,6 +235,33 @@ const ENTRY_DEPENDENCIES = {
   ws: '8.20.0',
   zod: '4.3.6',
 } as const;
+const ENTRY_DEV_DEPENDENCIES = {
+  '@multica/tsconfig': 'workspace:*',
+  '@types/jsdom': '21.1.7',
+  '@types/node': 'catalog:',
+  '@types/ws': '8.18.1',
+  typescript: 'catalog:',
+  vitest: 'catalog:',
+} as const;
+const ENTRY_PACKAGE_FILES = [
+  'bin',
+  'dist',
+  'scripts/audit-tarball.mjs',
+  'scripts/postinstall.mjs',
+  'LICENSE',
+  'NOTICE',
+  'MODIFICATIONS.md',
+  'THIRD_PARTY_NOTICES.md',
+  'README.md',
+] as const;
+const ENTRY_PACKAGE_SCRIPTS = {
+  build: 'tsc -p tsconfig.json',
+  typecheck: 'tsc --noEmit',
+  'typecheck:e2e': 'tsc -p test/e2e/tsconfig.json',
+  test: 'vitest run',
+  prepublishOnly: 'node scripts/audit-tarball.mjs',
+  postinstall: 'node scripts/postinstall.mjs',
+} as const;
 
 const ENTRY_OPTIONAL_DEPENDENCIES = {
   '@quukk/clawmessenger-runtime-win32-x64': '0.1.0-beta.1',
@@ -240,9 +288,17 @@ async function entryFixture(): Promise<EntryFixture> {
       ? JSON.stringify({
           name: 'quukk-clawmessenger',
           version: '0.1.0-beta.1',
+          description: 'Connect local AI agents to ClawMessenger, built on Multica',
+          type: 'module',
+          engines: { node: '>=22.13.0' },
           bin: { 'quukk-clawmessenger': 'bin/quukk-clawmessenger.js' },
+          files: ENTRY_PACKAGE_FILES,
+          scripts: ENTRY_PACKAGE_SCRIPTS,
+          license: 'SEE LICENSE IN LICENSE',
+          publishConfig: { access: 'public', provenance: true, tag: 'beta' },
           dependencies: ENTRY_DEPENDENCIES,
           optionalDependencies: ENTRY_OPTIONAL_DEPENDENCIES,
+          devDependencies: ENTRY_DEV_DEPENDENCIES,
         })
       : path.endsWith('.css')
         ? 'body{color:#123456}'
@@ -328,7 +384,7 @@ describe('audit-tarball', () => {
   it('accepts an exact entry listing with legal files, bin, UI assets, worker, and npm manifest', async () => {
     const fixture = await entryFixture();
 
-    expect(ENTRY_FILES).toHaveLength(99);
+    expect(ENTRY_FILES).toHaveLength(100);
     await expect(auditTarball({
       packJsonPath: fixture.report,
       packageDirectory: fixture.entry,
@@ -364,6 +420,22 @@ describe('audit-tarball', () => {
           ([name]) => name !== '@quukk/clawmessenger-runtime-linux-x64',
         ),
       ) },
+    ],
+    [
+      'an unexpected lifecycle script',
+      { scripts: { postinstall: 'node payload.js' } },
+    ],
+    [
+      'a mismatched Node engine',
+      { engines: { node: '>=18' } },
+    ],
+    [
+      'a latest-tag publish configuration',
+      { publishConfig: { access: 'public', provenance: true, tag: 'latest' } },
+    ],
+    [
+      'an unexpected manifest field',
+      { payload: '1.0.0' },
     ],
   ])('rejects %s in the entry manifest', async (_label, override) => {
     const fixture = await entryFixture();

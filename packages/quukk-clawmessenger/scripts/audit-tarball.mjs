@@ -21,6 +21,48 @@ const ENTRY_DEPENDENCIES = Object.freeze({
   ws: '8.20.0',
   zod: '4.3.6',
 });
+const ENTRY_DEV_DEPENDENCIES = Object.freeze({
+  '@multica/tsconfig': 'workspace:*',
+  '@types/jsdom': '21.1.7',
+  '@types/node': 'catalog:',
+  '@types/ws': '8.18.1',
+  typescript: 'catalog:',
+  vitest: 'catalog:',
+});
+const ENTRY_PACKAGE_FIELDS = Object.freeze([
+  'bin',
+  'dependencies',
+  'description',
+  'devDependencies',
+  'engines',
+  'files',
+  'license',
+  'name',
+  'optionalDependencies',
+  'publishConfig',
+  'scripts',
+  'type',
+  'version',
+]);
+const ENTRY_PACKAGE_FILES = Object.freeze([
+  'bin',
+  'dist',
+  'scripts/audit-tarball.mjs',
+  'scripts/postinstall.mjs',
+  'LICENSE',
+  'NOTICE',
+  'MODIFICATIONS.md',
+  'THIRD_PARTY_NOTICES.md',
+  'README.md',
+]);
+const ENTRY_PACKAGE_SCRIPTS = Object.freeze({
+  build: 'tsc -p tsconfig.json',
+  typecheck: 'tsc --noEmit',
+  'typecheck:e2e': 'tsc -p test/e2e/tsconfig.json',
+  test: 'vitest run',
+  prepublishOnly: 'node scripts/audit-tarball.mjs',
+  postinstall: 'node scripts/postinstall.mjs',
+});
 const RUNTIME_PACKAGE_NAMES = Object.freeze([
   '@quukk/clawmessenger-runtime-win32-x64',
   '@quukk/clawmessenger-runtime-win32-arm64',
@@ -34,6 +76,7 @@ const ENTRY_EXACT_FILES = new Set([
   'README.md',
   ...LEGAL_FILES,
   'bin/quukk-clawmessenger.js',
+  'scripts/audit-tarball.mjs',
   'scripts/postinstall.mjs',
   'dist/cli.js',
   'dist/index.js',
@@ -167,6 +210,14 @@ function exactStringRecord(value, expected) {
   const expectedKeys = Object.keys(expected).sort();
   return exactStringArray(keys, expectedKeys)
     && expectedKeys.every((key) => value[key] === expected[key]);
+}
+
+function exactScalarRecord(value, expected) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const keys = Object.keys(value).sort();
+  const expectedKeys = Object.keys(expected).sort();
+  return exactStringArray(keys, expectedKeys)
+    && expectedKeys.every((key) => Object.is(value[key], expected[key]));
 }
 
 function withoutRemoteUrls(value) {
@@ -351,8 +402,23 @@ async function auditReport(value, packageDirectory, knownCheckoutRoots) {
         RUNTIME_PACKAGE_NAMES.map((name) => [name, record.version]),
       );
       if (
-        packageJson.bin?.['quukk-clawmessenger'] !== 'bin/quukk-clawmessenger.js'
+        !exactStringArray(Object.keys(packageJson).sort(), [...ENTRY_PACKAGE_FIELDS].sort())
+        || packageJson.description !== 'Connect local AI agents to ClawMessenger, built on Multica'
+        || packageJson.type !== 'module'
+        || packageJson.license !== 'SEE LICENSE IN LICENSE'
+        || !exactStringRecord(packageJson.engines, { node: '>=22.13.0' })
+        || !exactStringRecord(packageJson.bin, {
+          'quukk-clawmessenger': 'bin/quukk-clawmessenger.js',
+        })
+        || !exactStringArray(packageJson.files, ENTRY_PACKAGE_FILES)
+        || !exactStringRecord(packageJson.scripts, ENTRY_PACKAGE_SCRIPTS)
+        || !exactScalarRecord(packageJson.publishConfig, {
+          access: 'public',
+          provenance: true,
+          tag: 'beta',
+        })
         || !exactStringRecord(packageJson.dependencies, ENTRY_DEPENDENCIES)
+        || !exactStringRecord(packageJson.devDependencies, ENTRY_DEV_DEPENDENCIES)
         || !exactStringRecord(
           packageJson.optionalDependencies,
           expectedOptionalDependencies,
