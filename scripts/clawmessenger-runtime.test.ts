@@ -12,8 +12,6 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { parse as parseYaml } from 'yaml';
-
 import {
   buildRuntime,
   parseBuildArguments,
@@ -720,66 +718,5 @@ describe('published runtime package metadata', () => {
       const source = await readFile(join(packageDirectory, 'SOURCE.md'));
       expect(source).toEqual(Buffer.from(EXPECTED_SOURCE_DOCUMENT));
     }
-  });
-});
-
-describe('runtime build workflow', () => {
-  it('builds and attests all six targets while keeping publishing protected and off by default', async () => {
-    const workflow = parseYaml(
-      await readFile(
-        join(REPO_ROOT, '.github', 'workflows', 'quukk-clawmessenger-runtime.yml'),
-        'utf8',
-      ),
-    );
-    const build = workflow.jobs['build-runtime'];
-    expect(build.env).toEqual({
-      CGO_ENABLED: '0',
-      GOENV: 'off',
-      GOFLAGS: '',
-      GOWORK: 'off',
-      GOTOOLCHAIN: 'local',
-      GOEXPERIMENT: '',
-      GOFIPS140: 'off',
-      GODEBUG: '',
-    });
-    expect(
-      build.strategy.matrix.include.map(
-        (target: Record<string, string>) => `${target.platform}/${target.arch}`,
-      ),
-    ).toEqual([
-      'win32/x64',
-      'win32/arm64',
-      'darwin/x64',
-      'darwin/arm64',
-      'linux/x64',
-      'linux/arm64',
-    ]);
-    const buildActions = build.steps.map((step: Record<string, string>) => step.uses).filter(Boolean);
-    const buildCommands = build.steps
-      .map((step: Record<string, string>) => step.run)
-      .filter(Boolean)
-      .join('\n');
-    expect(buildCommands).toContain('scripts/build-clawmessenger-runtime.mjs');
-    expect(buildCommands).toContain('scripts/verify-clawmessenger-runtime.mjs');
-    expect(buildCommands).toContain('first_sha256');
-    expect(buildCommands).toContain('second_sha256');
-    expect(buildCommands).toContain('npm pack "./packages/');
-    expect(buildActions).toContain('actions/upload-artifact@v4');
-    expect(buildActions).toContain('actions/attest-build-provenance@v2');
-
-    expect(workflow.on.workflow_dispatch.inputs.publish).toMatchObject({
-      type: 'boolean',
-      required: true,
-      default: false,
-    });
-    const publish = workflow.jobs['publish-runtime-packages'];
-    expect(publish.if).toBe(
-      "github.event_name == 'workflow_dispatch' && inputs.publish == true",
-    );
-    expect(publish.environment).toBe('npm-runtime-prerelease');
-    expect(publish.needs).toBe('build-runtime');
-    expect(publish.steps.map((step: Record<string, string>) => step.run).join('\n')).toContain(
-      'npm publish',
-    );
   });
 });

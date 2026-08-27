@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish the verified runtime packages to npm
+        description: Publish the verified entry and runtime packages to npm
         type: boolean
         required: true
         default: false
@@ -30,7 +30,65 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec vitest run scripts/clawmessenger-runtime.test.ts
+      - run: >-
+          pnpm exec vitest run
+          scripts/clawmessenger-runtime.test.ts
+          scripts/clawmessenger-runtime-workflow.test.ts
+
+  build-entry:
+    needs: runtime-contracts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build Bridge UI
+        run: pnpm --dir apps/bridge build
+      - name: Build entry TypeScript
+        run: pnpm --dir packages/quukk-clawmessenger exec tsc -p tsconfig.json
+      - name: Audit Bridge licenses
+        run: pnpm audit:bridge-licenses
+      - name: Prepare entry package
+        run: node packages/quukk-clawmessenger/scripts/prepare-package.mjs
+      - name: Dry-run and audit entry package
+        shell: bash
+        run: |
+          set -euo pipefail
+          audit_dir="$RUNNER_TEMP/quukk-entry-audit"
+          mkdir -p "$audit_dir"
+          npm pack --dry-run --json --ignore-scripts ./packages/quukk-clawmessenger > "$audit_dir/npm-pack.json"
+          node packages/quukk-clawmessenger/scripts/audit-tarball.mjs \
+            "$audit_dir/npm-pack.json" \
+            ./packages/quukk-clawmessenger
+      - name: Pack entry package
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir=".artifacts/entry"
+          mkdir -p "$artifact_dir"
+          npm pack --ignore-scripts ./packages/quukk-clawmessenger --pack-destination "$artifact_dir"
+      - name: Attest entry package provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: .artifacts/entry/*.tgz
+      - name: Upload entry package
+        uses: actions/upload-artifact@v4
+        with:
+          name: quukk-entry-package
+          path: .artifacts/entry/*.tgz
+          if-no-files-found: error
+          retention-days: 14
 
   build-runtime:
     needs: runtime-contracts
@@ -125,28 +183,269 @@ jobs:
           retention-days: 14
 
   publish-runtime-packages:
-    if: github.event_name == 'workflow_dispatch' && inputs.publish == true
-    needs: build-runtime
+    name: Publish beta package set
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.publish == true &&
+      github.ref_protected == true &&
+      (github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/quukk-clawmessenger-v'))
+    needs:
+      - build-runtime
+      - build-entry
     runs-on: ubuntu-latest
     environment: npm-runtime-prerelease
+    concurrency:
+      group: quukk-clawmessenger-beta-publish
+      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: quukk-runtime-*
-          path: .artifacts
-          merge-multiple: true
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-      - name: Publish prerelease runtime packages
+      - name: Require npm publish credential
         shell: bash
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          for package in .artifacts/*.tgz; do
-            npm publish "$package" --access public --tag beta --provenance
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN is required for an explicit beta publication"
+            exit 1
+          fi
+          npm whoami --registry=https://registry.npmjs.org >/dev/null
+      - name: Download Windows x64 runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: quukk-runtime-win32-x64
+          path: .artifacts/incoming/win32-x64
+      - name: Download Windows arm64 runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: quukk-runtime-win32-arm64
+          path: .artifacts/incoming/win32-arm64
+      - name: Download macOS x64 runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: quukk-runtime-darwin-x64
+          path: .artifacts/incoming/darwin-x64
+      - name: Download macOS arm64 runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: quukk-runtime-darwin-arm64
+          path: .artifacts/incoming/darwin-arm64
+      - name: Download Linux x64 runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: quukk-runtime-linux-x64
+          path: .artifacts/incoming/linux-x64
+      - name: Download Linux arm64 runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: quukk-runtime-linux-arm64
+          path: .artifacts/incoming/linux-arm64
+      - name: Download entry package
+        uses: actions/download-artifact@v4
+        with:
+          name: quukk-entry-package
+          path: .artifacts/incoming/entry
+      - name: Validate seven-package release set
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_version="$(node -p "require('./packages/quukk-clawmessenger/package.json').version")"
+          if [[ ! "$expected_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::entry package version is not valid semver"
+            exit 1
+          fi
+
+          runtime_names=(
+            '@quukk/clawmessenger-runtime-win32-x64'
+            '@quukk/clawmessenger-runtime-win32-arm64'
+            '@quukk/clawmessenger-runtime-darwin-x64'
+            '@quukk/clawmessenger-runtime-darwin-arm64'
+            '@quukk/clawmessenger-runtime-linux-x64'
+            '@quukk/clawmessenger-runtime-linux-arm64'
+          )
+          expected_names=("${runtime_names[@]}" 'quukk-clawmessenger')
+          artifact_directories=(
+            '.artifacts/incoming/win32-x64'
+            '.artifacts/incoming/win32-arm64'
+            '.artifacts/incoming/darwin-x64'
+            '.artifacts/incoming/darwin-arm64'
+            '.artifacts/incoming/linux-x64'
+            '.artifacts/incoming/linux-arm64'
+            '.artifacts/incoming/entry'
+          )
+          release_manifest='.artifacts/release-set.tsv'
+          version_file='.artifacts/release-version.txt'
+          : > "$release_manifest"
+          printf '%s\n' "$expected_version" > "$version_file"
+          declare -A seen_package_names=()
+          declare -A seen_archive_names=()
+          declare -A seen_archive_hashes=()
+          entry_archive=''
+
+          for index in "${!expected_names[@]}"; do
+            expected_name="${expected_names[$index]}"
+            artifact_directory="${artifact_directories[$index]}"
+            if [ ! -d "$artifact_directory" ]; then
+              echo "::error::missing artifact directory for $expected_name"
+              exit 1
+            fi
+            mapfile -d '' -t artifact_entries < <(
+              find "$artifact_directory" -mindepth 1 -maxdepth 1 -print0
+            )
+            if [ "${#artifact_entries[@]}" -ne 1 ]; then
+              echo "::error::artifact for $expected_name must contain exactly one entry"
+              exit 1
+            fi
+            archive="${artifact_entries[0]}"
+            archive_name="$(basename "$archive")"
+            if [ ! -f "$archive" ] || [[ ! "$archive_name" =~ ^[A-Za-z0-9._-]+\.tgz$ ]]; then
+              echo "::error::artifact for $expected_name must be one regular npm tarball"
+              exit 1
+            fi
+            if [ -n "${seen_archive_names[$archive_name]+present}" ]; then
+              echo "::error::duplicate tarball filename"
+              exit 1
+            fi
+            seen_archive_names[$archive_name]=1
+            archive_hash="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+            if [ -n "${seen_archive_hashes[$archive_hash]+present}" ]; then
+              echo "::error::duplicate tarball content"
+              exit 1
+            fi
+            seen_archive_hashes[$archive_hash]=1
+
+            package_identity="$(
+              tar -xOf "$archive" package/package.json |
+                node --input-type=module -e '
+                  let data = "";
+                  for await (const chunk of process.stdin) data += chunk;
+                  const manifest = JSON.parse(data);
+                  if (typeof manifest.name !== "string" || typeof manifest.version !== "string") {
+                    process.exit(2);
+                  }
+                  process.stdout.write(`${manifest.name}\t${manifest.version}`);
+                '
+            )" || {
+              echo "::error::cannot read package identity from $archive_name"
+              exit 1
+            }
+            IFS=$'\t' read -r package_name package_version <<< "$package_identity"
+            if [ "$package_name" != "$expected_name" ] || [ "$package_version" != "$expected_version" ]; then
+              echo "::error::unexpected package identity in $archive_name"
+              exit 1
+            fi
+            if [ -n "${seen_package_names[$package_name]+present}" ]; then
+              echo "::error::duplicate package name"
+              exit 1
+            fi
+            seen_package_names[$package_name]=1
+            printf '%s\t%s\n' "$package_name" "$archive" >> "$release_manifest"
+            if [ "$package_name" = 'quukk-clawmessenger' ]; then
+              entry_archive="$archive"
+            fi
           done
+
+          if [ "${#seen_package_names[@]}" -ne 7 ] || [ -z "$entry_archive" ]; then
+            echo "::error::release set must contain seven unique packages"
+            exit 1
+          fi
+          tar -xOf "$entry_archive" package/package.json |
+            EXPECTED_VERSION="$expected_version" node --input-type=module -e '
+              let data = "";
+              for await (const chunk of process.stdin) data += chunk;
+              const manifest = JSON.parse(data);
+              const expectedNames = process.argv.slice(1).sort();
+              const optionalDependencies = manifest.optionalDependencies;
+              if (optionalDependencies === null || typeof optionalDependencies !== "object") {
+                process.exit(2);
+              }
+              const actualNames = Object.keys(optionalDependencies).sort();
+              if (
+                JSON.stringify(actualNames) !== JSON.stringify(expectedNames) ||
+                actualNames.some((name) => optionalDependencies[name] !== process.env.EXPECTED_VERSION)
+              ) {
+                process.exit(2);
+              }
+            ' "${runtime_names[@]}" || {
+              echo "::error::entry optionalDependencies do not match the runtime release set"
+              exit 1
+            }
+      - name: Preflight npm package versions
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          expected_version="$(<.artifacts/release-version.txt)"
+          checked=0
+          while IFS=$'\t' read -r package_name archive; do
+            if [ -z "$package_name" ] || [ ! -f "$archive" ]; then
+              echo "::error::release manifest is invalid"
+              exit 1
+            fi
+            lookup_output="$RUNNER_TEMP/quukk-npm-view-$checked.out"
+            lookup_error="$RUNNER_TEMP/quukk-npm-view-$checked.err"
+            set +e
+            npm view "$package_name@$expected_version" version --json \
+              --registry=https://registry.npmjs.org >"$lookup_output" 2>"$lookup_error"
+            lookup_status=$?
+            set -e
+            if [ "$lookup_status" -eq 0 ]; then
+              echo "::error::$package_name@$expected_version is already published"
+              exit 1
+            fi
+            if ! grep -Eq '(^|[[:space:]])E404([[:space:]]|$)|404 Not Found' "$lookup_error"; then
+              echo "::error::could not prove $package_name@$expected_version is unoccupied"
+              exit 1
+            fi
+            checked=$((checked + 1))
+          done < .artifacts/release-set.tsv
+          if [ "$checked" -ne 7 ]; then
+            echo "::error::npm preflight did not check exactly seven packages"
+            exit 1
+          fi
+      - name: Publish runtime beta packages
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          published=0
+          while IFS=$'\t' read -r package_name archive; do
+            if [ "$package_name" = 'quukk-clawmessenger' ]; then
+              continue
+            fi
+            npm publish "$archive" --access public --tag beta --provenance
+            published=$((published + 1))
+          done < .artifacts/release-set.tsv
+          if [ "$published" -ne 6 ]; then
+            echo "::error::runtime release set did not contain exactly six packages"
+            exit 1
+          fi
+      - name: Publish entry beta package
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          entry_archive=''
+          entry_count=0
+          while IFS=$'\t' read -r package_name archive; do
+            if [ "$package_name" = 'quukk-clawmessenger' ]; then
+              entry_archive="$archive"
+              entry_count=$((entry_count + 1))
+            fi
+          done < .artifacts/release-set.tsv
+          if [ "$entry_count" -ne 1 ] || [ ! -f "$entry_archive" ]; then
+            echo "::error::entry release artifact is missing or ambiguous"
+            exit 1
+          fi
+          npm publish "$entry_archive" --access public --tag beta --provenance
