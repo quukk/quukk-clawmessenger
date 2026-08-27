@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { lstat, readFile, stat } from 'node:fs/promises';
-import { isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
+import { isAbsolute, join, parse, posix, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const PACK_REPORT_MAX_BYTES = 4 * 1024 * 1024;
@@ -145,7 +145,40 @@ function exactStringArray(value, expected) {
   );
 }
 
-function contentIsSensitive(bytes) {
+function withoutRemoteUrls(value) {
+  return value.replace(/\bhttps?:\/\/[^\s"'`<>]+/gi, '');
+}
+
+function comparablePathText(value) {
+  return withoutRemoteUrls(value).replace(/\\\\/g, '\\').replace(/\\/g, '/');
+}
+
+function hasPathBoundary(value, start, length) {
+  const before = start === 0 ? '' : value[start - 1];
+  const after = value[start + length] ?? '';
+  return (
+    (before === '' || !/[A-Za-z0-9._/-]/.test(before))
+    && (after === '' || !/[A-Za-z0-9._-]/.test(after))
+  );
+}
+
+function containsCheckoutRoot(value, roots) {
+  const comparable = comparablePathText(value);
+  for (const root of roots) {
+    const normalized = root.replace(/\\/g, '/');
+    const caseInsensitive = /^[A-Za-z]:\//.test(normalized) || normalized.startsWith('//');
+    const haystack = caseInsensitive ? comparable.toLowerCase() : comparable;
+    const needle = caseInsensitive ? normalized.toLowerCase() : normalized;
+    let start = haystack.indexOf(needle);
+    while (start !== -1) {
+      if (hasPathBoundary(haystack, start, needle.length)) return true;
+      start = haystack.indexOf(needle, start + 1);
+    }
+  }
+  return false;
+}
+
+function contentIsSensitive(bytes, checkoutRoots) {
   const value = bytes.toString('latin1');
   return (
     /(?:["']?(?:token|appkey|appsecret|bridgesecret|password|enrollmentproof)["']?\s*[:=]\s*["'][^"'\r\n]{8,}["'])/i.test(value)
@@ -155,7 +188,42 @@ function contentIsSensitive(bytes) {
     || /\b[A-Za-z]:[\\/]Users[\\/][^\s"']+/i.test(value)
     || /\/(?:home|Users)\/(?!me\/|user\/|username\/)[A-Za-z0-9._-]+\//.test(value)
     || /sourceMappingURL\s*=/.test(value)
+    || containsCheckoutRoot(bytes.toString('utf8'), checkoutRoots)
   );
+}
+
+function checkoutRoots(options, packageDirectory) {
+  const provided = options.knownCheckoutRoots;
+  if (
+    provided !== undefined
+    && (
+      !Array.isArray(provided)
+      || provided.length > 64
+      || provided.some((path) => (
+        typeof path !== 'string'
+        || path.length < 1
+        || path.length > 4096
+        || path.includes('\0')
+        || !isAbsolute(path)
+      ))
+    )
+  ) fail('invalid_arguments');
+  const candidates = [
+    process.cwd(),
+    packageDirectory,
+    fileURLToPath(new URL('..', import.meta.url)),
+    fileURLToPath(new URL('../../..', import.meta.url)),
+  ];
+  const ancestors = [];
+  for (const candidate of candidates) {
+    let current = resolve(candidate);
+    const root = parse(current).root;
+    while (relative(root, current).split(sep).filter(Boolean).length >= 2) {
+      ancestors.push(current);
+      current = resolve(current, '..');
+    }
+  }
+  return [...new Set([...ancestors, ...(provided ?? []).map((path) => resolve(path))])];
 }
 
 function reportRecords(value) {
@@ -186,7 +254,7 @@ async function jsonManifest(path) {
   }
 }
 
-async function auditReport(value, packageDirectory) {
+async function auditReport(value, packageDirectory, knownCheckoutRoots) {
   const records = reportRecords(value);
   let auditedFiles = 0;
   for (const record of records) {
@@ -217,11 +285,7 @@ async function auditReport(value, packageDirectory) {
     if (!entry && platform === undefined) fail('unexpected_package');
     const platformBinary = platform?.platform === 'win32' ? 'multica.exe' : 'multica';
     const required = entry
-      ? [
-          'package.json', 'README.md', ...LEGAL_FILES, 'bin/quukk-clawmessenger.js',
-          'scripts/postinstall.mjs', 'dist/cli.js', 'dist/rongcloud/worker-entry.js',
-          'dist/ui/index.html',
-        ]
+      ? [...ENTRY_EXACT_FILES]
       : ['package.json', platformBinary, 'manifest.json', ...PLATFORM_LEGAL_FILES, 'SOURCE.md'];
     if (required.some((path) => !names.has(path.toLowerCase()))) fail('required_file_missing');
     if (entry) {
@@ -246,7 +310,7 @@ async function auditReport(value, packageDirectory) {
       const actual = await stat(target).catch(() => fail('pack_file_unavailable'));
       if (!actual.isFile() || actual.size !== file.size) fail('pack_report_mismatch');
       const bytes = await readFile(target);
-      if (contentIsSensitive(bytes)) fail('sensitive_content');
+      if (contentIsSensitive(bytes, knownCheckoutRoots)) fail('sensitive_content');
       if (!entry && file.path === platformBinary) platformBinaryBytes = bytes;
       auditedFiles += 1;
     }
@@ -330,7 +394,11 @@ export async function auditTarball(options) {
   ) fail('invalid_arguments');
   const packJsonPath = resolve(packJsonValue);
   const packageDirectory = resolve(packageDirectoryValue);
-  return auditReport(await readPackJson(packJsonPath), packageDirectory);
+  return auditReport(
+    await readPackJson(packJsonPath),
+    packageDirectory,
+    checkoutRoots(options, packageDirectory),
+  );
 }
 
 function npmEnvironment() {
@@ -389,7 +457,11 @@ async function runCli(args) {
   if (args.length > 2) fail('invalid_arguments');
   if (args.length === 0) {
     const packageDirectory = fileURLToPath(new URL('..', import.meta.url));
-    return auditReport(defaultPackReport(packageDirectory), packageDirectory);
+    return auditReport(
+      defaultPackReport(packageDirectory),
+      packageDirectory,
+      checkoutRoots({}, packageDirectory),
+    );
   }
   const first = resolve(args[0]);
   const firstInfo = await lstat(first).catch(() => fail('invalid_arguments'));

@@ -11,7 +11,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
@@ -131,7 +131,54 @@ describe('prepare-package', () => {
   });
 });
 
-const ENTRY_FILES = [
+const ENTRY_MODULES = [
+  'bindings/service',
+  'cardkit/action-router',
+  'cardkit/builders',
+  'cardkit/parse-marker',
+  'cardkit/schema',
+  'cardkit/templates',
+  'cardkit/validate',
+  'cli',
+  'config/atomic-json',
+  'config/paths',
+  'config/schema',
+  'config/store',
+  'go/binary',
+  'go/client',
+  'go/sse',
+  'go/types',
+  'http/routes',
+  'http/security',
+  'http/server',
+  'http/tickets',
+  'index',
+  'logging/logger',
+  'migration/discover',
+  'migration/import',
+  'process/identity',
+  'process/service-identity',
+  'process/supervisor',
+  'protocol/discussion-v1',
+  'protocol/discussion-v2',
+  'protocol/discussion-wire',
+  'protocol/messages',
+  'registration/capabilities',
+  'registration/client',
+  'rongcloud/client',
+  'rongcloud/env-polyfill',
+  'rongcloud/worker-entry',
+  'rongcloud/worker-protocol',
+  'rongcloud/worker-supervisor',
+  'router/conversation',
+  'router/dedup',
+  'router/message-router',
+  'router/session-store',
+  'service',
+  'version',
+] as const;
+
+const ENTRY_FILES = [...new Set([
   'package.json',
   'README.md',
   'LICENSE',
@@ -144,9 +191,10 @@ const ENTRY_FILES = [
   'dist/index.js',
   'dist/rongcloud/worker-entry.js',
   'dist/ui/index.html',
+  ...ENTRY_MODULES.flatMap((module) => [`dist/${module}.js`, `dist/${module}.d.ts`]),
   'dist/ui/assets/app-123.js',
   'dist/ui/assets/app-123.css',
-] as const;
+])] as const;
 
 const PLATFORM_FILES = [
   'package.json',
@@ -169,7 +217,7 @@ async function entryFixture(): Promise<EntryFixture> {
   const root = await temporaryDirectory();
   const entry = join(root, 'package');
   const report = join(root, 'npm-pack.json');
-  for (const path of ENTRY_FILES) {
+  await Promise.all(ENTRY_FILES.map(async (path) => {
     const content = path === 'package.json'
       ? JSON.stringify({
           name: 'quukk-clawmessenger',
@@ -182,7 +230,7 @@ async function entryFixture(): Promise<EntryFixture> {
           ? '<!doctype html><script type="module" src="/assets/app-123.js"></script>'
           : `safe fixture for ${path}\n`;
     await write(join(entry, ...path.split('/')), content);
-  }
+  }));
   const writeReport = async (extraPaths: readonly string[] = []): Promise<void> => {
     const paths = [...ENTRY_FILES, ...extraPaths];
     const files = await Promise.all(paths.map(async (path) => ({
@@ -260,6 +308,7 @@ describe('audit-tarball', () => {
   it('accepts an exact entry listing with legal files, bin, UI assets, worker, and npm manifest', async () => {
     const fixture = await entryFixture();
 
+    expect(ENTRY_FILES).toHaveLength(99);
     await expect(auditTarball({
       packJsonPath: fixture.report,
       packageDirectory: fixture.entry,
@@ -348,6 +397,24 @@ describe('audit-tarball', () => {
     })).rejects.toMatchObject({ code: 'required_file_missing' });
   });
 
+  it.each([
+    'dist/index.js',
+    'dist/registration/client.js',
+    'dist/registration/client.d.ts',
+  ])('rejects a listing missing required build artifact %s', async (missing) => {
+    const fixture = await entryFixture();
+    const report = JSON.parse(await readFile(fixture.report, 'utf8')) as Array<{
+      files: Array<{ path: string; size: number; mode: number }>;
+    }>;
+    report[0]!.files = report[0]!.files.filter((file) => file.path !== missing);
+    await writeFile(fixture.report, JSON.stringify(report));
+
+    await expect(auditTarball({
+      packJsonPath: fixture.report,
+      packageDirectory: fixture.entry,
+    })).rejects.toMatchObject({ code: 'required_file_missing' });
+  });
+
   it('maps a malformed npm manifest to a fixed audit code', async () => {
     const fixture = await entryFixture();
     await writeFile(join(fixture.entry, 'package.json'), '{malformed');
@@ -389,6 +456,42 @@ describe('audit-tarball', () => {
     })).rejects.toMatchObject({ code: 'sensitive_content' });
   });
 
+  it('honors explicit checkout roots but does not classify remote URLs as local paths', async () => {
+    const fixture = await entryFixture();
+    const checkout = resolve(fixture.root, 'external-checkout', 'project');
+    await writeFile(join(fixture.entry, 'dist', 'cli.js'), `checkout=${checkout}`);
+    await fixture.writeReport();
+
+    await expect(auditTarball({
+      packJsonPath: fixture.report,
+      packageDirectory: fixture.entry,
+      knownCheckoutRoots: [checkout],
+    })).rejects.toMatchObject({ code: 'sensitive_content' });
+
+    const urlPath = checkout.replaceAll('\\', '/');
+    await writeFile(
+      join(fixture.entry, 'dist', 'cli.js'),
+      `docs=https://docs.example.invalid/${urlPath}`,
+    );
+    await fixture.writeReport();
+    await expect(auditTarball({
+      packJsonPath: fixture.report,
+      packageDirectory: fixture.entry,
+      knownCheckoutRoots: [checkout],
+    })).resolves.toEqual({ packageCount: 1, fileCount: ENTRY_FILES.length });
+  });
+
+  it('rejects package checkout ancestors outside user-home conventions', async () => {
+    const fixture = await entryFixture();
+    await writeFile(join(fixture.entry, 'README.md'), `checkout=${fixture.root}`);
+    await fixture.writeReport();
+
+    await expect(auditTarball({
+      packJsonPath: fixture.report,
+      packageDirectory: fixture.entry,
+    })).rejects.toMatchObject({ code: 'sensitive_content' });
+  });
+
   it('allows generic cross-platform path placeholders used by the setup UI', async () => {
     const fixture = await entryFixture();
     await writeFile(
@@ -401,6 +504,31 @@ describe('audit-tarball', () => {
       packJsonPath: fixture.report,
       packageDirectory: fixture.entry,
     })).resolves.toEqual({ packageCount: 1, fileCount: ENTRY_FILES.length });
+  });
+
+  it.each([
+    ['README.md', resolve(fileURLToPath(new URL('../../..', import.meta.url)))],
+    [
+      'dist/cli.js',
+      resolve(fileURLToPath(new URL('../../..', import.meta.url))).replaceAll('\\', '/'),
+    ],
+    [
+      'dist/cli.js',
+      resolve(fileURLToPath(new URL('../../..', import.meta.url))).replaceAll('/', '\\'),
+    ],
+    [
+      'dist/cli.js',
+      JSON.stringify(resolve(fileURLToPath(new URL('../../..', import.meta.url)))),
+    ],
+  ])('rejects the active checkout path in %s without echoing it', async (path, checkout) => {
+    const fixture = await entryFixture();
+    await writeFile(join(fixture.entry, ...path.split('/')), `checkout=${checkout}`);
+    await fixture.writeReport();
+
+    await expect(auditTarball({
+      packJsonPath: fixture.report,
+      packageDirectory: fixture.entry,
+    })).rejects.toMatchObject({ code: 'sensitive_content' });
   });
 
   it('rejects traversal, duplicate paths, and symlinked package components', async () => {
