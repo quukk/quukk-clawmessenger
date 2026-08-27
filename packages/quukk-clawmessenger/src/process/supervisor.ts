@@ -123,6 +123,10 @@ function matchesHealth(identity: BridgeProcessIdentity, health: BridgeHealth): b
   );
 }
 
+function childHasExited(child: ChildProcessWithoutNullStreams): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
 function abortableSleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -144,18 +148,27 @@ function abortableSleep(milliseconds: number, signal?: AbortSignal): Promise<voi
 function waitForCurrentExit(
   child: ChildProcessWithoutNullStreams,
   milliseconds: number,
+  signal?: AbortSignal,
 ): Promise<boolean> {
-  if (child.exitCode !== null) return Promise.resolve(true);
+  if (childHasExited(child)) return Promise.resolve(true);
+  if (signal?.aborted) return Promise.resolve(false);
   return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      child.removeListener('exit', exited);
-      resolve(false);
-    }, milliseconds);
-    const exited = () => {
+    let settled = false;
+    const finish = (didExit: boolean) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
-      resolve(true);
+      child.removeListener('exit', onExit);
+      signal?.removeEventListener('abort', aborted);
+      resolve(didExit);
     };
-    child.once('exit', exited);
+    const onExit = () => finish(true);
+    const aborted = () => finish(false);
+    const timer = setTimeout(() => finish(false), milliseconds);
+    child.once('exit', onExit);
+    signal?.addEventListener('abort', aborted, { once: true });
+    if (childHasExited(child)) finish(true);
+    else if (signal?.aborted) finish(false);
   });
 }
 
@@ -417,7 +430,6 @@ export class BridgeSupervisor {
         started_at: readiness.started_at,
       };
       if (!matchesHealth(processIdentity, gotHealth) || protocolViolation || childExited) {
-        generation.abort();
         throw new BridgeSupervisorError('identity_mismatch');
       }
       await this.#identityStore.write(processIdentity).catch(() => {
@@ -438,16 +450,85 @@ export class BridgeSupervisor {
       };
       return this.#public(this.#running);
     } catch (error) {
+      const startupTimedOut = deadline.timedOut();
+      let cleanupFailed = false;
+      if (child !== undefined) {
+        try {
+          await this.#reapFailedStart(child, managedClient);
+        } catch {
+          cleanupFailed = true;
+        }
+      }
       generation?.abort();
       if (durableIdentity !== undefined) {
         await this.#identityStore.removeIfMatches(durableIdentity).catch(() => undefined);
       }
-      if (deadline.timedOut()) throw new BridgeSupervisorError('startup_timeout');
+      if (cleanupFailed) throw new BridgeSupervisorError('shutdown_failed');
+      if (startupTimedOut) throw new BridgeSupervisorError('startup_timeout');
       if (error instanceof BridgeSupervisorError) throw error;
       throw new BridgeSupervisorError('startup_failed');
     } finally {
       deadline.dispose();
     }
+  }
+
+  async #reapFailedStart(
+    child: ChildProcessWithoutNullStreams,
+    client?: BridgeSupervisorClient,
+  ): Promise<void> {
+    if (childHasExited(child)) return;
+    const controller = new AbortController();
+    const timer = this.#deps.setTimeout(() => controller.abort(), this.#deps.shutdownGraceMs);
+    try {
+      if (client === undefined) {
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          // The exact child is still force-terminated below if it remains live.
+        }
+      } else {
+        await this.#settleBeforeAbort(
+          Promise.resolve().then(() => client.shutdown({ signal: controller.signal })),
+          controller.signal,
+        );
+      }
+
+      if (childHasExited(child)) return;
+      const stopped = controller.signal.aborted
+        ? false
+        : await this.#settleBeforeAbort(
+            Promise.resolve().then(() =>
+              this.#deps.waitForCurrentExit(
+                child,
+                this.#deps.shutdownGraceMs,
+                controller.signal,
+              ),
+            ),
+            controller.signal,
+          );
+      if (stopped === true || childHasExited(child)) return;
+      await this.#deps.forceTerminate(child);
+    } finally {
+      this.#deps.clearTimeout(timer);
+    }
+  }
+
+  #settleBeforeAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T | undefined> {
+    if (signal.aborted) return Promise.resolve(undefined);
+    return new Promise((resolve) => {
+      const aborted = () => resolve(undefined);
+      signal.addEventListener('abort', aborted, { once: true });
+      operation.then(
+        (value) => {
+          signal.removeEventListener('abort', aborted);
+          resolve(value);
+        },
+        () => {
+          signal.removeEventListener('abort', aborted);
+          resolve(undefined);
+        },
+      );
+    });
   }
 
   #readReadiness(

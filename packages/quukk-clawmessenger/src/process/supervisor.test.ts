@@ -59,7 +59,14 @@ class FakeChild extends EventEmitter {
   readonly stdin = new PassThrough();
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
+  readonly terminationSignals: Array<number | NodeJS.Signals> = [];
   exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
+
+  kill(signal: number | NodeJS.Signals = 'SIGTERM'): boolean {
+    this.terminationSignals.push(signal);
+    return true;
+  }
 
   exit(code = 0): void {
     if (this.exitCode !== null) return;
@@ -210,14 +217,20 @@ function store(overrides: Partial<BridgeSupervisorStore> = {}): BridgeSupervisor
 }
 
 type FakeClient = {
-  health: ReturnType<typeof vi.fn<() => Promise<BridgeHealth>>>;
-  shutdown: ReturnType<typeof vi.fn<() => Promise<void>>>;
+  health: ReturnType<
+    typeof vi.fn<(options?: { signal?: AbortSignal }) => Promise<BridgeHealth>>
+  >;
+  shutdown: ReturnType<typeof vi.fn<(options?: { signal?: AbortSignal }) => Promise<void>>>;
 };
 
 function fakeClient(): FakeClient {
   return {
-    health: vi.fn(async () => health()),
-    shutdown: vi.fn(async () => undefined),
+    health: vi.fn<(options?: { signal?: AbortSignal }) => Promise<BridgeHealth>>(
+      async () => health(),
+    ),
+    shutdown: vi.fn<(options?: { signal?: AbortSignal }) => Promise<void>>(
+      async () => undefined,
+    ),
   };
 }
 
@@ -613,6 +626,9 @@ describe('BridgeSupervisor startup', () => {
     expect(JSON.stringify((deps.spawn as ReturnType<typeof vi.fn>).mock.calls[0])).not.toContain(
       secret,
     );
+    expect(client.shutdown).not.toHaveBeenCalled();
+    expect(child.terminationSignals).toEqual([]);
+    expect(deps.forceTerminate).not.toHaveBeenCalled();
   });
 
   it('rejects oversized startup before binary resolution or spawn', async () => {
@@ -642,13 +658,15 @@ describe('BridgeSupervisor startup', () => {
   });
 
   it('rejects malformed readiness framing, overflow, early EOF, exit, and timeout', async () => {
-    const cases: Array<[string, (child: FakeChild) => void, Partial<BridgeSupervisorDependencies>]> = [
-      ['CRLF', (child) => startReady(child, readinessLine().replace('\n', '\r\n')), {}],
-      ['banner', (child) => startReady(child, `banner${readinessLine()}`), {}],
-      ['same-chunk trailing', (child) => startReady(child, `${readinessLine()}x`), {}],
-      ['overflow', (child) => startReady(child, `${'x'.repeat(65_536)}\n`), {}],
-      ['EOF', (child) => queueMicrotask(() => child.stdout.end('{}')), {}],
-      ['exit', (child) => queueMicrotask(() => child.exit(1)), {}],
+    const cases: Array<
+      [string, (child: FakeChild) => void, Partial<BridgeSupervisorDependencies>, boolean]
+    > = [
+      ['CRLF', (child) => startReady(child, readinessLine().replace('\n', '\r\n')), {}, true],
+      ['banner', (child) => startReady(child, `banner${readinessLine()}`), {}, true],
+      ['same-chunk trailing', (child) => startReady(child, `${readinessLine()}x`), {}, true],
+      ['overflow', (child) => startReady(child, `${'x'.repeat(65_536)}\n`), {}, true],
+      ['EOF', (child) => queueMicrotask(() => child.stdout.end('{}')), {}, true],
+      ['exit', (child) => queueMicrotask(() => child.exit(1)), {}, false],
       [
         'timeout',
         () => undefined,
@@ -659,9 +677,10 @@ describe('BridgeSupervisor startup', () => {
           }) as typeof setTimeout,
           clearTimeout: vi.fn() as never,
         },
+        false,
       ],
     ];
-    for (const [name, arrange, override] of cases) {
+    for (const [name, arrange, override, mustReap] of cases) {
       const child = new FakeChild();
       const forceTerminate = vi.fn(async () => undefined);
       arrange(child);
@@ -674,8 +693,195 @@ describe('BridgeSupervisor startup', () => {
         | BridgeSupervisorError
         | undefined;
       expect(error, name).toBeInstanceOf(BridgeSupervisorError);
-      expect(forceTerminate, name).not.toHaveBeenCalled();
+      expect(child.terminationSignals, name).toEqual(mustReap ? ['SIGTERM'] : []);
+      expect(forceTerminate, name).toHaveBeenCalledTimes(mustReap ? 1 : 0);
+      if (mustReap) expect(forceTerminate, name).toHaveBeenCalledWith(child);
     }
+  });
+
+  it('reaps the exact spawned child when readiness fails', async () => {
+    const child = new FakeChild();
+    const forcedChildren: FakeChild[] = [];
+    startReady(child, '{}\r\n');
+    const supervisor = new BridgeSupervisor({
+      store: store(),
+      identityStore: new MemoryIdentityStore(),
+      dependencies: dependencies(child, fakeClient(), {
+        waitForCurrentExit: async () => false,
+        forceTerminate: async (forcedChild) => {
+          forcedChildren.push(forcedChild as unknown as FakeChild);
+          child.exit(1);
+        },
+      }),
+    });
+
+    await expect(supervisor.ensureStarted()).rejects.toMatchObject({ code: 'readiness_invalid' });
+    expect(child.terminationSignals).toEqual(['SIGTERM']);
+    expect(forcedChildren).toEqual([child]);
+    expect(child.exitCode).toBe(1);
+  });
+
+  it('reaps the exact spawned child when the caller aborts during readiness', async () => {
+    const child = new FakeChild();
+    const controller = new AbortController();
+    const forceTerminate = vi.fn(async () => child.exit(1));
+    const spawn = vi.fn<BridgeSupervisorDependencies['spawn']>(() => {
+      queueMicrotask(() => controller.abort());
+      return child as never;
+    });
+    const supervisor = new BridgeSupervisor({
+      store: store(),
+      identityStore: new MemoryIdentityStore(),
+      dependencies: dependencies(child, fakeClient(), {
+        spawn,
+        waitForCurrentExit: async () => false,
+        forceTerminate,
+      }),
+    });
+
+    await expect(supervisor.ensureStarted({ signal: controller.signal })).rejects.toMatchObject({
+      code: 'startup_failed',
+    });
+    expect(child.terminationSignals).toEqual(['SIGTERM']);
+    expect(forceTerminate).toHaveBeenCalledWith(child);
+  });
+
+  it('uses a fresh cleanup signal when the caller aborts during health', async () => {
+    const child = new FakeChild();
+    const client = fakeClient();
+    const controller = new AbortController();
+    let cleanupSignal: AbortSignal | undefined;
+    client.health.mockImplementationOnce(({ signal } = {}) =>
+      new Promise<BridgeHealth>((_resolve, reject) => {
+        signal?.addEventListener(
+          'abort',
+          () => reject(new BridgeClientError('request_aborted')),
+          { once: true },
+        );
+        queueMicrotask(() => controller.abort());
+      }),
+    );
+    client.shutdown.mockImplementation(async ({ signal } = {}) => {
+      cleanupSignal = signal;
+      child.exit(0);
+    });
+    const forceTerminate = vi.fn(async () => undefined);
+    startReady(child);
+    const supervisor = new BridgeSupervisor({
+      store: store(),
+      identityStore: new MemoryIdentityStore(),
+      dependencies: dependencies(child, client, { forceTerminate }),
+    });
+
+    await expect(supervisor.ensureStarted({ signal: controller.signal })).rejects.toMatchObject({
+      code: 'startup_failed',
+    });
+    expect(cleanupSignal).toBeDefined();
+    expect(cleanupSignal).not.toBe(controller.signal);
+    expect(cleanupSignal?.aborted).toBe(false);
+    expect(forceTerminate).not.toHaveBeenCalled();
+  });
+
+  it('reaps the exact spawned child when the startup deadline expires during readiness', async () => {
+    const child = new FakeChild();
+    let expireStartup!: () => void;
+    const forceTerminate = vi.fn(async () => child.exit(1));
+    const setTimeout = vi.fn((callback: () => void, milliseconds?: number) => {
+      if (milliseconds === 25) expireStartup = callback;
+      return { milliseconds } as unknown as ReturnType<typeof globalThis.setTimeout>;
+    }) as unknown as typeof globalThis.setTimeout;
+    const spawn = vi.fn<BridgeSupervisorDependencies['spawn']>(() => {
+      queueMicrotask(() => expireStartup());
+      return child as never;
+    });
+    const supervisor = new BridgeSupervisor({
+      store: store(),
+      identityStore: new MemoryIdentityStore(),
+      dependencies: dependencies(child, fakeClient(), {
+        spawn,
+        setTimeout,
+        clearTimeout: vi.fn() as never,
+        startupTimeoutMs: 25,
+        waitForCurrentExit: async () => false,
+        forceTerminate,
+      }),
+    });
+
+    await expect(supervisor.ensureStarted()).rejects.toMatchObject({ code: 'startup_timeout' });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(child.terminationSignals).toEqual(['SIGTERM']);
+    expect(forceTerminate).toHaveBeenCalledWith(child);
+  });
+
+  it('bounds a hung authenticated shutdown then force-terminates only its spawned child', async () => {
+    const child = new FakeChild();
+    const client = fakeClient();
+    client.health.mockRejectedValueOnce(new BridgeClientError('response_invalid'));
+    client.shutdown.mockImplementation(() => new Promise<void>(() => undefined));
+    const cleanupTimers: Array<() => void> = [];
+    const setTimeout = vi.fn((callback: () => void, milliseconds?: number) => {
+      if (milliseconds === 10) cleanupTimers.push(callback);
+      return { milliseconds } as unknown as ReturnType<typeof globalThis.setTimeout>;
+    }) as unknown as typeof globalThis.setTimeout;
+    const forceTerminate = vi.fn(async (forcedChild) => {
+      expect(forcedChild).toBe(child);
+      child.exit(1);
+    });
+    startReady(child);
+    const supervisor = new BridgeSupervisor({
+      store: store(),
+      identityStore: new MemoryIdentityStore(),
+      dependencies: dependencies(child, client, {
+        setTimeout,
+        clearTimeout: vi.fn() as never,
+        shutdownGraceMs: 10,
+        waitForCurrentExit: async () => false,
+        forceTerminate,
+      }),
+    });
+
+    const starting = supervisor.ensureStarted();
+    await vi.waitFor(() => expect(client.shutdown).toHaveBeenCalledTimes(1));
+    expect(cleanupTimers).toHaveLength(1);
+    cleanupTimers[0]!();
+    await expect(starting).rejects.toMatchObject({ code: 'startup_failed' });
+    expect(child.terminationSignals).toEqual([]);
+    expect(forceTerminate).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not force-terminate when authenticated startup cleanup exits gracefully', async () => {
+    const child = new FakeChild();
+    const client = fakeClient();
+    client.health.mockRejectedValueOnce(new BridgeClientError('response_invalid'));
+    let lifecycle: AbortSignal | undefined;
+    client.shutdown.mockImplementation(async ({ signal } = {}) => {
+      expect(lifecycle?.aborted).toBe(false);
+      expect(signal?.aborted).toBe(false);
+      child.exit(0);
+    });
+    const forceTerminate = vi.fn(async () => undefined);
+    startReady(child);
+    const base = dependencies(child, client, {
+      waitForCurrentExit: async () => true,
+      forceTerminate,
+    });
+    const supervisor = new BridgeSupervisor({
+      store: store(),
+      identityStore: new MemoryIdentityStore(),
+      dependencies: {
+        ...base,
+        clientFactory: vi.fn((options) => {
+          lifecycle = options.lifecycleSignal;
+          return client as never;
+        }),
+      },
+    });
+
+    await expect(supervisor.ensureStarted()).rejects.toMatchObject({ code: 'startup_failed' });
+    expect(client.shutdown).toHaveBeenCalledTimes(1);
+    expect(lifecycle?.aborted).toBe(true);
+    expect(child.terminationSignals).toEqual([]);
+    expect(forceTerminate).not.toHaveBeenCalled();
   });
 
   it('rejects an oversized single readiness chunk before concatenating it', async () => {
@@ -724,7 +930,8 @@ describe('BridgeSupervisor startup', () => {
       const error = await supervisor.ensureStarted().catch((caught: unknown) => caught);
       expect(error, source).toMatchObject({ code: 'startup_failed' });
       expect(String(error), source).not.toContain('sentinel');
-      expect(forceTerminate, source).not.toHaveBeenCalled();
+      expect(child.terminationSignals, source).toEqual(['SIGTERM']);
+      expect(forceTerminate, source).toHaveBeenCalledWith(child);
     }
   });
 
@@ -750,7 +957,7 @@ describe('BridgeSupervisor startup', () => {
     expect(identityStore.value?.started_at).toBe(startedAt);
   });
 
-  it('rejects every current-child health fence mismatch without persistence or force', async () => {
+  it('rejects every current-child health fence mismatch without persistence and reaps it', async () => {
     const mismatches: BridgeHealth[] = [
       health({ pid: 9999 }),
       health({ version: '9.9.9' }),
@@ -761,18 +968,32 @@ describe('BridgeSupervisor startup', () => {
       const child = new FakeChild();
       const client = fakeClient();
       client.health.mockResolvedValue(mismatch);
+      let lifecycle: AbortSignal | undefined;
+      client.shutdown.mockImplementation(async () => {
+        expect(lifecycle?.aborted).toBe(false);
+      });
       const identityStore = new MemoryIdentityStore();
       const forceTerminate = vi.fn(async () => undefined);
       startReady(child);
+      const base = dependencies(child, client, { forceTerminate });
       await expect(
         new BridgeSupervisor({
           store: store(),
           identityStore,
-          dependencies: dependencies(child, client, { forceTerminate }),
+          dependencies: {
+            ...base,
+            clientFactory: vi.fn((options) => {
+              lifecycle = options.lifecycleSignal;
+              return client as never;
+            }),
+          },
         }).ensureStarted(),
       ).rejects.toMatchObject({ code: 'identity_mismatch' });
       expect(identityStore.writes).toHaveLength(0);
-      expect(forceTerminate).not.toHaveBeenCalled();
+      expect(client.shutdown).toHaveBeenCalledTimes(1);
+      expect(lifecycle?.aborted).toBe(true);
+      expect(child.terminationSignals).toEqual([]);
+      expect(forceTerminate).toHaveBeenCalledWith(child);
     }
   });
 });
