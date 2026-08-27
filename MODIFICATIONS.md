@@ -13,7 +13,15 @@
 - `apps/bridge`: private React/Vite workspace that builds local Bridge UI assets into the entry package.
 - `server/internal/daemon/bridge*.go`: injected, bounded discovery for local OpenCode, OpenClaw, Codex, and Hermes runtimes, kept separate from the existing daemon lifecycle.
 - Synchronous agent probe output shares a 64 KiB cap so noisy version and catalog commands safely fail instead of growing daemon memory without bound; Task 14/CI must watch for real catalog output above that limit.
-- RongCloud workers, Node-side registration transport, session persistence, and the local Bridge UI remain intentionally unimplemented at this stage.
+- Later fork commits implement the runtime workers, registration transport, session routing, and the local Bridge UI described below.
+
+## Local runtime selection UI
+
+- `apps/bridge/src` adds the Multica-attributed Quukk ClawMessenger setup and local operations interface for OpenCode, OpenClaw, Codex, and Hermes.
+- Setup defaults to detected ready runtimes, requires an explicit submit, discloses headless permissions, and requires a real authorized work root plus a default working directory before describing a registered runtime as task-ready.
+- Registration progress is isolated per runtime so a successful RongCloud identity stays successful when another runtime fails.
+- The UI uses one-use local session tickets, removes the ticket from browser history before exchange, and adds the returned CSRF token only to same-origin mutations.
+- Generated `packages/quukk-clawmessenger/dist/ui` assets are intentionally excluded from Git. `pnpm --dir apps/bridge build` creates them deterministically before package assembly.
 
 ## Authenticated Bridge transport
 
@@ -36,7 +44,7 @@
 - `.gitignore`: excludes a repository-local Quukk ClawMessenger runtime-data directory.
 - `docs/superpowers/specs/2026-08-26-quukk-clawmessenger-fork-design.md`: records the initial workspace scaffold and its intentionally limited scope.
 - `pnpm-workspace.yaml`: adds the catalog-pinned Vite version required by the Bridge UI workspace.
-- `pnpm-lock.yaml`: records only the Task 1 workspace importers and their resolved tooling dependencies.
+- `pnpm-lock.yaml`: records the fork workspaces and the focused Bridge UI dependencies used by the local package build.
 - `server/pkg/agent/launch.go`: bounds synchronous probe output while preserving process ownership and timeout errors.
 - `server/pkg/agent/agent_test.go`: covers oversized version output and timeout precedence without executing an installed agent CLI.
 
