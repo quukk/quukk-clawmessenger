@@ -936,6 +936,37 @@ describe('MessageRouter plain task admission', () => {
     expect(fixture.state.releaseCalls).toBe(1);
   });
 
+  it('cancels a plain task id that arrives after binding disposal without admitting or emitting', async () => {
+    const fixture = await routerHarness();
+    let startEntered!: () => void;
+    let resolveStart!: (value: { taskId: string; eventsUrl: string }) => void;
+    const pendingStart = new Promise<void>((resolve) => { startEntered = resolve; });
+    fixture.setStart(async (input) => {
+      fixture.starts.push(input);
+      startEntered();
+      return new Promise((resolve) => { resolveStart = resolve; });
+    });
+
+    const routing = fixture.router.onWorkerEvent(
+      IDENTITY_A,
+      inbound(IDENTITY_A, message('dispose-late-plain')),
+    );
+    await pendingStart;
+    await fixture.router.disposeBinding(IDENTITY_A);
+    resolveStart({ taskId: 'task-late-plain', eventsUrl: '/events' });
+    await routing;
+
+    expect(fixture.cancellations).toEqual(['task-late-plain']);
+    expect(fixture.receipts).toEqual([]);
+    expect(fixture.sent).toEqual([]);
+    expect(fixture.state.releaseCalls).toBe(0);
+    await expect(fixture.state.claimMessage(
+      IDENTITY_A.runtimeId,
+      'dispose-late-plain',
+      '03'.repeat(16),
+    )).resolves.toMatchObject({ status: 'duplicate' });
+  });
+
   it('accepts only HTTPS attachment metadata and never fetches or accepts a remote path', async () => {
     const fixture = await routerHarness();
     await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('uid-media', 'caption', {
@@ -1506,6 +1537,177 @@ describe('MessageRouter task events and reconnect behavior', () => {
       input.messageType === 'text' && input.content === 'queue-deferred')).toHaveLength(1);
   });
 
+  it('shares one serial drain across concurrent online notifications', async () => {
+    const fixture = await routerHarness();
+    let online = false;
+    let drainEntered!: () => void;
+    let releaseDrain!: () => void;
+    const drainWasEntered = new Promise<void>((resolve) => { drainEntered = resolve; });
+    const drainGate = new Promise<void>((resolve) => { releaseDrain = resolve; });
+    let drainAttempts = 0;
+    const originalSend = fixture.worker.send.bind(fixture.worker);
+    fixture.worker.send = async (identity, input) => {
+      if (input.messageType === 'text' && input.content === 'shared-drain') {
+        if (!online) throw Object.assign(new Error('offline'), { code: 'worker_exited' });
+        drainAttempts += 1;
+        drainEntered();
+        await drainGate;
+      }
+      return originalSend(identity, input);
+    };
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', { output: 'shared-drain' });
+    })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('shared-drain-buffer')));
+
+    online = true;
+    const first = fixture.router.onWorkerEvent(IDENTITY_A, {
+      type: 'connection', runtimeId: RUNTIME_A, instanceId: INSTANCE_A, state: 'online',
+    });
+    await drainWasEntered;
+    const second = fixture.router.onWorkerEvent(IDENTITY_A, {
+      type: 'connection', runtimeId: RUNTIME_A, instanceId: INSTANCE_A, state: 'online',
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(drainAttempts).toBe(1);
+    releaseDrain();
+    await Promise.all([first, second]);
+    expect(fixture.sent.filter(({ input }) =>
+      input.messageType === 'text' && input.content === 'shared-drain')).toHaveLength(1);
+  });
+
+  it('does not let an older drain delete output buffered while that drain is pending', async () => {
+    const fixture = await routerHarness();
+    let stage: 'buffer-old' | 'drain-old' | 'buffer-new' | 'online' = 'buffer-old';
+    let drainEntered!: () => void;
+    let releaseDrain!: () => void;
+    const drainWasEntered = new Promise<void>((resolve) => { drainEntered = resolve; });
+    const drainGate = new Promise<void>((resolve) => { releaseDrain = resolve; });
+    const originalSend = fixture.worker.send.bind(fixture.worker);
+    fixture.worker.send = async (identity, input) => {
+      if (input.messageType === 'text' && input.content === 'old-output') {
+        if (stage === 'buffer-old') throw Object.assign(new Error('offline'), { code: 'worker_exited' });
+        if (stage === 'drain-old') {
+          drainEntered();
+          await drainGate;
+        }
+      }
+      if (input.messageType === 'text' && input.content === 'new-output' && stage === 'buffer-new') {
+        throw Object.assign(new Error('offline'), { code: 'worker_exited' });
+      }
+      return originalSend(identity, input);
+    };
+    fixture.setEvents((taskId, index) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', { output: index === 0 ? 'old-output' : 'new-output' });
+    })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('old-buffer')));
+
+    stage = 'drain-old';
+    const draining = fixture.router.onWorkerEvent(IDENTITY_A, {
+      type: 'connection', runtimeId: RUNTIME_A, instanceId: INSTANCE_A, state: 'online',
+    });
+    await drainWasEntered;
+    stage = 'buffer-new';
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message(
+      'new-buffer',
+      'hello',
+      { senderId: 'sender-two' },
+    )));
+    releaseDrain();
+    await draining;
+
+    stage = 'online';
+    await fixture.router.onWorkerEvent(IDENTITY_A, {
+      type: 'connection', runtimeId: RUNTIME_A, instanceId: INSTANCE_A, state: 'online',
+    });
+    expect(fixture.sent.filter(({ input }) => input.messageType === 'text'
+      && (input.content === 'old-output' || input.content === 'new-output'))
+      .map(({ input }) => input.content)).toEqual(['old-output', 'new-output']);
+  });
+
+  it('advances delivered text when a coarse replay drains so A followed by AB emits only A then B', async () => {
+    vi.useFakeTimers();
+    const fixture = await routerHarness();
+    let online = false;
+    let releaseTerminal!: () => void;
+    let deltaObserved!: () => void;
+    const terminalGate = new Promise<void>((resolve) => { releaseTerminal = resolve; });
+    const deltaWasObserved = new Promise<void>((resolve) => { deltaObserved = resolve; });
+    const originalSend = fixture.worker.send.bind(fixture.worker);
+    fixture.worker.send = async (identity, input) => {
+      if (input.messageType === 'text' && input.content === 'A' && !online) {
+        throw Object.assign(new Error('offline'), { code: 'worker_exited' });
+      }
+      return originalSend(identity, input);
+    };
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'text_delta', { text: 'A' });
+      deltaObserved();
+      await terminalGate;
+      yield bridgeEvent(taskId, 'completed', { id: 2, output: 'AB' });
+    })());
+
+    const routing = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('drain-prefix')));
+    await deltaWasObserved;
+    await vi.advanceTimersByTimeAsync(250);
+    online = true;
+    await fixture.router.onWorkerEvent(IDENTITY_A, {
+      type: 'connection', runtimeId: RUNTIME_A, instanceId: INSTANCE_A, state: 'online',
+    });
+    releaseTerminal();
+    await routing;
+
+    expect(fixture.sent.filter(({ input }) => input.messageType === 'text'
+      && input.content !== '[processing]').map(({ input }) => input.content)).toEqual(['A', 'B']);
+  });
+
+  it('makes terminal output wait for an in-flight coarse drain before slicing its delivered prefix', async () => {
+    vi.useFakeTimers();
+    const fixture = await routerHarness();
+    let online = false;
+    let releaseTerminal!: () => void;
+    let releaseDrain!: () => void;
+    let deltaObserved!: () => void;
+    let drainEntered!: () => void;
+    const terminalGate = new Promise<void>((resolve) => { releaseTerminal = resolve; });
+    const drainGate = new Promise<void>((resolve) => { releaseDrain = resolve; });
+    const deltaWasObserved = new Promise<void>((resolve) => { deltaObserved = resolve; });
+    const drainWasEntered = new Promise<void>((resolve) => { drainEntered = resolve; });
+    const originalSend = fixture.worker.send.bind(fixture.worker);
+    fixture.worker.send = async (identity, input) => {
+      if (input.messageType === 'text' && input.content === 'A') {
+        if (!online) throw Object.assign(new Error('offline'), { code: 'worker_exited' });
+        drainEntered();
+        await drainGate;
+      }
+      return originalSend(identity, input);
+    };
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'text_delta', { text: 'A' });
+      deltaObserved();
+      await terminalGate;
+      yield bridgeEvent(taskId, 'completed', { id: 2, output: 'AB' });
+    })());
+
+    const routing = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('drain-prefix-race')));
+    await deltaWasObserved;
+    await vi.advanceTimersByTimeAsync(250);
+    online = true;
+    const draining = fixture.router.onWorkerEvent(IDENTITY_A, {
+      type: 'connection', runtimeId: RUNTIME_A, instanceId: INSTANCE_A, state: 'online',
+    });
+    await drainWasEntered;
+    releaseTerminal();
+    for (let index = 0; index < 5; index += 1) await Promise.resolve();
+    expect(fixture.sent.filter(({ input }) => input.messageType === 'text'
+      && input.content !== '[processing]')).toEqual([]);
+    releaseDrain();
+    await Promise.all([draining, routing]);
+
+    expect(fixture.sent.filter(({ input }) => input.messageType === 'text'
+      && input.content !== '[processing]').map(({ input }) => input.content)).toEqual(['A', 'B']);
+  });
+
   it('watchdog cancels once, closes the reader, flushes timeout, and never releases admitted dedup', async () => {
     vi.useFakeTimers();
     const fixture = await routerHarness();
@@ -1599,6 +1801,73 @@ describe('MessageRouter task events and reconnect behavior', () => {
 });
 
 describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
+  it.each([
+    ['v1', discussionV1(), 'dispose-late-v1'],
+    ['v2', discussionAssignment(), 'dispose-late-v2'],
+  ] as const)('cancels a late %s task after binding disposal without admitting or emitting', async (
+    _version,
+    payload,
+    uid,
+  ) => {
+    const fixture = await routerHarness();
+    let startEntered!: () => void;
+    let resolveStart!: (value: { taskId: string; eventsUrl: string }) => void;
+    const pendingStart = new Promise<void>((resolve) => { startEntered = resolve; });
+    fixture.setStart(async (input) => {
+      fixture.starts.push(input);
+      startEntered();
+      return new Promise((resolve) => { resolveStart = resolve; });
+    });
+
+    const routing = fixture.router.onWorkerEvent(
+      IDENTITY_A,
+      inbound(IDENTITY_A, protocolMessage(uid, payload)),
+    );
+    await pendingStart;
+    await fixture.router.disposeBinding(IDENTITY_A);
+    resolveStart({ taskId: `task-${uid}`, eventsUrl: '/events' });
+    await routing;
+
+    expect(fixture.cancellations).toEqual([`task-${uid}`]);
+    expect(fixture.receipts).toEqual([]);
+    expect(fixture.sent).toEqual([]);
+    expect(fixture.state.releaseCalls).toBe(0);
+    await expect(fixture.state.claimMessage(
+      IDENTITY_A.runtimeId,
+      uid,
+      '04'.repeat(16),
+    )).resolves.toMatchObject({ status: 'duplicate' });
+  });
+
+  it.each([
+    ['v1', discussionV1({ discussion_id: 'retry-v1' }), 'direct-retry-v1'],
+    ['v2', discussionAssignment({ discussionId: 'retry-v2' }), 'direct-retry-v2'],
+  ] as const)('rolls back the exact direct %s logical owner when start rejects so the same UID can retry', async (
+    _version,
+    payload,
+    uid,
+  ) => {
+    const fixture = await routerHarness();
+    let attempts = 0;
+    fixture.setStart(async (input) => {
+      fixture.starts.push(input);
+      attempts += 1;
+      if (attempts === 1) throw new Error('first start rejected');
+      return { taskId: 'task-retry-success', eventsUrl: '/events' };
+    });
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', { output: 'retry succeeded' });
+    })());
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(uid, payload)));
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(uid, payload)));
+
+    expect(fixture.starts).toHaveLength(2);
+    expect(fixture.state.releaseCalls).toBe(1);
+    expect(fixture.receipts).toHaveLength(1);
+    expect(JSON.stringify(fixture.sent)).toContain('retry succeeded');
+  });
+
   it('runs one owned v1 turn, advances the token, and tombstones logical replays', async () => {
     const fixture = await routerHarness();
     fixture.setEvents((taskId) => (async function* () {
@@ -1755,6 +2024,89 @@ describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
     ]));
   });
 
+  it('serializes a timer delta before the v2 terminal frame on one output tail', async () => {
+    const callbacks = new Map<number, { callback: () => void; milliseconds: number }>();
+    let timerId = 0;
+    const fixture = await routerHarness({
+      timers: {
+        setTimeout(callback, milliseconds) {
+          timerId += 1;
+          callbacks.set(timerId, { callback, milliseconds });
+          return timerId;
+        },
+        clearTimeout(timer) { callbacks.delete(timer as number); },
+      },
+    });
+    let releaseTerminal!: () => void;
+    let releaseDelta!: () => void;
+    let deltaEntered!: () => void;
+    const terminalGate = new Promise<void>((resolve) => { releaseTerminal = resolve; });
+    const deltaGate = new Promise<void>((resolve) => { releaseDelta = resolve; });
+    const deltaWasEntered = new Promise<void>((resolve) => { deltaEntered = resolve; });
+    let terminalSent = false;
+    const originalSend = fixture.worker.send.bind(fixture.worker);
+    fixture.worker.send = async (identity, input) => {
+      if (input.messageType === 'command_result'
+        && input.content.msg_type === 'discussion_contribution_delta') {
+        deltaEntered();
+        await deltaGate;
+      }
+      if (input.messageType === 'command_result'
+        && input.content.msg_type === 'discussion_contribution_completed') terminalSent = true;
+      return originalSend(identity, input);
+    };
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'text_delta', { text: 'A' });
+      await terminalGate;
+      yield bridgeEvent(taskId, 'completed', { id: 2, output: 'AB' });
+    })());
+
+    const routing = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'v2-output-tail',
+      discussionAssignment({ discussionId: 'output-tail' }),
+    )));
+    await vi.waitFor(() => expect([...callbacks.values()].some(({ milliseconds }) => milliseconds === 250)).toBe(true));
+    const deltaTimer = [...callbacks.values()].find(({ milliseconds }) => milliseconds === 250)!;
+    deltaTimer.callback();
+    await deltaWasEntered;
+    releaseTerminal();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(terminalSent).toBe(false);
+    releaseDelta();
+    await routing;
+
+    expect(fixture.sent.filter(({ input }) => input.messageType === 'command_result')
+      .map(({ input }) => typeof input.content === 'string' ? undefined : input.content.msg_type)).toEqual([
+      'discussion_contribution_delta',
+      'discussion_contribution_completed',
+    ]);
+  });
+
+  it('does not append a node-error frame after a v2 terminal frame has been attempted', async () => {
+    const fixture = await routerHarness();
+    const attempted: string[] = [];
+    const originalSend = fixture.worker.send.bind(fixture.worker);
+    fixture.worker.send = async (identity, input) => {
+      if (input.messageType === 'command_result' && typeof input.content.msg_type === 'string') {
+        attempted.push(input.content.msg_type);
+        if (input.content.msg_type === 'discussion_contribution_completed') {
+          throw Object.assign(new Error('terminal failed'), { code: 'protocol_error' });
+        }
+      }
+      return originalSend(identity, input);
+    };
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', { output: 'terminal output' });
+    })());
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'v2-one-terminal',
+      discussionAssignment({ discussionId: 'one-terminal' }),
+    )));
+
+    expect(attempted).toEqual(['discussion_contribution_completed']);
+  });
+
   it('requires the exact node host role and converts invalid host output to a fixed node error', async () => {
     const fixture = await routerHarness();
     fixture.setEvents((taskId) => (async function* () {
@@ -1812,6 +2164,102 @@ describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
 
     expect(fixture.cancellations).toEqual(['task_1_1']);
     expect(fixture.starts).toHaveLength(1);
+  });
+
+  it('performs one complete v2 cancel cleanup before releasing the lane and never replays buffered output', async () => {
+    const callbacks = new Map<number, { milliseconds: number; cleared: boolean }>();
+    let timerId = 0;
+    const fixture = await routerHarness({
+      timers: {
+        setTimeout(_callback, milliseconds) {
+          timerId += 1;
+          callbacks.set(timerId, { milliseconds, cleared: false });
+          return timerId;
+        },
+        clearTimeout(timer) {
+          const entry = callbacks.get(timer as number);
+          if (entry) entry.cleared = true;
+        },
+      },
+    });
+    let resolveNext!: (value: IteratorResult<BridgeTaskEvent>) => void;
+    let secondNext!: () => void;
+    let releaseReturn!: () => void;
+    const secondNextPending = new Promise<void>((resolve) => { secondNext = resolve; });
+    const returnGate = new Promise<void>((resolve) => { releaseReturn = resolve; });
+    let nextCalls = 0;
+    let returned = 0;
+    const iterator: AsyncIterator<BridgeTaskEvent> = {
+      next: async () => {
+        nextCalls += 1;
+        if (nextCalls === 1) {
+          return {
+            done: false,
+            value: bridgeEvent('task_1_1', 'text_delta', { text: 'X'.repeat(16 * 1024) }),
+          };
+        }
+        secondNext();
+        return new Promise((resolve) => { resolveNext = resolve; });
+      },
+      return: async () => {
+        returned += 1;
+        resolveNext({ done: true, value: undefined });
+        await returnGate;
+        return { done: true, value: undefined };
+      },
+    };
+    fixture.setEvents((taskId, index) => index === 0
+      ? { [Symbol.asyncIterator]: () => iterator }
+      : (async function* () { yield bridgeEvent(taskId, 'completed'); })());
+    let online = false;
+    const originalSend = fixture.worker.send.bind(fixture.worker);
+    fixture.worker.send = async (identity, input) => {
+      if (input.messageType === 'command_result'
+        && input.content.msg_type === 'discussion_contribution_delta'
+        && !online) throw Object.assign(new Error('offline'), { code: 'worker_exited' });
+      return originalSend(identity, input);
+    };
+
+    const active = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'cancel-cleanup-active',
+      discussionAssignment({ discussionId: 'cancel-cleanup' }),
+    )));
+    await secondNextPending;
+    const cancel = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'cancel-cleanup-command',
+      discussionCancel({ discussionId: 'cancel-cleanup' }),
+    )));
+    await vi.waitFor(() => expect(fixture.cancellations).toEqual(['task_1_1']));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const returnedBeforeRelease = returned;
+    const watchdogClearedBeforeRelease = [...callbacks.values()]
+      .find(({ milliseconds }) => milliseconds > 60_000)?.cleared;
+
+    const nextRoute = fixture.router.onWorkerEvent(
+      IDENTITY_A,
+      inbound(IDENTITY_A, message('after-v2-cancel')),
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(fixture.starts).toHaveLength(1);
+    resolveNext({ done: true, value: undefined });
+    releaseReturn();
+    await Promise.all([active, cancel, nextRoute]);
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'cancel-cleanup-replay',
+      discussionAssignment({ discussionId: 'cancel-cleanup' }),
+    )));
+    online = true;
+    await fixture.router.onWorkerEvent(IDENTITY_A, {
+      type: 'connection', runtimeId: RUNTIME_A, instanceId: INSTANCE_A, state: 'online',
+    });
+
+    expect(returnedBeforeRelease).toBe(1);
+    expect(watchdogClearedBeforeRelease).toBe(false);
+    expect(returned).toBe(1);
+    expect(fixture.cancellations).toEqual(['task_1_1']);
+    expect(fixture.starts).toHaveLength(2);
+    expect(fixture.sent.some(({ input }) => input.messageType === 'command_result'
+      && input.content.msg_type === 'discussion_contribution_delta')).toBe(false);
   });
 
   it('serves the bounded model catalog locally without starting a task', async () => {
@@ -2152,6 +2600,34 @@ describe('MessageRouter CardKit action dispatch', () => {
       'card-accepted-malformed',
       '02'.repeat(16),
     )).resolves.toMatchObject({ status: 'duplicate' });
+  });
+
+  it('builds a bounded card update before freezing the final command result', async () => {
+    const fixture = await routerHarness();
+    fixture.control.authorize = async () => true;
+    fixture.control.card = async () => ({
+      status: 'success',
+      code: 'ok',
+      message: 'accepted',
+      card: {
+        schema: '1.0.0',
+        id: 'card-one',
+        header: { title: 'Updated' },
+        sections: [],
+        reasoning: 'R'.repeat(8_900),
+      },
+    });
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'card-update-builder-failure',
+      action({ type: 'custom', kind: 'inspect', payload: { public: true } }),
+    )));
+
+    const result = fixture.sent.find(({ input }) => input.messageType === 'command_result')?.input.content;
+    expect(result).toMatchObject({
+      status: 'error', code: 'unsupported_action', message: 'unsupported_action',
+    });
+    expect(fixture.sent.some(({ input }) => input.messageType === 'card_update')).toBe(false);
   });
 
   it('defaults custom actions to deny and never reflects invalid raw action content', async () => {

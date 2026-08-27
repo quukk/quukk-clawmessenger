@@ -34,6 +34,7 @@ import {
   buildHostDecisionOutput,
   buildModelCatalogResponse,
   buildNodeError,
+  discussionV2LogicalKey,
   parseDiscussionModelCatalogRequest,
   parseDiscussionV2Command,
   parseHostDecision,
@@ -253,6 +254,7 @@ interface ActiveTask {
   bindingKey: string;
   conversationKey: string;
   taskId: string;
+  generation: number;
   submittedResumeSessionId?: string;
   lastEventId: number;
   suppressed: boolean;
@@ -287,6 +289,7 @@ interface DiscussionActive {
   bindingKey: string;
   logicalKey: string;
   taskId: string;
+  generation: number;
   command: DiscussionAssignment | DiscussionHostTurn;
   submittedResumeSessionId?: string;
   lastEventId: number;
@@ -295,18 +298,30 @@ interface DiscussionActive {
   outputTruncated: boolean;
   pendingDelta: string;
   seq: number;
+  outputTail: Promise<void>;
+  outputFinalQueued: boolean;
   suppressed: boolean;
   terminal: boolean;
   iterator?: AsyncIterator<BridgeTaskEvent>;
   deltaTimer?: unknown;
   watchdogTimer?: unknown;
   watchdogPromise?: Promise<void>;
+  cleanupPromise?: Promise<void>;
+  directOwner?: V2DirectOwner;
 }
 
 interface V1Owner {
+  token: string;
   state: 'active' | 'terminal';
   expiresAt: number;
   task?: V1Active;
+}
+
+interface V2DirectOwner {
+  logicalKey: string;
+  token: string;
+  state: 'prestart' | 'active' | 'terminal';
+  expiresAt: number;
 }
 
 interface V1Active {
@@ -315,6 +330,7 @@ interface V1Active {
   bindingKey: string;
   logicalKey: string;
   taskId: string;
+  generation: number;
   message: DiscussionV1Message;
   submittedResumeSessionId?: string;
   lastEventId: number;
@@ -334,6 +350,7 @@ interface BindingDiscussionState {
   wire: DiscussionWireReassembler;
   active: Map<string, DiscussionActive>;
   v1: Map<string, V1Owner>;
+  directV2: Map<string, V2DirectOwner>;
   ackWaiters: Map<string, ArtifactAckWaiter>;
 }
 
@@ -487,8 +504,11 @@ export class MessageRouter {
   readonly #waitingByBinding = new Map<string, number>();
   readonly #active = new Map<string, ActiveTask>();
   readonly #bufferedOutput = new Map<string, BufferedOutput[]>();
+  readonly #bufferDrains = new Map<string, Promise<void>>();
+  readonly #bufferDrainTasks = new Map<string, string>();
   readonly #discussion = new Map<string, BindingDiscussionState>();
   readonly #disposedBindings = new Set<string>();
+  readonly #bindingGenerations = new Map<string, number>();
   #bufferOrder = 0;
   #waiting = 0;
   #disposed = false;
@@ -512,7 +532,9 @@ export class MessageRouter {
   }
 
   async onWorkerEvent(identity: WorkerIdentity, event: WorkerEvent): Promise<void> {
-    if (this.#disposed || event.runtimeId !== identity.runtimeId) return;
+    if (this.#disposed
+      || this.#disposedBindings.has(bindingKey(identity))
+      || event.runtimeId !== identity.runtimeId) return;
     if (event.type === 'connection') {
       if (event.state === 'online') await this.#drainBufferedOutput(identity);
       return;
@@ -568,6 +590,7 @@ export class MessageRouter {
     const key = bindingKey(identity);
     if (this.#disposedBindings.has(key)) return;
     this.#disposedBindings.add(key);
+    this.#bindingGenerations.set(key, (this.#bindingGenerations.get(key) ?? 0) + 1);
     this.#bufferedOutput.delete(key);
     for (const [laneKey, lane] of this.#lanes) {
       if (lane.bindingKey !== key) continue;
@@ -595,6 +618,10 @@ export class MessageRouter {
       discussion.guard.dispose();
       discussion.wire.dispose();
       for (const active of discussion.active.values()) {
+        if (active.cleanupPromise !== undefined) {
+          cancellations.push(active.cleanupPromise);
+          continue;
+        }
         active.suppressed = true;
         if (active.deltaTimer !== undefined) this.#clearTimeout(active.deltaTimer);
         if (active.watchdogTimer !== undefined) this.#clearTimeout(active.watchdogTimer);
@@ -788,6 +815,7 @@ export class MessageRouter {
         wire: new DiscussionWireReassembler({ clock: this.#clock }),
         active: new Map(),
         v1: new Map(),
+        directV2: new Map(),
         ackWaiters: new Map(),
       };
       this.#discussion.set(key, state);
@@ -859,10 +887,11 @@ export class MessageRouter {
     raw: Record<string, unknown>,
     physicalAdmitted: boolean,
   ): Promise<void> {
+    const generation = this.#bindingGeneration(identity);
     const conversation = conversationFrom(message, identity);
     const claim = physicalAdmitted
       ? undefined
-      : await this.#claimLocal(identity, message.messageUid, conversation);
+      : await this.#claimLocal(identity, message.messageUid, conversation, generation);
     if (!physicalAdmitted && !claim) return;
     const parsed = parseDiscussionV1(raw);
     if (!parsed
@@ -879,14 +908,22 @@ export class MessageRouter {
       if (claim) await this.#admitOnly(identity, message, claim);
       return;
     }
-    const owner: V1Owner = { state: 'active', expiresAt: Number.POSITIVE_INFINITY };
+    const owner: V1Owner = {
+      token: claim?.claimId ?? message.messageUid,
+      state: 'active',
+      expiresAt: Number.POSITIVE_INFINITY,
+    };
     state.v1.set(logicalKey, owner);
     let started = false;
     try {
       await this.#recheckBinding(identity);
+      this.#requireBindingGeneration(identity, generation);
       const submittedResumeSessionId = await this.#state.currentSession(conversation);
+      this.#requireBindingGeneration(identity, generation);
       const workdir = await this.#binding.authorizeDefaultWorkdir(identity);
+      this.#requireBindingGeneration(identity, generation);
       await this.#recheckBinding(identity);
+      this.#requireBindingGeneration(identity, generation);
       const prompt = this.#v1Prompt(parsed);
       if (!prompt) throw new Error('prompt_too_large');
       const response = await this.#task.startTask({
@@ -897,12 +934,18 @@ export class MessageRouter {
         ...(submittedResumeSessionId === undefined ? {} : { resumeSessionId: submittedResumeSessionId }),
       });
       started = true;
+      if (!this.#bindingGenerationCurrent(identity, generation)) {
+        await this.#task.cancelTask(response.taskId).catch(() => undefined);
+        this.#terminalV1(state, owner);
+        return;
+      }
       const active: V1Active = {
         identity: { ...identity },
         conversation: { ...conversation },
         bindingKey: bindingKey(identity),
         logicalKey,
         taskId: response.taskId,
+        generation,
         message: parsed,
         ...(submittedResumeSessionId === undefined ? {} : { submittedResumeSessionId }),
         lastEventId: 0,
@@ -913,17 +956,39 @@ export class MessageRouter {
         terminal: false,
       };
       owner.task = active;
-      if (claim && !await this.#admitOnly(identity, message, claim)) {
-        active.suppressed = true;
-        await this.#task.cancelTask(active.taskId).catch(() => undefined);
-        this.#terminalV1(state, owner);
-        return;
+      if (claim) {
+        const admitted = await this.#state.admitMessage(claim.key, claim.claimId).catch(() => false);
+        if (!admitted) {
+          active.suppressed = true;
+          await this.#task.cancelTask(active.taskId).catch(() => undefined);
+          this.#terminalV1(state, owner);
+          return;
+        }
+        if (!this.#bindingGenerationCurrent(identity, generation)) {
+          active.suppressed = true;
+          this.#terminalV1(state, owner);
+          return;
+        }
+        await this.#sendReceipt(identity, this.#receipt(message, message.messageUid));
+        if (!this.#bindingGenerationCurrent(identity, generation)) {
+          active.suppressed = true;
+          this.#terminalV1(state, owner);
+          return;
+        }
       }
       await this.#consumeV1(state, owner, active);
     } catch {
-      this.#terminalV1(state, owner);
-      if (!started && claim) await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
-      if (physicalAdmitted) await this.#sendV1Advance(identity, conversation, parsed, '[runtime_failed]', false);
+      if (!started && claim
+        && owner.token === claim.claimId
+        && state.v1.get(logicalKey) === owner) {
+        state.v1.delete(logicalKey);
+        await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
+      } else {
+        this.#terminalV1(state, owner);
+      }
+      if (physicalAdmitted && this.#bindingGenerationCurrent(identity, generation)) {
+        await this.#sendV1Advance(identity, conversation, parsed, '[runtime_failed]', false);
+      }
     }
   }
 
@@ -959,6 +1024,8 @@ export class MessageRouter {
         if (event.task_id !== active.taskId || event.id <= active.lastEventId) continue;
         active.lastEventId = event.id;
         await this.#applyDiscussionSession(active, event);
+        if (active.suppressed
+          || !this.#bindingGenerationCurrent(active.identity, active.generation)) break;
         if (event.type === 'text_delta' && event.text) {
           this.#appendDiscussionOutput(active, event.text);
           continue;
@@ -1013,18 +1080,21 @@ export class MessageRouter {
     active: V1Active,
   ): Promise<void> {
     if (active.terminal || active.suppressed) return;
-    active.suppressed = true;
     active.terminal = true;
     await this.#task.cancelTask(active.taskId).catch(() => undefined);
     if (active.iterator?.return !== undefined) await active.iterator.return().catch(() => undefined);
-    await this.#sendV1Advance(
-      active.identity,
-      active.conversation,
-      active.message,
-      '[turn_timeout]',
-      true,
-      active,
-    );
+    try {
+      await this.#sendV1Advance(
+        active.identity,
+        active.conversation,
+        active.message,
+        '[turn_timeout]',
+        true,
+        active,
+      );
+    } finally {
+      active.suppressed = true;
+    }
     this.#terminalV1(state, owner);
   }
 
@@ -1042,13 +1112,27 @@ export class MessageRouter {
     }
   }
 
+  #terminalDirectV2(state: BindingDiscussionState, owner: V2DirectOwner | undefined): void {
+    if (owner === undefined || state.directV2.get(owner.logicalKey) !== owner) return;
+    owner.state = 'terminal';
+    owner.expiresAt = this.#time() + DISCUSSION_V2_LIMITS.logicalTombstoneTtlMs;
+    this.#pruneDirectV2(state);
+  }
+
+  #pruneDirectV2(state: BindingDiscussionState): void {
+    const now = this.#time();
+    for (const [key, owner] of state.directV2) {
+      if (owner.state === 'terminal' && owner.expiresAt <= now) state.directV2.delete(key);
+    }
+  }
+
   async #sendV1Advance(
     identity: WorkerIdentity,
     conversation: ConversationIdentity,
     message: DiscussionV1Message,
     response: string,
     timeout: boolean,
-    buffer?: Pick<V1Active, 'bindingKey' | 'taskId'>,
+    buffer?: Pick<V1Active, 'bindingKey' | 'taskId' | 'generation' | 'suppressed'>,
   ): Promise<void> {
     const advance = timeout
       ? advanceAfterTimeout(message.payload, identity.nodeId)
@@ -1089,7 +1173,13 @@ export class MessageRouter {
       output as unknown as Record<string, unknown>,
       buffer === undefined
         ? undefined
-        : { bindingKey: buffer.bindingKey, taskId: buffer.taskId, kind: 'terminal' },
+        : {
+            bindingKey: buffer.bindingKey,
+            taskId: buffer.taskId,
+            kind: 'terminal',
+            generation: buffer.generation,
+            active: buffer,
+          },
     );
   }
 
@@ -1099,15 +1189,19 @@ export class MessageRouter {
     raw: Record<string, unknown>,
     physicalAdmitted: boolean,
   ): Promise<void> {
+    const generation = this.#bindingGeneration(identity);
     const conversation = conversationFrom(message, identity);
     const claim = physicalAdmitted
       ? undefined
-      : await this.#claimLocal(identity, message.messageUid, conversation);
+      : await this.#claimLocal(identity, message.messageUid, conversation, generation);
     if (!physicalAdmitted && !claim) return;
     const parsed = parseDiscussionV2Command(raw);
     if (!parsed
       || (parsed.msg_type !== 'discussion_assignment' && parsed.msg_type !== 'discussion_host_turn')
-      || parsed.chatroomId !== message.targetId) {
+      || parsed.chatroomId !== message.targetId
+      || identity.nodeId.length > DISCUSSION_V2_LIMITS.maxId
+      || message.senderId.length > DISCUSSION_V2_LIMITS.maxId
+      || (parsed.msg_type === 'discussion_assignment' && parsed.targetId !== identity.nodeId)) {
       if (claim) await this.#admitOnly(identity, message, claim);
       return;
     }
@@ -1118,17 +1212,38 @@ export class MessageRouter {
       return;
     }
     const state = this.#discussionState(identity);
-    const logical = state.guard.claim(message.senderId, parsed, identity.nodeId);
-    if (logical.status !== 'accepted') {
-      if (claim) await this.#admitOnly(identity, message, claim);
-      return;
+    let logicalKey: string | undefined;
+    let directOwner: V2DirectOwner | undefined;
+    if (physicalAdmitted) {
+      const logical = state.guard.claim(message.senderId, parsed, identity.nodeId);
+      if (logical.status !== 'accepted') return;
+      logicalKey = logical.key;
+    } else {
+      this.#pruneDirectV2(state);
+      const key = discussionV2LogicalKey(message.senderId, parsed);
+      if (state.directV2.has(key)
+        || state.directV2.size >= DISCUSSION_V2_LIMITS.maxLogicalTombstones) {
+        if (claim) await this.#admitOnly(identity, message, claim);
+        return;
+      }
+      directOwner = {
+        logicalKey: key,
+        token: claim!.claimId,
+        state: 'prestart',
+        expiresAt: Number.POSITIVE_INFINITY,
+      };
+      state.directV2.set(key, directOwner);
     }
     let started = false;
     try {
       await this.#recheckBinding(identity);
+      this.#requireBindingGeneration(identity, generation);
       const submittedResumeSessionId = await this.#state.currentSession(conversation);
+      this.#requireBindingGeneration(identity, generation);
       const workdir = await this.#binding.authorizeDefaultWorkdir(identity);
+      this.#requireBindingGeneration(identity, generation);
       await this.#recheckBinding(identity);
+      this.#requireBindingGeneration(identity, generation);
       const prompt = this.#v2Prompt(parsed);
       if (!prompt || Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES) throw new Error('prompt_too_large');
       const response = await this.#task.startTask({
@@ -1139,12 +1254,36 @@ export class MessageRouter {
         ...(submittedResumeSessionId === undefined ? {} : { resumeSessionId: submittedResumeSessionId }),
       });
       started = true;
+      if (!this.#bindingGenerationCurrent(identity, generation)) {
+        await this.#task.cancelTask(response.taskId).catch(() => undefined);
+        if (logicalKey !== undefined) state.guard.complete(logicalKey);
+        if (directOwner !== undefined) this.#terminalDirectV2(state, directOwner);
+        return;
+      }
+      if (directOwner !== undefined) {
+        if (state.directV2.get(directOwner.logicalKey) !== directOwner
+          || directOwner.token !== claim?.claimId) {
+          await this.#task.cancelTask(response.taskId).catch(() => undefined);
+          return;
+        }
+        const logical = state.guard.claim(message.senderId, parsed, identity.nodeId);
+        if (logical.status !== 'accepted') {
+          this.#terminalDirectV2(state, directOwner);
+          await this.#task.cancelTask(response.taskId).catch(() => undefined);
+          if (claim) await this.#admitOnly(identity, message, claim);
+          return;
+        }
+        logicalKey = logical.key;
+        directOwner.state = 'active';
+      }
+      if (logicalKey === undefined) throw new Error('logical_owner_missing');
       const active: DiscussionActive = {
         identity: { ...identity },
         conversation: { ...conversation },
         bindingKey: bindingKey(identity),
-        logicalKey: logical.key,
+        logicalKey,
         taskId: response.taskId,
+        generation,
         command: parsed,
         ...(submittedResumeSessionId === undefined ? {} : { submittedResumeSessionId }),
         lastEventId: 0,
@@ -1153,23 +1292,58 @@ export class MessageRouter {
         outputTruncated: false,
         pendingDelta: '',
         seq: 0,
+        outputTail: Promise.resolve(),
+        outputFinalQueued: false,
         suppressed: false,
         terminal: false,
+        ...(directOwner === undefined ? {} : { directOwner }),
       };
-      state.active.set(logical.key, active);
-      if (claim && !await this.#admitOnly(identity, message, claim)) {
-        active.suppressed = true;
-        state.active.delete(logical.key);
-        state.guard.complete(logical.key);
-        await this.#task.cancelTask(active.taskId).catch(() => undefined);
+      state.active.set(logicalKey, active);
+      if (claim) {
+        const admitted = await this.#state.admitMessage(claim.key, claim.claimId).catch(() => false);
+        if (!admitted) {
+          active.suppressed = true;
+          state.active.delete(logicalKey);
+          state.guard.complete(logicalKey);
+          this.#terminalDirectV2(state, directOwner);
+          await this.#task.cancelTask(active.taskId).catch(() => undefined);
+          return;
+        }
+        if (!this.#bindingGenerationCurrent(identity, generation)) {
+          active.suppressed = true;
+          state.active.delete(logicalKey);
+          state.guard.complete(logicalKey);
+          this.#terminalDirectV2(state, directOwner);
+          return;
+        }
+        await this.#sendReceipt(identity, this.#receipt(message, message.messageUid));
+        if (!this.#bindingGenerationCurrent(identity, generation)) {
+          active.suppressed = true;
+          state.active.delete(logicalKey);
+          state.guard.complete(logicalKey);
+          this.#terminalDirectV2(state, directOwner);
+          return;
+        }
+      }
+      if (active.suppressed) {
+        if (active.cleanupPromise !== undefined) await active.cleanupPromise;
         return;
       }
       await this.#consumeDiscussionV2(state, active);
     } catch {
-      state.guard.complete(logical.key);
-      state.active.delete(logical.key);
-      if (!started && claim) await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
-      if (physicalAdmitted) {
+      if (logicalKey !== undefined) {
+        state.guard.complete(logicalKey);
+        state.active.delete(logicalKey);
+      }
+      if (!started && claim && directOwner !== undefined
+        && directOwner.token === claim.claimId
+        && state.directV2.get(directOwner.logicalKey) === directOwner) {
+        state.directV2.delete(directOwner.logicalKey);
+        await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
+      } else if (directOwner !== undefined) {
+        this.#terminalDirectV2(state, directOwner);
+      }
+      if (physicalAdmitted && this.#bindingGenerationCurrent(identity, generation)) {
         await this.#sendV2NodeError(identity, conversation, parsed, 'model_error');
       }
     }
@@ -1215,6 +1389,8 @@ export class MessageRouter {
         if (event.task_id !== active.taskId || event.id <= active.lastEventId) continue;
         active.lastEventId = event.id;
         await this.#applyDiscussionSession(active, event);
+        if (active.suppressed
+          || !this.#bindingGenerationCurrent(active.identity, active.generation)) break;
         if (event.type === 'text_delta' && event.text) {
           const previousLength = active.output.length;
           this.#appendDiscussionOutput(active, event.text);
@@ -1228,33 +1404,41 @@ export class MessageRouter {
           if (event.output) this.#appendDiscussionCompleted(active, event.output);
           active.terminal = true;
           await this.#flushDiscussionDelta(active);
-          if (active.command.msg_type === 'discussion_assignment') {
-            if (active.output.trim().length > 0) {
-              const payload = buildContributionCompleted(
-                active.command,
-                active.identity.nodeId,
-                active.output,
-                this.#time(),
-              );
-              await this.#sendDiscussionPayload(
-                active.identity,
-                active.conversation,
-                'command_result',
-                payload as unknown as Record<string, unknown>,
-                { bindingKey: active.bindingKey, taskId: active.taskId, kind: 'terminal' },
-              );
+          await this.#queueDiscussionOutput(active, true, async () => {
+            if (active.command.msg_type === 'discussion_assignment') {
+              if (active.output.trim().length > 0) {
+                const payload = buildContributionCompleted(
+                  active.command,
+                  active.identity.nodeId,
+                  active.output,
+                  this.#time(),
+                );
+                await this.#sendDiscussionPayload(
+                  active.identity,
+                  active.conversation,
+                  'command_result',
+                  payload as unknown as Record<string, unknown>,
+                  {
+                    bindingKey: active.bindingKey,
+                    taskId: active.taskId,
+                    kind: 'terminal',
+                    generation: active.generation,
+                    active,
+                  },
+                );
+              } else {
+                await this.#sendV2NodeErrorDirect(
+                  active.identity,
+                  active.conversation,
+                  active.command,
+                  'model_error',
+                  active,
+                );
+              }
             } else {
-              await this.#sendV2NodeError(
-                active.identity,
-                active.conversation,
-                active.command,
-                'model_error',
-                active,
-              );
+              await this.#finishHostDecision(active);
             }
-          } else {
-            await this.#finishHostDecision(active);
-          }
+          });
           break;
         }
         if (event.type === 'failed' || event.type === 'cancelled') {
@@ -1280,11 +1464,17 @@ export class MessageRouter {
         ).catch(() => undefined);
       }
     } finally {
-      if (active.deltaTimer !== undefined) this.#clearTimeout(active.deltaTimer);
-      if (active.watchdogTimer !== undefined) this.#clearTimeout(active.watchdogTimer);
-      if (active.watchdogPromise !== undefined) await active.watchdogPromise.catch(() => undefined);
-      state.active.delete(active.logicalKey);
-      state.guard.complete(active.logicalKey);
+      if (active.cleanupPromise !== undefined) {
+        await active.cleanupPromise;
+      } else {
+        if (active.deltaTimer !== undefined) this.#clearTimeout(active.deltaTimer);
+        if (active.watchdogTimer !== undefined) this.#clearTimeout(active.watchdogTimer);
+        if (active.watchdogPromise !== undefined) await active.watchdogPromise.catch(() => undefined);
+        await active.outputTail;
+        if (state.active.get(active.logicalKey) === active) state.active.delete(active.logicalKey);
+        state.guard.complete(active.logicalKey);
+        this.#terminalDirectV2(state, active.directOwner);
+      }
     }
   }
 
@@ -1304,14 +1494,29 @@ export class MessageRouter {
     }, OUTPUT_FLUSH_MS);
   }
 
-  async #flushDiscussionDelta(active: DiscussionActive): Promise<void> {
+  #queueDiscussionOutput(
+    active: DiscussionActive,
+    terminal: boolean,
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    if (active.outputFinalQueued) return active.outputTail;
+    if (terminal) active.outputFinalQueued = true;
+    const queued = active.outputTail.then(async () => {
+      if (!active.suppressed
+        && this.#bindingGenerationCurrent(active.identity, active.generation)) await operation();
+    });
+    active.outputTail = queued.catch(() => undefined);
+    return queued;
+  }
+
+  #flushDiscussionDelta(active: DiscussionActive): Promise<void> {
     if (active.deltaTimer !== undefined) {
       this.#clearTimeout(active.deltaTimer);
       active.deltaTimer = undefined;
     }
     if (active.suppressed
       || active.command.msg_type !== 'discussion_assignment'
-      || active.pendingDelta.length === 0) return;
+      || active.pendingDelta.length === 0) return Promise.resolve();
     const content = active.pendingDelta;
     active.pendingDelta = '';
     const payload = buildContributionDelta(
@@ -1322,13 +1527,19 @@ export class MessageRouter {
       this.#time(),
     );
     active.seq += 1;
-    await this.#sendDiscussionPayload(
+    return this.#queueDiscussionOutput(active, false, () => this.#sendDiscussionPayload(
       active.identity,
       active.conversation,
       'command_result',
       payload as unknown as Record<string, unknown>,
-      { bindingKey: active.bindingKey, taskId: active.taskId, kind: 'coarse' },
-    );
+      {
+        bindingKey: active.bindingKey,
+        taskId: active.taskId,
+        kind: 'coarse',
+        generation: active.generation,
+        active,
+      },
+    ));
   }
 
   async #finishHostDecision(active: DiscussionActive): Promise<void> {
@@ -1339,7 +1550,7 @@ export class MessageRouter {
         const reference = await this.#sendArtifact(active, decision);
         if (active.suppressed) return;
         if (!reference) {
-          await this.#sendV2NodeError(
+          await this.#sendV2NodeErrorDirect(
             active.identity,
             active.conversation,
             active.command,
@@ -1360,7 +1571,13 @@ export class MessageRouter {
           active.conversation,
           'command_result',
           payload,
-          { bindingKey: active.bindingKey, taskId: active.taskId, kind: 'terminal' },
+          {
+            bindingKey: active.bindingKey,
+            taskId: active.taskId,
+            kind: 'terminal',
+            generation: active.generation,
+            active,
+          },
         );
         return;
       }
@@ -1375,10 +1592,16 @@ export class MessageRouter {
         active.conversation,
         'command_result',
         payload,
-        { bindingKey: active.bindingKey, taskId: active.taskId, kind: 'terminal' },
+        {
+          bindingKey: active.bindingKey,
+          taskId: active.taskId,
+          kind: 'terminal',
+          generation: active.generation,
+          active,
+        },
       );
     } catch {
-      await this.#sendV2NodeError(
+      await this.#sendV2NodeErrorDirect(
         active.identity,
         active.conversation,
         active.command,
@@ -1429,7 +1652,13 @@ export class MessageRouter {
           active.conversation,
           'command_result',
           built.payload,
-          { bindingKey: active.bindingKey, taskId: active.taskId, kind: 'terminal' },
+          {
+            bindingKey: active.bindingKey,
+            taskId: active.taskId,
+            kind: 'terminal',
+            generation: active.generation,
+            active,
+          },
         );
       } catch {
         this.#clearArtifactWaiter(state, this.#artifactAckKey(expectation));
@@ -1534,22 +1763,30 @@ export class MessageRouter {
     state: BindingDiscussionState,
     active: DiscussionActive,
   ): Promise<void> {
+    if (active.cleanupPromise !== undefined) {
+      await active.cleanupPromise;
+      return;
+    }
     if (active.terminal || active.suppressed) return;
-    active.suppressed = true;
     active.terminal = true;
     this.#clearArtifactWaitersForLogical(state, active.logicalKey);
     if (active.deltaTimer !== undefined) this.#clearTimeout(active.deltaTimer);
     await this.#task.cancelTask(active.taskId).catch(() => undefined);
     if (active.iterator?.return !== undefined) await active.iterator.return().catch(() => undefined);
-    await this.#sendV2NodeError(
-      active.identity,
-      active.conversation,
-      active.command,
-      'timeout',
-      active,
-    ).catch(() => undefined);
+    try {
+      await this.#sendV2NodeError(
+        active.identity,
+        active.conversation,
+        active.command,
+        'timeout',
+        active,
+      ).catch(() => undefined);
+    } finally {
+      active.suppressed = true;
+    }
     state.active.delete(active.logicalKey);
     state.guard.complete(active.logicalKey);
+    this.#terminalDirectV2(state, active.directOwner);
   }
 
   async #sendV2NodeError(
@@ -1557,7 +1794,27 @@ export class MessageRouter {
     conversation: ConversationIdentity,
     command: DiscussionAssignment | DiscussionHostTurn,
     category: 'invalid_response' | 'model_error' | 'timeout',
-    active?: Pick<DiscussionActive, 'bindingKey' | 'taskId'>,
+    active?: DiscussionActive,
+  ): Promise<void> {
+    if (active !== undefined) {
+      await this.#queueDiscussionOutput(active, true, () => this.#sendV2NodeErrorDirect(
+        identity,
+        conversation,
+        command,
+        category,
+        active,
+      ));
+      return;
+    }
+    await this.#sendV2NodeErrorDirect(identity, conversation, command, category);
+  }
+
+  async #sendV2NodeErrorDirect(
+    identity: WorkerIdentity,
+    conversation: ConversationIdentity,
+    command: DiscussionAssignment | DiscussionHostTurn,
+    category: 'invalid_response' | 'model_error' | 'timeout',
+    active?: Pick<DiscussionActive, 'bindingKey' | 'taskId' | 'generation' | 'suppressed'>,
   ): Promise<void> {
     await this.#sendDiscussionPayload(
       identity,
@@ -1566,7 +1823,13 @@ export class MessageRouter {
       buildNodeError(command, identity.nodeId, category, this.#time()),
       active === undefined
         ? undefined
-        : { bindingKey: active.bindingKey, taskId: active.taskId, kind: 'terminal' },
+        : {
+            bindingKey: active.bindingKey,
+            taskId: active.taskId,
+            kind: 'terminal',
+            generation: active.generation,
+            active,
+          },
     );
   }
 
@@ -1587,14 +1850,11 @@ export class MessageRouter {
       const result = state.guard.cancel(message.senderId, value);
       if (result.status === 'accepted') {
         state.wire.clearDiscussion(result.clearSenderId, result.clearDiscussionId);
-        await Promise.all(result.abortedKeys.map(async (key) => {
+        await Promise.all(result.abortedKeys.map((key) => {
           const active = state.active.get(key);
-          if (!active) return;
-          active.suppressed = true;
-          this.#clearArtifactWaitersForLogical(state, key);
-          if (active.deltaTimer !== undefined) this.#clearTimeout(active.deltaTimer);
-          if (active.watchdogTimer !== undefined) this.#clearTimeout(active.watchdogTimer);
-          await this.#task.cancelTask(active.taskId).catch(() => undefined);
+          return active === undefined
+            ? Promise.resolve()
+            : this.#cancelDiscussionV2Active(state, active);
         }));
       }
     } else {
@@ -1621,6 +1881,41 @@ export class MessageRouter {
       }
     }
     if (claim) await this.#admitOnly(identity, message, claim);
+  }
+
+  #cancelDiscussionV2Active(
+    state: BindingDiscussionState,
+    active: DiscussionActive,
+  ): Promise<void> {
+    if (active.cleanupPromise !== undefined) return active.cleanupPromise;
+    active.suppressed = true;
+    active.terminal = true;
+    if (active.deltaTimer !== undefined) {
+      this.#clearTimeout(active.deltaTimer);
+      active.deltaTimer = undefined;
+    }
+    this.#clearArtifactWaitersForLogical(state, active.logicalKey);
+    this.#removeBufferedTask(active.bindingKey, active.taskId);
+    const cleanup = Promise.resolve().then(async () => {
+      await Promise.all([
+        this.#task.cancelTask(active.taskId).catch(() => undefined),
+        active.iterator?.return === undefined
+          ? Promise.resolve()
+          : active.iterator.return().then(() => undefined).catch(() => undefined),
+      ]);
+      await active.outputTail;
+      this.#removeBufferedTask(active.bindingKey, active.taskId);
+    }).finally(() => {
+      if (active.watchdogTimer !== undefined) {
+        this.#clearTimeout(active.watchdogTimer);
+        active.watchdogTimer = undefined;
+      }
+      if (state.active.get(active.logicalKey) === active) state.active.delete(active.logicalKey);
+      state.guard.complete(active.logicalKey);
+      this.#terminalDirectV2(state, active.directOwner);
+    });
+    active.cleanupPromise = cleanup;
+    return cleanup;
   }
 
   async #runDiscussionCatalog(
@@ -1666,6 +1961,22 @@ export class MessageRouter {
       || this.#disposedBindings.has(bindingKey(identity))) throw new Error('binding_unavailable');
   }
 
+  #bindingGeneration(identity: WorkerIdentity): number {
+    return this.#bindingGenerations.get(bindingKey(identity)) ?? 0;
+  }
+
+  #bindingGenerationCurrent(identity: WorkerIdentity, generation: number): boolean {
+    return !this.#disposed
+      && !this.#disposedBindings.has(bindingKey(identity))
+      && this.#bindingGeneration(identity) === generation;
+  }
+
+  #requireBindingGeneration(identity: WorkerIdentity, generation: number): void {
+    if (!this.#bindingGenerationCurrent(identity, generation)) {
+      throw new Error('binding_generation_invalidated');
+    }
+  }
+
   async #admitOnly(
     identity: WorkerIdentity,
     message: NormalizedRongCloudMessage,
@@ -1686,6 +1997,8 @@ export class MessageRouter {
       bindingKey: string;
       taskId: string;
       kind: BufferedOutput['kind'];
+      generation: number;
+      active: { suppressed: boolean };
     },
   ): Promise<void> {
     const messages = encodeDiscussionWire(payload).map((frame) => {
@@ -1697,11 +2010,21 @@ export class MessageRouter {
       );
     });
     for (let index = 0; index < messages.length; index += 1) {
+      if (buffer !== undefined
+        && (buffer.active.suppressed
+          || !this.#bindingGenerationCurrent(identity, buffer.generation))) return;
       try {
         await this.#worker.send(identity, messages[index]!);
+        if (buffer !== undefined
+          && (buffer.active.suppressed
+            || !this.#bindingGenerationCurrent(identity, buffer.generation))) return;
       } catch (error) {
         const code = workerErrorCode(error);
-        if (buffer && code !== undefined && TRANSIENT_OUTPUT_CODES.has(code)) {
+        if (buffer
+          && !buffer.active.suppressed
+          && this.#bindingGenerationCurrent(identity, buffer.generation)
+          && code !== undefined
+          && TRANSIENT_OUTPUT_CODES.has(code)) {
           this.#bufferTaskOutput(
             identity,
             buffer.bindingKey,
@@ -1848,16 +2171,6 @@ export class MessageRouter {
       }
       return;
     }
-    const response = this.#structuredResponse(
-      conversation,
-      'command_result',
-      this.#cardCommandResult(
-        routed.requestId,
-        result.status,
-        result.code,
-        result.message,
-      ),
-    );
     let update: RouterWorkerSend | undefined;
     if (result.card !== undefined) {
       try {
@@ -1870,6 +2183,16 @@ export class MessageRouter {
         result = { status: 'error', code: 'unsupported_action', message: 'unsupported_action' };
       }
     }
+    const response = this.#structuredResponse(
+      conversation,
+      'command_result',
+      this.#cardCommandResult(
+        routed.requestId,
+        result.status,
+        result.code,
+        result.message,
+      ),
+    );
     const admitted = await this.#state.admitMessage(claim.key, claim.claimId).catch(() => false);
     if (!admitted) return;
     await this.#worker.send(identity, response).catch(() => undefined);
@@ -2198,6 +2521,7 @@ export class MessageRouter {
     identity: WorkerIdentity,
     messageUid: string,
     conversation: ConversationIdentity,
+    generation?: number,
   ): Promise<ClaimedMessage | undefined> {
     const claimId = this.#claimId();
     if (!claimId) return undefined;
@@ -2205,12 +2529,19 @@ export class MessageRouter {
     try {
       claim = await this.#state.claimMessage(identity.runtimeId, messageUid, claimId);
     } catch {
-      await this.#safeSendText(identity, conversation, '[dedup_capacity]');
+      if (generation === undefined || this.#bindingGenerationCurrent(identity, generation)) {
+        await this.#safeSendText(identity, conversation, '[dedup_capacity]');
+      }
       return undefined;
     }
     if (claim.status === 'duplicate') return undefined;
+    if (generation !== undefined && !this.#bindingGenerationCurrent(identity, generation)) {
+      await this.#state.releaseMessage(claim.key, claimId).catch(() => undefined);
+      return undefined;
+    }
     try {
       const bound = await this.#binding.binding(identity);
+      if (generation !== undefined) this.#requireBindingGeneration(identity, generation);
       if (!bound
         || bound.runtimeId !== identity.runtimeId
         || bound.nodeId !== identity.nodeId
@@ -2219,7 +2550,9 @@ export class MessageRouter {
       }
     } catch {
       await this.#state.releaseMessage(claim.key, claimId).catch(() => undefined);
-      await this.#safeSendText(identity, conversation, '[binding_unavailable]');
+      if (generation === undefined || this.#bindingGenerationCurrent(identity, generation)) {
+        await this.#safeSendText(identity, conversation, '[binding_unavailable]');
+      }
       return undefined;
     }
     return { key: claim.key, claimId };
@@ -2405,6 +2738,7 @@ export class MessageRouter {
     message: NormalizedRongCloudMessage,
     candidate: TaskCandidate,
   ): Promise<void> {
+    const generation = this.#bindingGeneration(identity);
     const claimId = this.#claimId();
     if (!claimId) {
       await this.#safeSendText(identity, candidate.conversation, '[invalid_message]');
@@ -2417,7 +2751,14 @@ export class MessageRouter {
         candidate.effectiveMessageUid,
         claimId,
       );
+      this.#requireBindingGeneration(identity, generation);
     } catch (error) {
+      if (!this.#bindingGenerationCurrent(identity, generation)) {
+        if (claim?.status === 'claimed') {
+          await this.#state.releaseMessage(claim.key, claimId).catch(() => undefined);
+        }
+        return;
+      }
       await this.#safeSendText(
         identity,
         candidate.conversation,
@@ -2431,6 +2772,7 @@ export class MessageRouter {
     let taskId: string | undefined;
     try {
       const bound = await this.#binding.binding(identity);
+      this.#requireBindingGeneration(identity, generation);
       if (!bound
         || bound.runtimeId !== identity.runtimeId
         || bound.nodeId !== identity.nodeId
@@ -2439,10 +2781,14 @@ export class MessageRouter {
       }
       if (candidate.joinRoom !== undefined) {
         await this.#worker.joinChatroom(identity, { roomId: candidate.joinRoom, historyCount: 0 });
+        this.#requireBindingGeneration(identity, generation);
       }
       const submittedResumeSessionId = await this.#state.currentSession(candidate.conversation);
+      this.#requireBindingGeneration(identity, generation);
       const workdir = await this.#binding.authorizeDefaultWorkdir(identity);
+      this.#requireBindingGeneration(identity, generation);
       await this.#recheckBinding(identity);
+      this.#requireBindingGeneration(identity, generation);
       const response = await this.#task.startTask({
         runtimeId: identity.runtimeId,
         conversationKey: conversationKey(candidate.conversation),
@@ -2452,6 +2798,10 @@ export class MessageRouter {
       });
       started = true;
       taskId = response.taskId;
+      if (!this.#bindingGenerationCurrent(identity, generation)) {
+        await this.#task.cancelTask(taskId).catch(() => undefined);
+        return;
+      }
       let resolveDone!: () => void;
       const done = new Promise<void>((resolve) => { resolveDone = resolve; });
       const active: ActiveTask = {
@@ -2460,6 +2810,7 @@ export class MessageRouter {
         bindingKey: bindingKey(identity),
         conversationKey: conversationKey(candidate.conversation),
         taskId,
+        generation,
         ...(submittedResumeSessionId === undefined ? {} : { submittedResumeSessionId }),
         lastEventId: 0,
         suppressed: false,
@@ -2478,6 +2829,12 @@ export class MessageRouter {
       try {
         const admitted = await this.#state.admitMessage(claim.key, claimId);
         if (!admitted) throw new Error('admit_failed');
+        if (!this.#bindingGenerationCurrent(identity, generation)) {
+          active.suppressed = true;
+          this.#active.delete(active.conversationKey);
+          active.resolveDone();
+          return;
+        }
       } catch {
         active.suppressed = true;
         this.#active.delete(active.conversationKey);
@@ -2487,19 +2844,35 @@ export class MessageRouter {
 
       await this.#worker.receipt(identity, this.#receipt(message, candidate.effectiveMessageUid))
         .catch(() => this.#logFailure(active, 'receipt_failed'));
+      if (!this.#bindingGenerationCurrent(identity, generation)) {
+        active.suppressed = true;
+        this.#active.delete(active.conversationKey);
+        active.resolveDone();
+        return;
+      }
       await this.#worker.send(identity, {
         conversationType: candidate.conversation.conversationType,
         targetId: replyTargetId(candidate.conversation),
         messageType: 'text',
         content: '[processing]',
       }).catch(() => this.#logFailure(active, 'output_dropped'));
+      if (!this.#bindingGenerationCurrent(identity, generation)) {
+        active.suppressed = true;
+        this.#active.delete(active.conversationKey);
+        active.resolveDone();
+        return;
+      }
       await this.#consume(active);
     } catch {
       if (!started) {
         await this.#state.releaseMessage(claim.key, claimId).catch(() => undefined);
-        await this.#safeSendText(identity, candidate.conversation, '[task_start_failed]');
+        if (this.#bindingGenerationCurrent(identity, generation)) {
+          await this.#safeSendText(identity, candidate.conversation, '[task_start_failed]');
+        }
       } else if (taskId !== undefined) {
-        await this.#safeSendText(identity, candidate.conversation, '[runtime_transport_error]');
+        if (this.#bindingGenerationCurrent(identity, generation)) {
+          await this.#safeSendText(identity, candidate.conversation, '[runtime_transport_error]');
+        }
       }
     }
   }
@@ -2529,6 +2902,8 @@ export class MessageRouter {
             ...(eventStatus === undefined ? {} : { status: eventStatus }),
             ...(event.session_id === undefined ? {} : { authoritativeSessionId: event.session_id }),
           }).catch(() => this.#logFailure(active, 'router_state_invalid'));
+          if (active.suppressed
+            || !this.#bindingGenerationCurrent(active.identity, active.generation)) break;
         }
         if (event.type === 'text_delta') {
           if (event.text) {
@@ -2635,14 +3010,25 @@ export class MessageRouter {
   }
 
   #queueOutput(active: ActiveTask, operation: () => Promise<void>): Promise<void> {
-    const queued = active.outputTail.then(operation, operation);
+    const guarded = async (): Promise<void> => {
+      const drain = this.#bufferDrainTasks.get(active.bindingKey) === active.taskId
+        ? this.#bufferDrains.get(active.bindingKey)
+        : undefined;
+      if (drain !== undefined) await drain;
+      if (!active.suppressed
+        && this.#bindingGenerationCurrent(active.identity, active.generation)) await operation();
+    };
+    const queued = active.outputTail.then(guarded, guarded);
     active.outputTail = queued.catch(() => this.#logFailure(active, 'output_dropped'));
     return active.outputTail;
   }
 
   #flushCoarse(active: ActiveTask): Promise<void> {
     return this.#queueOutput(active, async () => {
-      if (active.suppressed || active.terminal || active.timedOut) return;
+      if (active.suppressed
+        || active.terminal
+        || active.timedOut
+        || !this.#bindingGenerationCurrent(active.identity, active.generation)) return;
       const safe = streamSafeContent(active.rawOutput);
       const pending = safe.slice(active.deliveredTextCharacters);
       const chunks = textChunks(pending, OUTPUT_CHUNK_BYTES);
@@ -2652,6 +3038,7 @@ export class MessageRouter {
         try {
           await this.#worker.send(active.identity, message);
           active.deliveredTextCharacters += chunk.length;
+          if (!this.#bindingGenerationCurrent(active.identity, active.generation)) return;
         } catch (error) {
           const code = workerErrorCode(error);
           if (code !== undefined && TRANSIENT_OUTPUT_CODES.has(code)) {
@@ -2675,7 +3062,8 @@ export class MessageRouter {
       active.flushTimer = undefined;
     }
     return this.#queueOutput(active, async () => {
-      if (active.suppressed && !active.timedOut) return;
+      if ((active.suppressed && !active.timedOut)
+        || !this.#bindingGenerationCurrent(active.identity, active.generation)) return;
       const parsed = parseCardMarkers(active.rawOutput);
       const cardMessages: RouterWorkerSend[] = [];
       let invalidCards = 0;
@@ -2703,6 +3091,7 @@ export class MessageRouter {
       for (let index = 0; index < messages.length; index += 1) {
         try {
           await this.#worker.send(active.identity, messages[index]!);
+          if (!this.#bindingGenerationCurrent(active.identity, active.generation)) return;
         } catch (error) {
           const code = workerErrorCode(error);
           if (code !== undefined && TRANSIENT_OUTPUT_CODES.has(code)) {
@@ -2804,28 +3193,74 @@ export class MessageRouter {
   async #drainBufferedOutput(identity: WorkerIdentity): Promise<void> {
     const bindKey = bindingKey(identity);
     if (this.#disposedBindings.has(bindKey)) return;
-    const entries = this.#bufferedOutput.get(bindKey);
-    if (!entries) return;
-    entries.sort((left, right) => left.order - right.order);
-    while (entries.length > 0) {
-      const entry = entries[0]!;
-      while (entry.messages.length > 0) {
-        try {
-          await this.#worker.send(entry.identity, entry.messages[0]!);
-          entry.messages.shift();
-          entry.bytes = serializedBytes(entry.messages);
-        } catch (error) {
-          const code = workerErrorCode(error);
-          if (code === 'queue_full' || (code !== undefined && TRANSIENT_OUTPUT_CODES.has(code))) {
-            return;
-          }
-          entries.shift();
-          break;
-        }
+    const existing = this.#bufferDrains.get(bindKey);
+    if (existing) return existing;
+    let shared!: Promise<void>;
+    shared = this.#performBufferedDrain(bindKey).finally(() => {
+      if (this.#bufferDrains.get(bindKey) === shared) {
+        this.#bufferDrainTasks.delete(bindKey);
+        this.#bufferDrains.delete(bindKey);
       }
-      if (entry.messages.length === 0 && entries[0] === entry) entries.shift();
+    });
+    this.#bufferDrains.set(bindKey, shared);
+    return shared;
+  }
+
+  async #performBufferedDrain(bindKey: string): Promise<void> {
+    while (!this.#disposedBindings.has(bindKey)) {
+      const entries = this.#bufferedOutput.get(bindKey);
+      if (!entries || entries.length === 0) return;
+      const entry = entries.reduce((oldest, candidate) =>
+        candidate.order < oldest.order ? candidate : oldest);
+      const message = entry.messages[0];
+      if (!message) {
+        this.#deleteBufferedEntry(bindKey, entry);
+        continue;
+      }
+      this.#bufferDrainTasks.set(bindKey, entry.taskId);
+      try {
+        await this.#worker.send(entry.identity, message);
+      } catch (error) {
+        const code = workerErrorCode(error);
+        if (this.#bufferDrainTasks.get(bindKey) === entry.taskId) {
+          this.#bufferDrainTasks.delete(bindKey);
+        }
+        if (code === 'queue_full' || (code !== undefined && TRANSIENT_OUTPUT_CODES.has(code))) {
+          return;
+        }
+        this.#deleteBufferedEntry(bindKey, entry);
+        continue;
+      }
+      this.#advanceDrainedText(bindKey, entry.taskId, message);
+      if (this.#bufferDrainTasks.get(bindKey) === entry.taskId) {
+        this.#bufferDrainTasks.delete(bindKey);
+      }
+      const current = this.#bufferedOutput.get(bindKey);
+      if (!current || !current.includes(entry) || entry.messages[0] !== message) continue;
+      entry.messages.shift();
+      entry.bytes = serializedBytes(entry.messages);
+      if (entry.messages.length === 0) this.#deleteBufferedEntry(bindKey, entry);
     }
-    this.#bufferedOutput.delete(bindKey);
+  }
+
+  #deleteBufferedEntry(bindKey: string, entry: BufferedOutput): void {
+    const current = this.#bufferedOutput.get(bindKey);
+    if (!current || !current.includes(entry)) return;
+    const retained = current.filter((candidate) => candidate !== entry);
+    if (this.#bufferedOutput.get(bindKey) !== current) return;
+    if (retained.length === 0) this.#bufferedOutput.delete(bindKey);
+    else this.#bufferedOutput.set(bindKey, retained);
+  }
+
+  #advanceDrainedText(bindKey: string, taskId: string, message: RouterWorkerSend): void {
+    if (message.messageType !== 'text' || typeof message.content !== 'string') return;
+    const active = [...this.#active.values()].find((candidate) =>
+      candidate.bindingKey === bindKey && candidate.taskId === taskId);
+    if (!active) return;
+    active.deliveredTextCharacters = Math.min(
+      active.rawOutput.length,
+      active.deliveredTextCharacters + message.content.length,
+    );
   }
 
   #receipt(message: NormalizedRongCloudMessage, messageUid: string): RouterReceipt {
