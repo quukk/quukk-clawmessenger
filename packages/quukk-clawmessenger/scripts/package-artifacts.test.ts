@@ -206,6 +206,24 @@ const PLATFORM_FILES = [
   'SOURCE.md',
 ] as const;
 
+const ENTRY_DEPENDENCIES = {
+  '@rongcloud/engine': '5.36.6',
+  '@rongcloud/imlib-next': '5.36.6',
+  'fake-indexeddb': '6.2.5',
+  jsdom: '29.0.1',
+  ws: '8.20.0',
+  zod: '4.3.6',
+} as const;
+
+const ENTRY_OPTIONAL_DEPENDENCIES = {
+  '@quukk/clawmessenger-runtime-win32-x64': '0.1.0-beta.1',
+  '@quukk/clawmessenger-runtime-win32-arm64': '0.1.0-beta.1',
+  '@quukk/clawmessenger-runtime-darwin-x64': '0.1.0-beta.1',
+  '@quukk/clawmessenger-runtime-darwin-arm64': '0.1.0-beta.1',
+  '@quukk/clawmessenger-runtime-linux-x64': '0.1.0-beta.1',
+  '@quukk/clawmessenger-runtime-linux-arm64': '0.1.0-beta.1',
+} as const;
+
 type EntryFixture = {
   root: string;
   entry: string;
@@ -223,6 +241,8 @@ async function entryFixture(): Promise<EntryFixture> {
           name: 'quukk-clawmessenger',
           version: '0.1.0-beta.1',
           bin: { 'quukk-clawmessenger': 'bin/quukk-clawmessenger.js' },
+          dependencies: ENTRY_DEPENDENCIES,
+          optionalDependencies: ENTRY_OPTIONAL_DEPENDENCIES,
         })
       : path.endsWith('.css')
         ? 'body{color:#123456}'
@@ -313,6 +333,53 @@ describe('audit-tarball', () => {
       packJsonPath: fixture.report,
       packageDirectory: fixture.entry,
     })).resolves.toEqual({ packageCount: 1, fileCount: ENTRY_FILES.length });
+  });
+
+  it.each([
+    [
+      'a pnpm catalog production dependency',
+      { dependencies: { ...ENTRY_DEPENDENCIES, zod: 'catalog:' } },
+    ],
+    [
+      'an unexpected production dependency',
+      { dependencies: { ...ENTRY_DEPENDENCIES, payload: '1.0.0' } },
+    ],
+    [
+      'a missing production dependency',
+      { dependencies: Object.fromEntries(
+        Object.entries(ENTRY_DEPENDENCIES).filter(([name]) => name !== 'zod'),
+      ) },
+    ],
+    [
+      'a mismatched platform runtime version',
+      { optionalDependencies: {
+        ...ENTRY_OPTIONAL_DEPENDENCIES,
+        '@quukk/clawmessenger-runtime-linux-x64': '0.1.0-beta.2',
+      } },
+    ],
+    [
+      'an incomplete platform runtime set',
+      { optionalDependencies: Object.fromEntries(
+        Object.entries(ENTRY_OPTIONAL_DEPENDENCIES).filter(
+          ([name]) => name !== '@quukk/clawmessenger-runtime-linux-x64',
+        ),
+      ) },
+    ],
+  ])('rejects %s in the entry manifest', async (_label, override) => {
+    const fixture = await entryFixture();
+    const packageJson = JSON.parse(
+      await readFile(join(fixture.entry, 'package.json'), 'utf8'),
+    ) as object;
+    await writeFile(
+      join(fixture.entry, 'package.json'),
+      JSON.stringify({ ...packageJson, ...override }),
+    );
+    await fixture.writeReport();
+
+    await expect(auditTarball({
+      packJsonPath: fixture.report,
+      packageDirectory: fixture.entry,
+    })).rejects.toMatchObject({ code: 'manifest_invalid' });
   });
 
   it('accepts the exact seven-file scoped platform package contract', async () => {

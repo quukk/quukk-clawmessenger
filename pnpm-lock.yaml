@@ -793,7 +793,7 @@ importers:
         specifier: 8.20.0
         version: 8.20.0
       zod:
-        specifier: 'catalog:'
+        specifier: 4.3.6
         version: 4.3.6
     devDependencies:
       '@multica/tsconfig':

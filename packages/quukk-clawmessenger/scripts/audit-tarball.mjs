@@ -13,6 +13,22 @@ const LEGAL_FILES = ['LICENSE', 'NOTICE', 'MODIFICATIONS.md', 'THIRD_PARTY_NOTIC
 const PLATFORM_LEGAL_FILES = ['LICENSE', 'NOTICE', 'MODIFICATIONS.md'];
 const SEMVER = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const GO_RELEASE = /^go1\.[1-9]\d*(?:\.(?:0|[1-9]\d*))?(?:(?:beta|rc)[1-9]\d*)?$/;
+const ENTRY_DEPENDENCIES = Object.freeze({
+  '@rongcloud/engine': '5.36.6',
+  '@rongcloud/imlib-next': '5.36.6',
+  'fake-indexeddb': '6.2.5',
+  jsdom: '29.0.1',
+  ws: '8.20.0',
+  zod: '4.3.6',
+});
+const RUNTIME_PACKAGE_NAMES = Object.freeze([
+  '@quukk/clawmessenger-runtime-win32-x64',
+  '@quukk/clawmessenger-runtime-win32-arm64',
+  '@quukk/clawmessenger-runtime-darwin-x64',
+  '@quukk/clawmessenger-runtime-darwin-arm64',
+  '@quukk/clawmessenger-runtime-linux-x64',
+  '@quukk/clawmessenger-runtime-linux-arm64',
+]);
 const ENTRY_EXACT_FILES = new Set([
   'package.json',
   'README.md',
@@ -143,6 +159,14 @@ function exactStringArray(value, expected) {
     && value.length === expected.length
     && value.every((item, index) => item === expected[index])
   );
+}
+
+function exactStringRecord(value, expected) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const keys = Object.keys(value).sort();
+  const expectedKeys = Object.keys(expected).sort();
+  return exactStringArray(keys, expectedKeys)
+    && expectedKeys.every((key) => value[key] === expected[key]);
 }
 
 function withoutRemoteUrls(value) {
@@ -323,7 +347,17 @@ async function auditReport(value, packageDirectory, knownCheckoutRoots) {
       || packageJson.version !== record.version
     ) fail('manifest_invalid');
     if (entry) {
-      if (packageJson.bin?.['quukk-clawmessenger'] !== 'bin/quukk-clawmessenger.js') {
+      const expectedOptionalDependencies = Object.fromEntries(
+        RUNTIME_PACKAGE_NAMES.map((name) => [name, record.version]),
+      );
+      if (
+        packageJson.bin?.['quukk-clawmessenger'] !== 'bin/quukk-clawmessenger.js'
+        || !exactStringRecord(packageJson.dependencies, ENTRY_DEPENDENCIES)
+        || !exactStringRecord(
+          packageJson.optionalDependencies,
+          expectedOptionalDependencies,
+        )
+      ) {
         fail('manifest_invalid');
       }
     } else {

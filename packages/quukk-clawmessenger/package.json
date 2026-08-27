@@ -20,7 +20,7 @@
     "fake-indexeddb": "6.2.5",
     "jsdom": "29.0.1",
     "ws": "8.20.0",
-    "zod": "catalog:"
+    "zod": "4.3.6"
   },
   "optionalDependencies": {
     "@quukk/clawmessenger-runtime-win32-x64": "0.1.0-beta.1",
