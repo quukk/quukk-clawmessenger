@@ -5,11 +5,12 @@
   "type": "module",
   "engines": { "node": ">=22.13.0" },
   "bin": { "quukk-clawmessenger": "bin/quukk-clawmessenger.js" },
-  "files": ["bin", "dist", "LICENSE", "NOTICE", "MODIFICATIONS.md", "THIRD_PARTY_NOTICES.md", "README.md"],
+  "files": ["bin", "dist", "scripts/postinstall.mjs", "LICENSE", "NOTICE", "MODIFICATIONS.md", "THIRD_PARTY_NOTICES.md", "README.md"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "postinstall": "node scripts/postinstall.mjs"
   },
   "license": "SEE LICENSE IN LICENSE",
   "dependencies": {
