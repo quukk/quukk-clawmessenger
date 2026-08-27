@@ -697,8 +697,11 @@ export class MessageRouter {
       this.#discussion.delete(key);
     }
     await Promise.allSettled(cancellations);
-    const outbound = this.#outboundByBinding.get(key);
-    if (outbound !== undefined) await Promise.allSettled([...outbound]);
+    while (true) {
+      const outbound = this.#outboundByBinding.get(key);
+      if (outbound === undefined || outbound.size === 0) break;
+      await Promise.allSettled([...outbound]);
+    }
   }
 
   dispose(): Promise<void> {

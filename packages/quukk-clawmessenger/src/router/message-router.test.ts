@@ -1041,6 +1041,75 @@ describe('MessageRouter plain task admission', () => {
     expect(fixture.sent).toEqual([]);
   });
 
+  it.each(['binding', 'global'] as const)(
+    'does not finish %s disposal between chained discussion wire frames',
+    async (scope) => {
+      const fixture = await routerHarness();
+      fixture.setStart(async () => { throw new Error('start rejected'); });
+      const originalSend = fixture.worker.send.bind(fixture.worker);
+      let sendCount = 0;
+      let firstEntered!: () => void;
+      let secondEntered!: () => void;
+      let releaseFirst!: () => void;
+      let releaseSecond!: () => void;
+      const firstWasEntered = new Promise<void>((resolve) => { firstEntered = resolve; });
+      const secondWasEntered = new Promise<void>((resolve) => { secondEntered = resolve; });
+      const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+      fixture.worker.send = async (identity, input) => {
+        sendCount += 1;
+        if (sendCount === 1) {
+          firstEntered();
+          await firstGate;
+        } else if (sendCount === 2) {
+          secondEntered();
+          await secondGate;
+        } else {
+          throw new Error('unexpected third discussion wire frame');
+        }
+        return originalSend(identity, input);
+      };
+      const base = discussionV1();
+      const token = discussionV1({
+        discussion_id: `chained-dispose-${scope}`,
+        payload: {
+          ...(base.payload as Record<string, unknown>),
+          originator_text: 'X'.repeat(10_000),
+        },
+      });
+      const frames = encodeDiscussionWire(token);
+      expect(frames).toHaveLength(2);
+      await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+        `chained-dispose-${scope}-0`,
+        JSON.parse(frames[0]!) as Record<string, unknown>,
+      )));
+      const routing = fixture.router.onWorkerEvent(IDENTITY_A, inbound(
+        IDENTITY_A,
+        protocolMessage(
+          `chained-dispose-${scope}-1`,
+          JSON.parse(frames[1]!) as Record<string, unknown>,
+        ),
+      ));
+      await firstWasEntered;
+      let disposalSettled = false;
+      const disposal = (scope === 'binding'
+        ? fixture.router.disposeBinding(IDENTITY_A)
+        : fixture.router.dispose()).then(() => { disposalSettled = true; });
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
+      const settledBeforeFirst = disposalSettled;
+      releaseFirst();
+      await secondWasEntered;
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
+      const settledBeforeSecond = disposalSettled;
+      releaseSecond();
+      await Promise.all([routing, disposal]);
+
+      expect(settledBeforeFirst).toBe(false);
+      expect(settledBeforeSecond).toBe(false);
+      expect(sendCount).toBe(2);
+    },
+  );
+
   it('shares one global disposal promise while task cancellation is still pending', async () => {
     const fixture = await routerHarness();
     let nextEntered!: () => void;
