@@ -58,7 +58,7 @@ npm install -g quukk-clawmessenger
 
 禁用变量固定为 `QUUKK_CLAWMESSENGER_NO_OPEN=1`，便于企业部署、自动化脚本和问题复现使用。
 
-本地服务绑定随机可用端口并仅监听 `127.0.0.1` / `::1`。浏览器 URL 带一次性启动票据；页面兑换后 URL 中的票据立即失效并被移除。
+本地服务绑定随机可用端口并仅监听 `127.0.0.1`。浏览器 URL 的 fragment 携带一次性启动票据；页面首段外部 JavaScript 将票据复制到局部内存后，必须先同步调用 `history.replaceState` 清除 fragment，再发起兑换。HTTP 服务不会收到 fragment，也不宣称能读取或清除它。
 
 ### 3.2 设置页流程
 
@@ -78,7 +78,7 @@ Bridge mode 保留 Multica 的视觉系统与品牌区域，提供四个最小�
 - **运行时**：按本机分组展示 provider、别名、版本、检测状态、融云连接状态和启用开关。
 - **活动**：按运行时展示消息接收、任务启动、流式输出、完成、失败与取消的时间线。
 - **诊断**：服务版本、端口、进程、CLI 探测结果、脱敏日志导出。
-- **设置**：ClawMessenger 服务地址、默认工作目录、自动启动、日志级别与重新注册。
+- **设置**：ClawMessenger 服务地址、默认工作目录、授权工作目录根、provider 路径覆盖、日志级别与重新注册。v1 不提供 OS 登录自动启动；安装后弹出只由严格 gated postinstall 或显式 setup 触发。
 
 所有用户可见运行时名称使用 Multica 的 `runtimeDisplayLabel` / `runtimeDisplayName` / `runtimeRowLabel` 规则，不直接渲染原始 `runtime.name`。
 

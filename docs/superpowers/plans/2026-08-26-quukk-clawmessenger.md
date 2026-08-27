@@ -18,7 +18,9 @@
 - Do not copy source from `opencode-clawmessenger` until its missing distributable license notice is resolved. Codex/OpenClaw bridges may be adapted with their MIT notices retained.
 - Default tests must inject fake runtimes and fake transports. They must never execute a locally installed agent CLI or connect to production RongCloud.
 - The main Node process must never import the RongCloud SDK or its browser polyfill. Each enabled runtime owns one child process and one SDK singleton.
-- Tokens, prompts, browser tickets, bearer secrets, and inherited environment dumps must never be logged or sent in child argv/env.
+- Tokens, prompts, bearer secrets, and inherited environment dumps must never be logged or sent in child argv/env.
+- Browser launch tickets must never enter the long-running Node service, Go daemon, or RongCloud worker argv/env. The sole exception is the validated `shell:false` OS default-browser opener, whose short-lived argv may contain the fragment ticket.
+- Treat that opener exposure as an explicit 30-second process-list residual risk; retain one-use redemption, fragment-only transport, synchronous browser-side removal, and `--no-open` as the supported alternative.
 - A runtime is `ready` when its executable and version probe work. `needs_auth` is only learned from a confirmed task authentication failure.
 - Runtime capability `approval_events` is `false` in v1. Existing headless adapters keep their current internal permission behavior; the UI must disclose it.
 - Node owns authorized working-directory roots and provider session IDs. Go only receives a canonical existing directory and optional `resume_session_id`.
@@ -797,6 +799,8 @@ git commit -m "feat: route isolated runtime conversations"
 - Create: `packages/quukk-clawmessenger/src/http/routes.ts`
 - Create: `packages/quukk-clawmessenger/src/http/server.ts`
 - Create: `packages/quukk-clawmessenger/src/http/server.test.ts`
+- Create: `packages/quukk-clawmessenger/src/process/service-identity.ts`
+- Create: `packages/quukk-clawmessenger/src/process/service-identity.test.ts`
 - Create: `packages/quukk-clawmessenger/src/service.ts`
 - Create: `packages/quukk-clawmessenger/src/cli.ts`
 - Create: `packages/quukk-clawmessenger/src/cli.test.ts`
@@ -804,11 +808,15 @@ git commit -m "feat: route isolated runtime conversations"
 - Create: `packages/quukk-clawmessenger/scripts/postinstall.test.ts`
 - Create: `packages/quukk-clawmessenger/src/logging/logger.ts`
 - Create: `packages/quukk-clawmessenger/src/logging/redact.test.ts`
+- Modify: `packages/quukk-clawmessenger/src/router/message-router.ts`
+- Modify: `packages/quukk-clawmessenger/src/router/message-router.test.ts`
 - Modify: `packages/quukk-clawmessenger/package.json`
+- Modify: `docs/superpowers/specs/2026-08-26-quukk-clawmessenger-fork-design.md`
+- Modify: `docs/superpowers/plans/2026-08-26-quukk-clawmessenger.md`
 
 **Step 1: Add RED browser/API security tests**
 
-Test loopback binding, Host allowlist, strict Origin checks for state changes, one-use/short-lived launch ticket, HttpOnly + SameSite=Strict cookie, CSRF token, CSP, no token-bearing URL after ticket exchange, body bounds, and no secret fields in diagnostics.
+Test loopback binding, Host allowlist, strict Origin checks for state changes, a 30-second one-use launch ticket, HttpOnly + SameSite=Strict cookie, CSRF token, CSP, body bounds, and no secret fields in diagnostics. Task 11 must prove the fragment never enters the HTTP request-target, Referer, or logs; Task 12 must prove synchronous `replaceState` happens before exchange.
 
 Expose only the UI needs:
 
@@ -823,9 +831,11 @@ Expose only the UI needs:
 - `GET /api/settings`
 - `PUT /api/settings`
 
+The sole browser-ineligible exception is `POST /internal/control`. Its JSON command is a fixed enum of `status`, `launch_ticket`, `rescan`, or `shutdown`; it uses a domain-separated derived control credential, loopback peer and exact Host fencing, strict JSON/body bounds, and explicitly rejects browser headers, cookies, CORS, browser sessions, and CSRF semantics.
+
 **Step 2: Implement the local service**
 
-Use `node:http`, `crypto`, `URL`, and zod. Do not add Express/Fastify. Bind to random loopback port, serve the built UI from `dist/ui`, and inject dependencies for tests.
+Use `node:http`, `crypto`, `URL`, and zod. Do not add Express/Fastify. Bind to random loopback port, serve the built UI from `dist/ui`, and inject dependencies for tests. Persist a compare-before-delete `daemon.pid` service identity for authenticated cross-process control. Reactivating a previously disabled binding must await its router disposal, clear only that binding's disposed state, and generation-fence every old asynchronous chain.
 
 **Step 3: Add RED CLI tests**
 
@@ -887,6 +897,7 @@ Use the `design-taste-frontend` skill before visual implementation. Test:
 - Explicit authorization of at least one real working-directory root and a default work directory before the bridge is described as task-ready.
 - Rescan, disable, reregister, activity, diagnostics, and settings flows.
 - Multica name/attribution and adjacent Quukk ClawMessenger derivative label remain visible.
+- A 43-character ticket is accepted only from `location.hash`; the client synchronously replaces the URL with `location.pathname` before exchange, rejects query/malformed tickets, and sends later mutations with `X-Quukk-CSRF`.
 
 ```powershell
 & $pnpm --dir apps/bridge exec vitest run src/setup.test.tsx src/app.test.tsx
