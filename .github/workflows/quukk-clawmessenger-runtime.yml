@@ -35,6 +35,15 @@ jobs:
   build-runtime:
     needs: runtime-contracts
     runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: '0'
+      GOENV: 'off'
+      GOFLAGS: ''
+      GOWORK: 'off'
+      GOTOOLCHAIN: 'local'
+      GOEXPERIMENT: ''
+      GOFIPS140: 'off'
+      GODEBUG: ''
     permissions:
       contents: read
       id-token: write

@@ -26,6 +26,22 @@ const VERSION = '0.1.0-beta.1';
 const SOURCE_COMMIT = 'a'.repeat(40);
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const temporaryDirectories: string[] = [];
+const PLATFORM_LABELS: Record<string, string> = {
+  win32: 'Windows',
+  darwin: 'macOS',
+  linux: 'Linux',
+};
+const EXPECTED_SOURCE_DOCUMENT = [
+  '# Source attribution',
+  '',
+  "This package contains a platform build of Multica's `server/cmd/multica` entrypoint for Quukk ClawMessenger.",
+  '',
+  '- Upstream source: https://github.com/multica-ai/multica',
+  '- Exact source commit, Go toolchain version, binary filename, and SHA-256: `manifest.json`',
+  '- Fork modifications: `MODIFICATIONS.md`',
+  '- License and attribution: `LICENSE` and `NOTICE`',
+  '',
+].join('\n');
 
 async function fixtureRepository(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'quukk-runtime-build-'));
@@ -75,11 +91,16 @@ async function validRuntimePackage(
       {
         name: target.packageName,
         version: VERSION,
-        description: 'fixture',
+        description: `Multica Bridge runtime for Quukk ClawMessenger on ${PLATFORM_LABELS[platform]} ${arch}`,
         license: 'SEE LICENSE IN LICENSE',
+        homepage: 'https://github.com/multica-ai/multica',
         files,
         os: [platform],
         cpu: [arch],
+        publishConfig: {
+          access: 'public',
+          provenance: true,
+        },
       },
       null,
       2,
@@ -92,7 +113,7 @@ async function validRuntimePackage(
   }
   await writeFile(
     join(packageDirectory, 'SOURCE.md'),
-    '# Source attribution\n\nBuilt from https://github.com/multica-ai/multica entrypoint `server/cmd/multica`.\n',
+    EXPECTED_SOURCE_DOCUMENT,
   );
   await writeFile(join(packageDirectory, target.binary), 'tiny-runtime');
   await writeFile(
@@ -238,12 +259,24 @@ describe('buildRuntime', () => {
       arch: 'x64',
       env: {
         PATH: process.env.PATH,
+        SystemRoot: 'C:\\Windows',
+        TEMP: 'D:\\task-cache\\tmp',
         GOCACHE: 'D:\\task-cache\\go-build',
         GOMODCACHE: 'D:\\task-cache\\go-mod',
         GOPATH: 'D:\\task-cache\\go-path',
         GOENV: 'D:\\user-go-env',
         GOFLAGS: '-race',
         GOAMD64: 'v3',
+        GOWORK: 'D:\\rogue\\go.work',
+        GOTOOLCHAIN: 'auto',
+        GOEXPERIMENT: 'arenas',
+        GOFIPS140: 'latest',
+        GODEBUG: 'gotypesalias=0',
+        GOPPC64: 'power10',
+        CGO_CFLAGS: '-DROGUE_BUILD=1',
+        CGO_LDFLAGS: '-lrogue',
+        CC: 'rogue-cc',
+        SOURCE_DATE_EPOCH: '1',
       },
       execute,
     });
@@ -267,8 +300,30 @@ describe('buildRuntime', () => {
     await expect(readFile(join(expectedDirectory, 'manifest.json'), 'utf8')).resolves.toBe(
       `${JSON.stringify(result.manifest, null, 2)}\n`,
     );
+    await expect(readFile(join(expectedDirectory, 'SOURCE.md'), 'utf8')).resolves.toBe(
+      EXPECTED_SOURCE_DOCUMENT,
+    );
 
     const build = calls.find(({ file, args }) => file === 'go' && args[0] === 'build');
+    const expectedBuildEnvironment = {
+      PATH: process.env.PATH,
+      SystemRoot: 'C:\\Windows',
+      TEMP: 'D:\\task-cache\\tmp',
+      GOCACHE: 'D:\\task-cache\\go-build',
+      GOMODCACHE: 'D:\\task-cache\\go-mod',
+      GOPATH: 'D:\\task-cache\\go-path',
+      CGO_ENABLED: '0',
+      GOENV: 'off',
+      GOFLAGS: '',
+      GOWORK: 'off',
+      GOTOOLCHAIN: 'local',
+      GOEXPERIMENT: '',
+      GOFIPS140: 'off',
+      GODEBUG: '',
+      GOOS: 'windows',
+      GOARCH: 'amd64',
+      GOAMD64: 'v1',
+    };
     expect(build).toEqual({
       file: 'go',
       args: [
@@ -284,20 +339,11 @@ describe('buildRuntime', () => {
       options: expect.objectContaining({
         cwd: join(root, 'server'),
         shell: false,
-        env: expect.objectContaining({
-          CGO_ENABLED: '0',
-          GOOS: 'windows',
-          GOARCH: 'amd64',
-          GOCACHE: 'D:\\task-cache\\go-build',
-          GOMODCACHE: 'D:\\task-cache\\go-mod',
-          GOPATH: 'D:\\task-cache\\go-path',
-          GOENV: 'off',
-          GOFLAGS: '',
-          GOAMD64: 'v1',
-        }),
+        env: expectedBuildEnvironment,
       }),
     });
     expect(calls.every(({ options }) => options.shell === false)).toBe(true);
+    for (const { options } of calls) expect(options.env).toEqual(expectedBuildEnvironment);
   });
 
   it('rejects a package path redirected outside the repository before invoking Go', async () => {
@@ -488,14 +534,22 @@ describe('verifyRuntimePackage', () => {
     }
   });
 
-  it('rejects package identity, version, os, cpu, file-list, and install-script drift', async () => {
+  it('rejects drift in every canonical runtime package metadata field', async () => {
     const mutations: Array<[string, (manifest: Record<string, unknown>) => void]> = [
       ['name', (value) => { value.name = '@quukk/wrong'; }],
       ['version', (value) => { value.version = '9.9.9'; }],
+      ['description', (value) => { value.description = 'replacement runtime'; }],
+      ['license', (value) => { value.license = 'MIT'; }],
+      ['homepage', (value) => { value.homepage = 'https://example.invalid'; }],
       ['os', (value) => { value.os = ['linux']; }],
       ['cpu', (value) => { value.cpu = ['arm64']; }],
       ['files', (value) => { value.files = ['multica.exe']; }],
-      ['scripts', (value) => { value.scripts = { postinstall: 'node download.mjs' }; }],
+      ['publishConfig access', (value) => {
+        value.publishConfig = { access: 'restricted', provenance: true };
+      }],
+      ['publishConfig provenance', (value) => {
+        value.publishConfig = { access: 'public', provenance: false };
+      }],
     ];
     for (const [name, mutate] of mutations) {
       const { root, packageDirectory } = await validRuntimePackage();
@@ -506,6 +560,33 @@ describe('verifyRuntimePackage', () => {
         verifyRuntimePackage(packageDirectory, { repoRoot: root }),
         name,
       ).rejects.toThrow(/package/);
+    }
+  });
+
+  it('rejects every field outside the exact runtime package metadata schema', async () => {
+    const additions: Array<[string, unknown]> = [
+      ['dependencies', { payload: '1.0.0' }],
+      ['optionalDependencies', { payload: '1.0.0' }],
+      ['peerDependencies', { payload: '1.0.0' }],
+      ['devDependencies', { payload: '1.0.0' }],
+      ['bin', { payload: 'install.js' }],
+      ['main', 'install.js'],
+      ['module', 'install.mjs'],
+      ['exports', './install.js'],
+      ['scripts', { postinstall: 'node install.js' }],
+      ['config', { executable: 'install.js' }],
+      ['private', false],
+      ['x-unknown', 'unexpected'],
+    ];
+    for (const [field, value] of additions) {
+      const { root, packageDirectory } = await validRuntimePackage();
+      const packageJson = JSON.parse(await readFile(join(packageDirectory, 'package.json'), 'utf8'));
+      packageJson[field] = value;
+      await writeFile(join(packageDirectory, 'package.json'), JSON.stringify(packageJson));
+      await expect(
+        verifyRuntimePackage(packageDirectory, { repoRoot: root }),
+        field,
+      ).rejects.toThrow(/package metadata/);
     }
   });
 
@@ -537,6 +618,17 @@ describe('verifyRuntimePackage', () => {
     await writeFile(join(source.packageDirectory, 'SOURCE.md'), '# Source\n');
     await expect(
       verifyRuntimePackage(source.packageDirectory, { repoRoot: source.root }),
+    ).rejects.toThrow(/source attribution/);
+  });
+
+  it('requires the exact canonical source document instead of matching attribution substrings', async () => {
+    const { root, packageDirectory } = await validRuntimePackage();
+    await writeFile(
+      join(packageDirectory, 'SOURCE.md'),
+      'Forged package from https://github.com/multica-ai/multica using server/cmd/multica.\n',
+    );
+    await expect(
+      verifyRuntimePackage(packageDirectory, { repoRoot: root }),
     ).rejects.toThrow(/source attribution/);
   });
 
@@ -625,9 +717,8 @@ describe('published runtime package metadata', () => {
           await readFile(join(REPO_ROOT, legalFile)),
         );
       }
-      const source = await readFile(join(packageDirectory, 'SOURCE.md'), 'utf8');
-      expect(source).toContain('https://github.com/multica-ai/multica');
-      expect(source).toContain('server/cmd/multica');
+      const source = await readFile(join(packageDirectory, 'SOURCE.md'));
+      expect(source).toEqual(Buffer.from(EXPECTED_SOURCE_DOCUMENT));
     }
   });
 });
@@ -641,6 +732,16 @@ describe('runtime build workflow', () => {
       ),
     );
     const build = workflow.jobs['build-runtime'];
+    expect(build.env).toEqual({
+      CGO_ENABLED: '0',
+      GOENV: 'off',
+      GOFLAGS: '',
+      GOWORK: 'off',
+      GOTOOLCHAIN: 'local',
+      GOEXPERIMENT: '',
+      GOFIPS140: 'off',
+      GODEBUG: '',
+    });
     expect(
       build.strategy.matrix.include.map(
         (target: Record<string, string>) => `${target.platform}/${target.arch}`,

@@ -12,8 +12,43 @@ const DEFAULT_REPO_ROOT = resolve(SCRIPT_DIRECTORY, '..');
 const FULL_GIT_OID = /^[0-9a-f]{40}$/;
 const GO_VERSION = /^go1\.[1-9]\d*(?:\.(?:0|[1-9]\d*))?(?:(?:beta|rc)[1-9]\d*)?$/;
 const PACKAGE_VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+const OPERATIONAL_ENVIRONMENT = new Set([
+  'PATH',
+  'PATHEXT',
+  'SYSTEMROOT',
+  'WINDIR',
+  'HOME',
+  'USERPROFILE',
+  'HOMEDRIVE',
+  'HOMEPATH',
+  'LOCALAPPDATA',
+  'APPDATA',
+  'TEMP',
+  'TMP',
+  'TMPDIR',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'NO_PROXY',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+  'GOCACHE',
+  'GOMODCACHE',
+  'GOPATH',
+]);
 const USAGE =
   'usage: node scripts/build-clawmessenger-runtime.mjs --platform <win32|darwin|linux> --arch <x64|arm64>';
+export const RUNTIME_SOURCE_DOCUMENT = [
+  '# Source attribution',
+  '',
+  "This package contains a platform build of Multica's `server/cmd/multica` entrypoint for Quukk ClawMessenger.",
+  '',
+  '- Upstream source: https://github.com/multica-ai/multica',
+  '- Exact source commit, Go toolchain version, binary filename, and SHA-256: `manifest.json`',
+  '- Fork modifications: `MODIFICATIONS.md`',
+  '- License and attribution: `LICENSE` and `NOTICE`',
+  '',
+].join('\n');
 
 const TARGETS = new Map(
   [
@@ -168,6 +203,32 @@ function normalizeBuildDate(value) {
   return date.toISOString().replace('.000Z', 'Z');
 }
 
+/**
+ * @param {NodeJS.ProcessEnv} source
+ * @param {ReturnType<typeof runtimeTarget>} target
+ */
+function cleanBuildEnvironment(source, target) {
+  const operational = Object.fromEntries(
+    Object.entries(source).filter(([key, value]) => {
+      return value !== undefined && OPERATIONAL_ENVIRONMENT.has(key.toUpperCase());
+    }),
+  );
+  return {
+    ...operational,
+    CGO_ENABLED: '0',
+    GOENV: 'off',
+    GOFLAGS: '',
+    GOWORK: 'off',
+    GOTOOLCHAIN: 'local',
+    GOEXPERIMENT: '',
+    GOFIPS140: 'off',
+    GODEBUG: '',
+    GOOS: target.goos,
+    GOARCH: target.goarch,
+    ...(target.goarch === 'amd64' ? { GOAMD64: 'v1' } : { GOARM64: 'v8.0' }),
+  };
+}
+
 /** @param {string} path */
 async function sha256File(path) {
   const hash = createHash('sha256');
@@ -202,11 +263,13 @@ export async function buildRuntime(options) {
 
   const binaryPath = join(location.packageDirectory, target.binary);
   const manifestPath = join(location.packageDirectory, 'manifest.json');
+  const sourcePath = join(location.packageDirectory, 'SOURCE.md');
   await requireSafeOutputPath(binaryPath, location.packageDirectory);
   await requireSafeOutputPath(manifestPath, location.packageDirectory);
+  await requireSafeOutputPath(sourcePath, location.packageDirectory);
 
   const execute = options.execute ?? executeCommand;
-  const env = { ...(options.env ?? process.env) };
+  const env = cleanBuildEnvironment(options.env ?? process.env, target);
   const commandOptions = { cwd: location.root, env, shell: /** @type {const} */ (false) };
   const goResult = await execute('go', ['version'], commandOptions);
   const goVersion = parseGoVersion(goResult.stdout);
@@ -244,15 +307,7 @@ export async function buildRuntime(options) {
     ],
     {
       cwd: join(location.root, 'server'),
-      env: {
-        ...env,
-        CGO_ENABLED: '0',
-        GOENV: 'off',
-        GOFLAGS: '',
-        GOOS: target.goos,
-        GOARCH: target.goarch,
-        ...(target.goarch === 'amd64' ? { GOAMD64: 'v1' } : { GOARM64: 'v8.0' }),
-      },
+      env,
       shell: false,
     },
   );
@@ -270,6 +325,7 @@ export async function buildRuntime(options) {
     `${JSON.stringify(manifest, null, 2)}\n`,
     'utf8',
   );
+  await writeFile(sourcePath, RUNTIME_SOURCE_DOCUMENT, 'utf8');
   return { packageDirectory: location.packageDirectory, binaryPath, manifest };
 }
 

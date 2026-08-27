@@ -7,6 +7,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
+  RUNTIME_SOURCE_DOCUMENT,
   isRecognizedGoVersion,
   isSafePackageVersion,
   runtimeTarget,
@@ -18,9 +19,24 @@ const FULL_GIT_OID = /^[0-9a-f]{40}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const JSON_LIMIT = 64 << 10;
 const SOURCE_REPOSITORY = 'https://github.com/multica-ai/multica';
-const SOURCE_ENTRYPOINT = 'server/cmd/multica';
 const LEGAL_FILES = ['LICENSE', 'NOTICE', 'MODIFICATIONS.md'];
 const PLATFORM_PACKAGE = /^quukk-clawmessenger-runtime-(win32|darwin|linux)-(x64|arm64)$/;
+const PLATFORM_LABELS = Object.freeze({
+  win32: 'Windows',
+  darwin: 'macOS',
+  linux: 'Linux',
+});
+const RUNTIME_PACKAGE_FIELDS = [
+  'cpu',
+  'description',
+  'files',
+  'homepage',
+  'license',
+  'name',
+  'os',
+  'publishConfig',
+  'version',
+];
 
 /** @param {string} left @param {string} right */
 function samePath(left, right) {
@@ -159,13 +175,19 @@ export async function verifyRuntimePackage(requestedPackage, options = {}) {
     throw new Error('runtime package version does not match a safe entry package version');
   }
   if (
+    !isExactStringArray(Object.keys(packageJson).sort(), RUNTIME_PACKAGE_FIELDS) ||
     packageJson.name !== target.packageName ||
+    packageJson.description !==
+      `Multica Bridge runtime for Quukk ClawMessenger on ${PLATFORM_LABELS[target.platform]} ${target.arch}` ||
     packageJson.license !== 'SEE LICENSE IN LICENSE' ||
+    packageJson.homepage !== SOURCE_REPOSITORY ||
     !isExactStringArray(packageJson.os, [target.platform]) ||
     !isExactStringArray(packageJson.cpu, [target.arch]) ||
     !isExactStringArray(packageJson.files, packagedFiles) ||
-    packageJson.scripts !== undefined ||
-    packageJson.private === true
+    !isRecord(packageJson.publishConfig) ||
+    !isExactStringArray(Object.keys(packageJson.publishConfig).sort(), ['access', 'provenance']) ||
+    packageJson.publishConfig.access !== 'public' ||
+    packageJson.publishConfig.provenance !== true
   ) {
     throw new Error('runtime package metadata does not match its target');
   }
@@ -203,8 +225,8 @@ export async function verifyRuntimePackage(requestedPackage, options = {}) {
       throw new Error(`packaged legal file differs from repository root: ${legalFile}`);
     }
   }
-  const source = await readFile(join(packageDirectory, 'SOURCE.md'), 'utf8');
-  if (!source.includes(SOURCE_REPOSITORY) || !source.includes(SOURCE_ENTRYPOINT)) {
+  const source = await readFile(join(packageDirectory, 'SOURCE.md'));
+  if (!source.equals(Buffer.from(RUNTIME_SOURCE_DOCUMENT, 'utf8'))) {
     throw new Error('runtime package source attribution is incomplete');
   }
 
