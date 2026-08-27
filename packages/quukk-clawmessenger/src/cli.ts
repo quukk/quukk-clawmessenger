@@ -1062,6 +1062,10 @@ export interface ProductionLogSnapshot {
   bytes: Buffer;
 }
 
+export interface ProductionLogRetry {
+  kind: 'retry';
+}
+
 export interface ProductionCliRuntimeDependencies {
   identityStore?: DaemonIdentityPersistence;
   processId?: number;
@@ -1081,7 +1085,7 @@ export interface ProductionCliRuntimeDependencies {
   readLogSnapshot?: (
     filePath: string,
     maximumBytes: number,
-  ) => Promise<ProductionLogSnapshot | undefined>;
+  ) => Promise<ProductionLogSnapshot | ProductionLogRetry | undefined>;
 }
 
 export interface ProductionCliRuntimeOptions {
@@ -1232,7 +1236,7 @@ function sameLogFile(
 async function defaultReadLogSnapshot(
   filePath: string,
   maximumBytes: number,
-): Promise<ProductionLogSnapshot | undefined> {
+): Promise<ProductionLogSnapshot | ProductionLogRetry | undefined> {
   let before: Awaited<ReturnType<typeof fsLstat>>;
   try {
     before = await fsLstat(filePath);
@@ -1247,13 +1251,13 @@ async function defaultReadLogSnapshot(
   try {
     handle = await fsOpen(filePath, 'r');
   } catch (error) {
-    if (errorCodeOf(error) === 'ENOENT') return undefined;
+    if (errorCodeOf(error) === 'ENOENT') return { kind: 'retry' };
     throw productionFailure('operation_unavailable');
   }
   try {
     const opened = await handle.stat();
     if (!opened.isFile()) throw productionFailure('operation_unavailable');
-    if (!sameLogFile(before, opened)) return undefined;
+    if (!sameLogFile(before, opened)) return { kind: 'retry' };
     if (
       !Number.isSafeInteger(opened.size)
       || opened.size < 0
@@ -1268,7 +1272,7 @@ async function defaultReadLogSnapshot(
     }
     const after = await handle.stat();
     if (offset !== bytes.byteLength || after.size !== opened.size || !sameLogFile(opened, after)) {
-      return undefined;
+      return { kind: 'retry' };
     }
     return {
       fileId: `${String(opened.dev)}:${String(opened.ino)}:${opened.birthtimeMs}`,
@@ -2103,15 +2107,32 @@ export function createProductionCliRuntime(
       let previous: ProductionLogSnapshot | undefined;
       let emittedOffset = 0;
       let initial = true;
+      let replacementRetries = 0;
       try {
         while (!controller.signal.aborted) {
-          let snapshot: ProductionLogSnapshot | undefined;
+          let result: ProductionLogSnapshot | ProductionLogRetry | undefined;
           try {
-            snapshot = await readLogSnapshot(paths.bridgeLog, LOG_SNAPSHOT_LIMIT);
+            result = await readLogSnapshot(paths.bridgeLog, LOG_SNAPSHOT_LIMIT);
           } catch {
             throw productionFailure('operation_unavailable');
           }
           if (controller.signal.aborted) return;
+          if (result !== undefined && 'kind' in result) {
+            if (result.kind !== 'retry' || Object.keys(result).length !== 1) {
+              throw productionFailure('operation_unavailable');
+            }
+            replacementRetries += 1;
+            if (replacementRetries >= 3) throw productionFailure('operation_unavailable');
+            try {
+              await sleep(10, controller.signal);
+            } catch {
+              if (controller.signal.aborted) return;
+              throw productionFailure('operation_unavailable');
+            }
+            continue;
+          }
+          replacementRetries = 0;
+          const snapshot = result;
           if (
             snapshot !== undefined
             && (
@@ -2252,10 +2273,12 @@ export function packagedCliCandidate(
   const packagedBinPath = resolve(packageRoot, 'bin', 'quukk-clawmessenger.js');
   const invokedBinPath = resolve(processArgv[1]!);
   const localShimPath = resolve(dirname(packageRoot), '.bin', 'quukk-clawmessenger');
+  const invokedFromBinDirectory = basename(invokedBinPath) === 'quukk-clawmessenger'
+    && (basename(dirname(invokedBinPath)) === 'bin' || basename(dirname(invokedBinPath)) === '.bin');
   if (
     invokedBinPath !== packagedBinPath
     && invokedBinPath !== localShimPath
-    && basename(invokedBinPath) !== 'quukk-clawmessenger'
+    && !invokedFromBinDirectory
   ) {
     return undefined;
   }

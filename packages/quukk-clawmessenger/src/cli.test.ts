@@ -2487,6 +2487,43 @@ describe('createProductionCliRuntime', () => {
     });
   });
 
+  it('retries one transient log replacement for a non-follow tail', async () => {
+    const store = identityStore();
+    const readLogSnapshot = vi.fn()
+      .mockResolvedValueOnce({ kind: 'retry' })
+      .mockResolvedValueOnce({ fileId: 'replacement', bytes: Buffer.from('next\n', 'utf8') });
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readLogSnapshot,
+      sleep: vi.fn(async () => undefined),
+    }) as never);
+    const lines: string[] = [];
+
+    for await (const line of runtime.readLogs({ lines: 1, follow: false })) lines.push(line);
+
+    expect(lines).toEqual(['next']);
+    expect(readLogSnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails closed after three consecutive transient log replacements', async () => {
+    const store = identityStore();
+    const readLogSnapshot = vi.fn(async () => ({ kind: 'retry' }));
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readLogSnapshot,
+      sleep: vi.fn(async () => undefined),
+    }) as never);
+
+    const read = (async () => {
+      for await (const _line of runtime.readLogs({ lines: 1, follow: false })) {
+        // No line is expected from a replacement race.
+      }
+    })();
+
+    await expect(read).rejects.toMatchObject({
+      code: 'operation_unavailable', message: 'operation_unavailable',
+    });
+    expect(readLogSnapshot).toHaveBeenCalledTimes(3);
+  });
+
   it('doctor reads only bounded strict metadata, identity, credentials, and authenticated status', async () => {
     const store = identityStore({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
     const paths = localPaths(HOME);
@@ -2583,6 +2620,10 @@ describe('createProductionCliRuntime', () => {
   it('uses a pure packaged-path guard before any self-execution I/O', () => {
     const packageRoot = resolve('selfexec', 'node_modules', 'quukk-clawmessenger');
     const moduleUrl = pathToFileURL(resolve(packageRoot, 'dist', 'cli.js')).href;
+    const globalPackageRoot = resolve(
+      'selfexec-global', 'lib', 'node_modules', 'quukk-clawmessenger',
+    );
+    const globalModuleUrl = pathToFileURL(resolve(globalPackageRoot, 'dist', 'cli.js')).href;
 
     expect(packagedCliCandidate([
       EXECUTABLE, resolve('ordinary-importer.js'), 'status',
@@ -2601,9 +2642,14 @@ describe('createProductionCliRuntime', () => {
     ], moduleUrl)).toEqual(expect.objectContaining({ argv: ['doctor'] }));
     expect(packagedCliCandidate([
       EXECUTABLE,
-      resolve('selfexec', 'global-bin', 'quukk-clawmessenger'),
+      resolve('selfexec-global', 'bin', 'quukk-clawmessenger'),
       'status',
-    ], moduleUrl)).toEqual(expect.objectContaining({ argv: ['status'] }));
+    ], globalModuleUrl)).toEqual(expect.objectContaining({ argv: ['status'] }));
+    expect(packagedCliCandidate([
+      EXECUTABLE,
+      resolve('unrelated-import', 'quukk-clawmessenger'),
+      'status',
+    ], moduleUrl)).toBeUndefined();
     expect(packagedCliCandidate([
       EXECUTABLE, resolve(packageRoot, 'bin', 'quukk-clawmessenger.js'),
     ], pathToFileURL(resolve(packageRoot, 'src', 'cli.ts')).href)).toBeUndefined();
