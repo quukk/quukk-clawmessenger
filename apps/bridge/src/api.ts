@@ -66,6 +66,14 @@ const runtimeSchema = z
     worker: workerSchema.nullable(),
   })
   .strict()
+  .superRefine((value, context) => {
+    if (value.runtimeId === null) {
+      if (value.binding !== null) context.addIssue({ code: 'custom', path: ['binding'] });
+      if (value.worker !== null) context.addIssue({ code: 'custom', path: ['worker'] });
+    } else if (value.binding !== null && value.binding.runtimeId !== value.runtimeId) {
+      context.addIssue({ code: 'custom', path: ['binding', 'runtimeId'] });
+    }
+  })
   .transform(
     (value): BridgeRuntime => ({
       provider: value.provider,
@@ -117,14 +125,20 @@ const apiErrorSchema = z
   })
   .strict();
 
-const mutationResultSchema = z.discriminatedUnion('ok', [
-  z
-    .object({ runtimeId: runtimeIdSchema, ok: z.literal(true), binding: safeBindingSchema })
-    .strict(),
-  z
-    .object({ runtimeId: runtimeIdSchema, ok: z.literal(false), error: apiErrorSchema })
-    .strict(),
-]);
+const mutationResultSchema = z
+  .discriminatedUnion('ok', [
+    z
+      .object({ runtimeId: runtimeIdSchema, ok: z.literal(true), binding: safeBindingSchema })
+      .strict(),
+    z
+      .object({ runtimeId: runtimeIdSchema, ok: z.literal(false), error: apiErrorSchema })
+      .strict(),
+  ])
+  .superRefine((value, context) => {
+    if (value.ok && value.binding.runtimeId !== value.runtimeId) {
+      context.addIssue({ code: 'custom', path: ['binding', 'runtimeId'] });
+    }
+  });
 
 const mutationEnvelopeSchema = z
   .object({ schemaVersion: z.literal(1), results: z.array(mutationResultSchema).min(1).max(4) })
@@ -174,13 +188,13 @@ const settingsEnvelopeSchema = z
 
 const activitySchema = z
   .object({
-    id: z.number().int().nonnegative(),
-    time: z.string().min(1).max(64),
+    id: z.number().int().positive().safe(),
+    time: z.iso.datetime({ offset: true }),
     level: z.enum(['debug', 'info', 'warn', 'error']),
-    event: safeCodeSchema,
+    event: z.string().min(1).max(128),
     runtimeId: runtimeIdSchema.optional(),
     provider: providerSchema.optional(),
-    taskId: z.string().min(1).max(128).optional(),
+    taskId: z.string().min(1).max(256).optional(),
     eventType: z
       .enum([
         'started',
@@ -194,8 +208,8 @@ const activitySchema = z
       ])
       .optional(),
     errorCode: safeCodeSchema.optional(),
-    count: z.number().int().nonnegative().optional(),
-    durationMs: z.number().int().nonnegative().optional(),
+    count: z.number().int().nonnegative().safe().optional(),
+    durationMs: z.number().int().nonnegative().safe().optional(),
   })
   .strict()
   .transform(
@@ -211,6 +225,13 @@ const activitySchema = z
 const activityEnvelopeSchema = z
   .object({ schemaVersion: z.literal(1), events: z.array(activitySchema).max(100) })
   .strict()
+  .superRefine((value, context) => {
+    for (let index = 1; index < value.events.length; index += 1) {
+      if (value.events[index - 1]!.id >= value.events[index]!.id) {
+        context.addIssue({ code: 'custom', path: ['events', index, 'id'] });
+      }
+    }
+  })
   .transform((value) => ({ activity: value.events }));
 
 const diagnosticsSchema = z
@@ -400,24 +421,27 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
         method: 'POST',
         body: JSON.stringify({ runtimeIds }),
       });
-      const parsed = parseSafely(
-        data,
-        mutationEnvelopeSchema,
-        {
-          results: runtimeIds.map(
-            (runtimeId): z.infer<typeof mutationResultSchema> => ({
-              runtimeId,
-              ok: false,
-              error: {
-                code: 'invalid_response',
-                category: 'runtime',
-                retryable: false,
-              },
-            }),
-          ),
-        },
-      );
-      return parsed.results.map(
+      const invalid = () =>
+        runtimeIds.map(
+          (runtimeId): BindingMutationResult => ({
+            runtimeId,
+            ok: false,
+            errorCode: 'invalid_response',
+          }),
+        );
+      const parsed = mutationEnvelopeSchema.safeParse(data);
+      if (!parsed.success) return invalid();
+      const expected = new Set(runtimeIds);
+      const received = new Set(parsed.data.results.map((result) => result.runtimeId));
+      if (
+        expected.size !== runtimeIds.length ||
+        received.size !== parsed.data.results.length ||
+        parsed.data.results.length !== runtimeIds.length ||
+        parsed.data.results.some((result) => !expected.has(result.runtimeId))
+      ) {
+        return invalid();
+      }
+      return parsed.data.results.map(
         (result): BindingMutationResult =>
           result.ok
             ? { runtimeId: result.runtimeId, ok: true }
@@ -438,9 +462,10 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
         method: 'POST',
       });
       const parsed = singleBindingEnvelopeSchema.safeParse(data);
-      return parsed.success && parsed.data.binding.runtimeId === runtimeId
-        ? { runtimeId, ok: true }
-        : { runtimeId, ok: false, errorCode: 'invalid_response' };
+      if (!parsed.success || parsed.data.binding.runtimeId !== runtimeId) {
+        throw new BridgeApiError('invalid_response');
+      }
+      return { runtimeId, ok: true };
     },
     async getActivity() {
       const data = await request('/api/activity');

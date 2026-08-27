@@ -134,6 +134,27 @@ describe('bridge app', () => {
     expect(api.reregisterBinding).toHaveBeenCalledWith(runtimes[0]!.id);
   });
 
+  it('surfaces an explicit reregister failure without refreshing as if it succeeded', async () => {
+    const user = userEvent.setup();
+    const getRuntimes = vi.fn<BridgeApi['getRuntimes']>().mockResolvedValue(runtimes);
+    const api = createApi({
+      getRuntimes,
+      reregisterBinding: vi.fn().mockResolvedValue({
+        runtimeId: runtimes[0]!.id!,
+        ok: false,
+        errorCode: 'invalid_response',
+      }),
+    });
+    render(<App api={api} />);
+    await screen.findByRole('heading', { name: /choose local agents/i });
+
+    await user.click(screen.getByRole('button', { name: /^runtimes$/i }));
+    await user.click(screen.getByRole('button', { name: /reregister opencode/i }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/unable to reregister this agent/i);
+    expect(getRuntimes).toHaveBeenCalledTimes(1);
+  });
+
   it('labels activity by runtime and safely falls back for an unknown runtime', async () => {
     const user = userEvent.setup();
     const api = createApi({

@@ -36,7 +36,7 @@ export function RuntimesPage({ api, runtimes, onRuntimesChange }: RuntimesPagePr
     setError(null);
     try {
       if (operation === 'disable') await api.disableBinding(runtimeId);
-      else await api.reregisterBinding(runtimeId);
+      else if (!(await api.reregisterBinding(runtimeId)).ok) throw new Error('reregister_failed');
       if (!requestFence.isCurrent(generation)) return;
       const nextRuntimes = await api.getRuntimes();
       if (requestFence.isCurrent(generation)) onRuntimesChange(nextRuntimes);
