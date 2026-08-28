@@ -238,7 +238,7 @@ class ManualTimers {
   }
 }
 
-const workerEntryPath = 'D:\\pkg\\dist\\rongcloud\\worker-entry.js';
+const workerEntryPath = resolve('dist/rongcloud/worker-entry.js');
 const requestTimeoutMs = 50;
 const restartBaseMs = 10;
 const restartMaxMs = 40;

@@ -79,5 +79,12 @@
 - `server/pkg/agent/agent_test.go`: covers oversized version output and timeout precedence without executing an installed agent CLI.
 - `server/internal/daemon/bridge_http_test.go`: uses OS-native absolute runtime fixture paths so
   the Bridge HTTP lifecycle contracts run consistently on Windows and Linux.
+- `.github/workflows/quukk-clawmessenger-runtime.yml`: supplies the GitHub-hosted runner's
+  temporary directory to entry-package tests without weakening the package's fail-closed runtime
+  requirement for `TEMP`/`TMP`.
+- `packages/quukk-clawmessenger/src/process/service-identity.test.ts`,
+  `src/rongcloud/worker-supervisor.test.ts`, `src/router/message-router.test.ts`,
+  `src/router/router.integration.test.ts`, and `src/service.test.ts`: use OS-native temporary and
+  absolute fixture paths so the same security and lifecycle contracts run on Windows and Linux.
 
 New fork-specific files are listed in this task's commit and do not replace upstream source files.

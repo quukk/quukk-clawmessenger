@@ -76,6 +76,9 @@ jobs:
         run: pnpm --dir apps/bridge typecheck
       - name: Test entry package
         run: pnpm --dir packages/quukk-clawmessenger test
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
       - name: Typecheck entry package
         run: pnpm --dir packages/quukk-clawmessenger typecheck
       - name: Typecheck fake end-to-end

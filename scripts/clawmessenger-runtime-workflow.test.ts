@@ -165,6 +165,10 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
     expect(bridgeTest.run).toBe('pnpm --dir apps/bridge test');
     expect(bridgeTypecheck.run).toBe('pnpm --dir apps/bridge typecheck');
     expect(entryTest.run).toBe('pnpm --dir packages/quukk-clawmessenger test');
+    expect(entryTest.env).toEqual({
+      TEMP: '${{ runner.temp }}',
+      TMP: '${{ runner.temp }}',
+    });
     expect(entryTypecheck.run).toBe('pnpm --dir packages/quukk-clawmessenger typecheck');
     expect(e2eTypecheck.run).toBe('pnpm --dir packages/quukk-clawmessenger typecheck:e2e');
     expect(bridgeBuild.run).toBe('pnpm --dir apps/bridge build');

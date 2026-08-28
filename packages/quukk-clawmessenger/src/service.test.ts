@@ -1,5 +1,6 @@
 import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -44,7 +45,7 @@ import {
   type ServiceWorkerPort,
 } from './service.js';
 
-const TASK_TEMP_ROOT = 'D:\\A-DM\\dm-im\\.task-tmp';
+const TASK_TEMP_ROOT = join(tmpdir(), 'quukk-task11-service');
 const SECRET = Buffer.alloc(32, 7).toString('base64url');
 const STARTING: StartingDaemonIdentity = {
   schema_version: 1,
@@ -79,7 +80,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
   for (const directory of tempDirectories) {
     const canonical = resolve(directory);
-    if (!canonical.startsWith(`${resolve(TASK_TEMP_ROOT)}\\`)) {
+    if (!canonical.startsWith(resolve(TASK_TEMP_ROOT) + sep)) {
       throw new Error('unsafe_test_cleanup_target');
     }
     await rm(canonical, { recursive: true, force: true });

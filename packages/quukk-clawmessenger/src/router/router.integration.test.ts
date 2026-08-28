@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -19,7 +20,7 @@ import {
 } from './message-router.js';
 import { RouterStateStore } from './session-store.js';
 
-const TEMP_ROOT = 'D:\\A-DM\\dm-im\\.task-tmp';
+const TEMP_ROOT = join(tmpdir(), 'quukk-task10-integration-root');
 const RUNTIME_A = `rt_${'a'.repeat(32)}`;
 const RUNTIME_B = `rt_${'b'.repeat(32)}`;
 const A: WorkerIdentity = { runtimeId: RUNTIME_A, nodeId: 'codex_node-a' };
@@ -171,7 +172,7 @@ async function harness(): Promise<IntegrationHarness> {
         enabled: true,
       }),
       authorizeDefaultWorkdir: async (identity) =>
-        identity.runtimeId === RUNTIME_A ? 'D:\\work-a' : 'D:\\work-b',
+        join(TEMP_ROOT, identity.runtimeId === RUNTIME_A ? 'work-a' : 'work-b'),
     },
     control,
     state,

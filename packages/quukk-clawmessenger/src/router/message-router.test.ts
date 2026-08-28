@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -30,7 +31,8 @@ import {
 } from './message-router.js';
 import { RouterStateError, RouterStateStore } from './session-store.js';
 
-const TASK_TEMP_ROOT = 'D:\\A-DM\\dm-im\\.task-tmp';
+const TASK_TEMP_ROOT = join(tmpdir(), 'quukk-task10-router');
+const AUTHORIZED_WORKDIR = join(tmpdir(), 'quukk-authorized-project');
 const RUNTIME_A = `rt_${'a'.repeat(32)}`;
 const RUNTIME_B = `rt_${'b'.repeat(32)}`;
 const temporaryDirectories: string[] = [];
@@ -284,7 +286,7 @@ async function routerHarness(
     binding: async (identity) => ({ ...identity, provider: 'codex', enabled: true }),
     authorizeDefaultWorkdir: async () => {
       order.push('authorize-workdir');
-      return 'D:\\authorized\\project';
+      return AUTHORIZED_WORKDIR;
     },
   };
   const control: RouterControlPort = {
@@ -809,7 +811,7 @@ describe('MessageRouter plain task admission', () => {
       runtimeId: RUNTIME_A,
       conversationKey: JSON.stringify([RUNTIME_A, IDENTITY_A.nodeId, 3, 'group', 'sender']),
       prompt: 'hello',
-      workdir: 'D:\\authorized\\project',
+      workdir: AUTHORIZED_WORKDIR,
     }]);
     expect(fixture.receipts[0]).toEqual({
       identity: IDENTITY_A,
@@ -879,7 +881,7 @@ describe('MessageRouter plain task admission', () => {
       },
       binding: {
         binding: async (identity) => ({ ...identity, provider: 'codex', enabled: true }),
-        authorizeDefaultWorkdir: async () => 'D:\\authorized\\project',
+        authorizeDefaultWorkdir: async () => AUTHORIZED_WORKDIR,
       },
       control: {
         authorize: async () => false,
@@ -930,7 +932,7 @@ describe('MessageRouter plain task admission', () => {
     );
     await authorizationEntered;
     await fixture.router.dispose();
-    authorize('D:\\authorized\\project');
+    authorize(AUTHORIZED_WORKDIR);
     await routing;
 
     expect(fixture.starts).toEqual([]);
@@ -1401,7 +1403,7 @@ describe('MessageRouter plain task admission', () => {
     })));
     expect(fixture.starts[0]?.prompt).toContain('https://cdn.example/image.png');
     expect(fixture.starts[0]?.prompt).not.toContain('D:\\attacker');
-    expect(fixture.starts[0]?.workdir).toBe('D:\\authorized\\project');
+    expect(fixture.starts[0]?.workdir).toBe(AUTHORIZED_WORKDIR);
 
     await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('uid-bad-media', 'caption', {
       attachments: [{ kind: 'file', url: 'file:///secret' }],

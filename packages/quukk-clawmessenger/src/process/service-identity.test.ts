@@ -17,6 +17,7 @@ import {
   unlink as fsUnlink,
   writeFile,
 } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
@@ -31,7 +32,7 @@ import {
   type StartingDaemonIdentity,
 } from './service-identity.js';
 
-const TASK_TEMP_ROOT = 'D:\\A-DM\\dm-im\\.task-tmp';
+const TASK_TEMP_ROOT = join(tmpdir(), 'quukk-task11-service-identity');
 const VERSION = '0.1.0-beta.1';
 const STARTED_AT = '2026-08-27T08:00:00.000000123Z';
 const INSTANCE_ID = `svc_${'a'.repeat(32)}`;
