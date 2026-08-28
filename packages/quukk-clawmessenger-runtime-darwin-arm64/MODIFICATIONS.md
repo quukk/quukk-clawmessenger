@@ -2,6 +2,7 @@
 
 ## Fork baseline
 
+- Fork repository: https://github.com/quukk/quukk-clawmessenger
 - Upstream repository: https://github.com/multica-ai/multica
 - Upstream baseline commit: `54027ba763fa7da0699b2fe89df4a6b2c13d1c6f`
 - Fork development branch: `codex/quukk-clawmessenger`

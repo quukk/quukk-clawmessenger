@@ -212,6 +212,7 @@ jobs:
   publish-runtime-packages:
     name: Publish beta package set
     if: >-
+      github.repository == 'quukk/quukk-clawmessenger' &&
       github.event_name == 'workflow_dispatch' &&
       inputs.publish == true &&
       github.ref_protected == true &&

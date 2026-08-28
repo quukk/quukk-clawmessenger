@@ -34,6 +34,7 @@ const EXPECTED_SOURCE_DOCUMENT = [
   '',
   "This package contains a platform build of Multica's `server/cmd/multica` entrypoint for Quukk ClawMessenger.",
   '',
+  '- Fork source: https://github.com/quukk/quukk-clawmessenger',
   '- Upstream source: https://github.com/multica-ai/multica',
   '- Exact source commit, Go toolchain version, binary filename, and SHA-256: `manifest.json`',
   '- Fork modifications: `MODIFICATIONS.md`',
@@ -91,7 +92,13 @@ async function validRuntimePackage(
         version: VERSION,
         description: `Multica Bridge runtime for Quukk ClawMessenger on ${PLATFORM_LABELS[platform]} ${arch}`,
         license: 'SEE LICENSE IN LICENSE',
-        homepage: 'https://github.com/multica-ai/multica',
+        repository: {
+          type: 'git',
+          url: 'git+https://github.com/quukk/quukk-clawmessenger.git',
+          directory: `packages/${target.directory}`,
+        },
+        bugs: { url: 'https://github.com/quukk/quukk-clawmessenger/issues' },
+        homepage: `https://github.com/quukk/quukk-clawmessenger/tree/main/packages/${target.directory}#readme`,
         files,
         os: [platform],
         cpu: [arch],
@@ -538,6 +545,21 @@ describe('verifyRuntimePackage', () => {
       ['version', (value) => { value.version = '9.9.9'; }],
       ['description', (value) => { value.description = 'replacement runtime'; }],
       ['license', (value) => { value.license = 'MIT'; }],
+      ['repository URL', (value) => {
+        value.repository = {
+          type: 'git',
+          url: 'git+https://github.com/example/wrong.git',
+          directory: 'packages/quukk-clawmessenger-runtime-win32-x64',
+        };
+      }],
+      ['repository directory', (value) => {
+        value.repository = {
+          type: 'git',
+          url: 'git+https://github.com/quukk/quukk-clawmessenger.git',
+          directory: 'packages/wrong',
+        };
+      }],
+      ['bugs', (value) => { value.bugs = { url: 'https://example.invalid/issues' }; }],
       ['homepage', (value) => { value.homepage = 'https://example.invalid'; }],
       ['os', (value) => { value.os = ['linux']; }],
       ['cpu', (value) => { value.cpu = ['arm64']; }],
@@ -688,6 +710,11 @@ describe('published runtime package metadata', () => {
     expect(entryPackage.optionalDependencies).toEqual(
       Object.fromEntries(targets.map((target) => [target.packageName, VERSION])),
     );
+    expect(entryPackage.repository).toEqual({
+      type: 'git',
+      url: 'git+https://github.com/quukk/quukk-clawmessenger.git',
+      directory: 'packages/quukk-clawmessenger',
+    });
 
     for (const target of targets) {
       const packageDirectory = join(REPO_ROOT, 'packages', target.directory);
@@ -698,6 +725,13 @@ describe('published runtime package metadata', () => {
         name: target.packageName,
         version: VERSION,
         license: 'SEE LICENSE IN LICENSE',
+        repository: {
+          type: 'git',
+          url: 'git+https://github.com/quukk/quukk-clawmessenger.git',
+          directory: `packages/${target.directory}`,
+        },
+        bugs: { url: 'https://github.com/quukk/quukk-clawmessenger/issues' },
+        homepage: `https://github.com/quukk/quukk-clawmessenger/tree/main/packages/${target.directory}#readme`,
         os: [target.platform],
         cpu: [target.arch],
         files: [

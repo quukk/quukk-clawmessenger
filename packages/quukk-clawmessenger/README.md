@@ -7,7 +7,8 @@ session store, and failure boundary.
 
 **Built on [Multica](https://github.com/multica-ai/multica).** This is a community derivative;
 the local interface retains the Multica product name, logo, copyright, and attribution alongside
-the Quukk ClawMessenger label.
+the Quukk ClawMessenger label. Fork source:
+[quukk/quukk-clawmessenger](https://github.com/quukk/quukk-clawmessenger).
 
 ## Install and set up
 

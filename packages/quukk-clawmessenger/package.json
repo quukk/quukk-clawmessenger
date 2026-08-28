@@ -15,6 +15,15 @@
     "postinstall": "node scripts/postinstall.mjs"
   },
   "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/quukk/quukk-clawmessenger.git",
+    "directory": "packages/quukk-clawmessenger"
+  },
+  "bugs": {
+    "url": "https://github.com/quukk/quukk-clawmessenger/issues"
+  },
+  "homepage": "https://github.com/quukk/quukk-clawmessenger/tree/main/packages/quukk-clawmessenger#readme",
   "publishConfig": {
     "access": "public",
     "provenance": true,

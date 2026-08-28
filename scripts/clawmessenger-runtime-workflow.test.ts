@@ -231,7 +231,7 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
 
     const publish = requiredJob(workflow, 'publish-runtime-packages');
     expect(publish.if?.replace(/\s+/g, ' ').trim()).toBe(
-      "github.event_name == 'workflow_dispatch' && inputs.publish == true && github.ref_protected == true && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/quukk-clawmessenger-v'))",
+      "github.repository == 'quukk/quukk-clawmessenger' && github.event_name == 'workflow_dispatch' && inputs.publish == true && github.ref_protected == true && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/quukk-clawmessenger-v'))",
     );
     expect(publish.environment).toBe('npm-runtime-prerelease');
     expect(publish.needs).toEqual(['build-runtime', 'build-entry']);

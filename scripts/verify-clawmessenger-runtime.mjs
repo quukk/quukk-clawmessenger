@@ -16,7 +16,8 @@ const DEFAULT_REPO_ROOT = resolve(SCRIPT_DIRECTORY, '..');
 const FULL_GIT_OID = /^[0-9a-f]{40}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const JSON_LIMIT = 64 << 10;
-const SOURCE_REPOSITORY = 'https://github.com/multica-ai/multica';
+const FORK_REPOSITORY = 'https://github.com/quukk/quukk-clawmessenger';
+const FORK_REPOSITORY_GIT = 'git+https://github.com/quukk/quukk-clawmessenger.git';
 const LEGAL_FILES = ['LICENSE', 'NOTICE', 'MODIFICATIONS.md'];
 const PLATFORM_PACKAGE = /^quukk-clawmessenger-runtime-(win32|darwin|linux)-(x64|arm64)$/;
 const PLATFORM_LABELS = Object.freeze({
@@ -25,6 +26,7 @@ const PLATFORM_LABELS = Object.freeze({
   linux: 'Linux',
 });
 const RUNTIME_PACKAGE_FIELDS = [
+  'bugs',
   'cpu',
   'description',
   'files',
@@ -33,6 +35,7 @@ const RUNTIME_PACKAGE_FIELDS = [
   'name',
   'os',
   'publishConfig',
+  'repository',
   'version',
 ];
 
@@ -178,7 +181,15 @@ export async function verifyRuntimePackage(requestedPackage, options = {}) {
     packageJson.description !==
       `Multica Bridge runtime for Quukk ClawMessenger on ${PLATFORM_LABELS[target.platform]} ${target.arch}` ||
     packageJson.license !== 'SEE LICENSE IN LICENSE' ||
-    packageJson.homepage !== SOURCE_REPOSITORY ||
+    !isRecord(packageJson.repository) ||
+    !isExactStringArray(Object.keys(packageJson.repository).sort(), ['directory', 'type', 'url']) ||
+    packageJson.repository.type !== 'git' ||
+    packageJson.repository.url !== FORK_REPOSITORY_GIT ||
+    packageJson.repository.directory !== `packages/${target.directory}` ||
+    !isRecord(packageJson.bugs) ||
+    !isExactStringArray(Object.keys(packageJson.bugs), ['url']) ||
+    packageJson.bugs.url !== `${FORK_REPOSITORY}/issues` ||
+    packageJson.homepage !== `${FORK_REPOSITORY}/tree/main/packages/${target.directory}#readme` ||
     !isExactStringArray(packageJson.os, [target.platform]) ||
     !isExactStringArray(packageJson.cpu, [target.arch]) ||
     !isExactStringArray(packageJson.files, packagedFiles) ||

@@ -56,8 +56,11 @@ describe('publish lifecycle', () => {
     const packageJson = JSON.parse(
       await readFile(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'),
     ) as {
+      bugs?: Record<string, unknown>;
       files?: string[];
+      homepage?: string;
       publishConfig?: Record<string, unknown>;
+      repository?: Record<string, unknown>;
       scripts?: Record<string, string>;
     };
 
@@ -68,6 +71,17 @@ describe('publish lifecycle', () => {
       provenance: true,
       tag: 'beta',
     });
+    expect(packageJson.repository).toEqual({
+      type: 'git',
+      url: 'git+https://github.com/quukk/quukk-clawmessenger.git',
+      directory: 'packages/quukk-clawmessenger',
+    });
+    expect(packageJson.bugs).toEqual({
+      url: 'https://github.com/quukk/quukk-clawmessenger/issues',
+    });
+    expect(packageJson.homepage).toBe(
+      'https://github.com/quukk/quukk-clawmessenger/tree/main/packages/quukk-clawmessenger#readme',
+    );
   });
 });
 
@@ -295,6 +309,13 @@ async function entryFixture(): Promise<EntryFixture> {
           files: ENTRY_PACKAGE_FILES,
           scripts: ENTRY_PACKAGE_SCRIPTS,
           license: 'SEE LICENSE IN LICENSE',
+          repository: {
+            type: 'git',
+            url: 'git+https://github.com/quukk/quukk-clawmessenger.git',
+            directory: 'packages/quukk-clawmessenger',
+          },
+          bugs: { url: 'https://github.com/quukk/quukk-clawmessenger/issues' },
+          homepage: 'https://github.com/quukk/quukk-clawmessenger/tree/main/packages/quukk-clawmessenger#readme',
           publishConfig: { access: 'public', provenance: true, tag: 'beta' },
           dependencies: ENTRY_DEPENDENCIES,
           optionalDependencies: ENTRY_OPTIONAL_DEPENDENCIES,
@@ -436,6 +457,30 @@ describe('audit-tarball', () => {
     [
       'an unexpected manifest field',
       { payload: '1.0.0' },
+    ],
+    [
+      'a mismatched repository URL',
+      { repository: {
+        type: 'git',
+        url: 'git+https://github.com/example/wrong.git',
+        directory: 'packages/quukk-clawmessenger',
+      } },
+    ],
+    [
+      'a mismatched repository directory',
+      { repository: {
+        type: 'git',
+        url: 'git+https://github.com/quukk/quukk-clawmessenger.git',
+        directory: 'packages/wrong',
+      } },
+    ],
+    [
+      'a mismatched issue tracker',
+      { bugs: { url: 'https://example.invalid/issues' } },
+    ],
+    [
+      'a mismatched homepage',
+      { homepage: 'https://example.invalid' },
     ],
   ])('rejects %s in the entry manifest', async (_label, override) => {
     const fixture = await entryFixture();

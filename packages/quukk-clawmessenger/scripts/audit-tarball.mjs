@@ -31,15 +31,18 @@ const ENTRY_DEV_DEPENDENCIES = Object.freeze({
 });
 const ENTRY_PACKAGE_FIELDS = Object.freeze([
   'bin',
+  'bugs',
   'dependencies',
   'description',
   'devDependencies',
   'engines',
   'files',
+  'homepage',
   'license',
   'name',
   'optionalDependencies',
   'publishConfig',
+  'repository',
   'scripts',
   'type',
   'version',
@@ -406,6 +409,15 @@ async function auditReport(value, packageDirectory, knownCheckoutRoots) {
         || packageJson.description !== 'Connect local AI agents to ClawMessenger, built on Multica'
         || packageJson.type !== 'module'
         || packageJson.license !== 'SEE LICENSE IN LICENSE'
+        || !exactStringRecord(packageJson.repository, {
+          type: 'git',
+          url: 'git+https://github.com/quukk/quukk-clawmessenger.git',
+          directory: 'packages/quukk-clawmessenger',
+        })
+        || !exactStringRecord(packageJson.bugs, {
+          url: 'https://github.com/quukk/quukk-clawmessenger/issues',
+        })
+        || packageJson.homepage !== 'https://github.com/quukk/quukk-clawmessenger/tree/main/packages/quukk-clawmessenger#readme'
         || !exactStringRecord(packageJson.engines, { node: '>=22.13.0' })
         || !exactStringRecord(packageJson.bin, {
           'quukk-clawmessenger': 'bin/quukk-clawmessenger.js',
