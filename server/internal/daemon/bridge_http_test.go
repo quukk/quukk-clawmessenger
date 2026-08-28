@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -250,7 +251,7 @@ func TestBridgeHTTPRefreshUsesLongLivedRootAndReportsRefreshing(t *testing.T) {
 }
 
 func TestBridgeHTTPRefreshIsExplicitNeedsAuthRecovery(t *testing.T) {
-	path := `C:\tools\codex.exe`
+	path := filepath.Join(t.TempDir(), "codex")
 	bridge := newBridge("install", map[string]string{"codex": path}, bridgeDeps{
 		probeAgentCLIs: func() map[string]AgentEntry { return map[string]AgentEntry{} },
 		resolveAgentExecutablePath: func(candidate string) (string, error) {
@@ -898,8 +899,9 @@ func (b *bridgeHTTPCleanupBackend) Execute(ctx context.Context, _ string, _ agen
 	return &agent.Session{Messages: messages, Result: result}, nil
 }
 
-func newBridgeHTTPReadyTestBridge() *Bridge {
-	path := `C:\tools\codex.exe`
+func newBridgeHTTPReadyTestBridge(t *testing.T) *Bridge {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "codex")
 	return newBridge("install", map[string]string{"codex": path}, bridgeDeps{
 		probeAgentCLIs: func() map[string]AgentEntry { return map[string]AgentEntry{} },
 		resolveAgentExecutablePath: func(candidate string) (string, error) {
@@ -918,7 +920,7 @@ func newBridgeHTTPReadyTestBridge() *Bridge {
 }
 
 func TestBridgeHTTPServeWaitsForTaskTerminalAfterShutdownWithoutSSE(t *testing.T) {
-	bridge := newBridgeHTTPReadyTestBridge()
+	bridge := newBridgeHTTPReadyTestBridge(t)
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1318,7 +1320,7 @@ func TestBridgeHTTPStartupGateParentCancellationWinsBeforeReadyLock(t *testing.T
 }
 
 func TestBridgeHTTPServeUnexpectedServeErrorCancelsAndJoinsTaskCleanup(t *testing.T) {
-	bridge := newBridgeHTTPReadyTestBridge()
+	bridge := newBridgeHTTPReadyTestBridge(t)
 	backend := &bridgeHTTPCleanupBackend{
 		started:    make(chan struct{}),
 		cancelSeen: make(chan struct{}),

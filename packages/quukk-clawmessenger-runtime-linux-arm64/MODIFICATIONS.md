@@ -77,5 +77,7 @@
   a publication gate, and carry the exact notices for Go modules linked into runtime binaries.
 - `server/pkg/agent/launch.go`: bounds synchronous probe output while preserving process ownership and timeout errors.
 - `server/pkg/agent/agent_test.go`: covers oversized version output and timeout precedence without executing an installed agent CLI.
+- `server/internal/daemon/bridge_http_test.go`: uses OS-native absolute runtime fixture paths so
+  the Bridge HTTP lifecycle contracts run consistently on Windows and Linux.
 
 New fork-specific files are listed in this task's commit and do not replace upstream source files.
