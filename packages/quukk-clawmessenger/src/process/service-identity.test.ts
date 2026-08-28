@@ -417,6 +417,7 @@ describe('DaemonIdentityStore', () => {
     const store = new DaemonIdentityStore({
       filePath,
       dependencies: {
+        platform: 'win32',
         open: async (path, flags, mode) => {
           const handle = await fsOpen(path, flags, mode);
           const inode = statCalls++ === 0 ? ownInode : rogueInode;

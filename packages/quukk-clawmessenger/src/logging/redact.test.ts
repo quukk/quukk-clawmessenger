@@ -192,7 +192,7 @@ describe('LocalLogger safe serialization', () => {
     const logger = await LocalLogger.open({
       filePath,
       level: 'info',
-      dependencies: { appendFile, stat: fakeStat },
+      dependencies: { appendFile, stat: fakeStat, chmod: async () => undefined },
     });
 
     logger.debug({ event: 'debug_filtered' });

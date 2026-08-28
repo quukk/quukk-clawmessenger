@@ -1,3 +1,5 @@
+import { join, resolve } from 'node:path';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -112,8 +114,9 @@ describe('resolveBridgeBinary', () => {
   });
 
   it('stream-hashes and returns only the verified fixed binary path', async () => {
+    const runtimeRoot = resolve('fixture/runtime');
     const resolvePackageRoot = vi.fn(async () => ({
-      root: 'D:\\fixture\\runtime',
+      root: runtimeRoot,
       packageVersion: version,
     }));
     const readBinary = vi.fn<BridgeBinaryDependencies['readBinary']>(() =>
@@ -129,7 +132,7 @@ describe('resolveBridgeBinary', () => {
     await expect(
       resolveBridgeBinary(dependencies({ resolvePackageRoot, readFile, readBinary })),
     ).resolves.toEqual({
-      path: 'D:\\fixture\\runtime\\multica.exe',
+      path: join(runtimeRoot, 'multica.exe'),
       packageName: '@quukk/clawmessenger-runtime-win32-x64',
       version,
       sha256: abcSHA256,
@@ -137,7 +140,7 @@ describe('resolveBridgeBinary', () => {
     expect(resolvePackageRoot).toHaveBeenCalledWith(
       '@quukk/clawmessenger-runtime-win32-x64',
     );
-    expect(readFile).toHaveBeenCalledWith('D:\\fixture\\runtime\\manifest.json', 64 << 10);
-    expect(readBinary).toHaveBeenCalledWith('D:\\fixture\\runtime\\multica.exe');
+    expect(readFile).toHaveBeenCalledWith(join(runtimeRoot, 'manifest.json'), 64 << 10);
+    expect(readBinary).toHaveBeenCalledWith(join(runtimeRoot, 'multica.exe'));
   });
 });

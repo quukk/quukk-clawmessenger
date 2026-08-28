@@ -81,10 +81,17 @@
   the Bridge HTTP lifecycle contracts run consistently on Windows and Linux.
 - `.github/workflows/quukk-clawmessenger-runtime.yml`: supplies the GitHub-hosted runner's
   temporary directory to entry-package tests without weakening the package's fail-closed runtime
-  requirement for `TEMP`/`TMP`.
+  requirement for `TEMP`/`TMP`, and prefixes runtime package directories with `./` so npm treats
+  them as local folders rather than GitHub repository shorthands.
 - `packages/quukk-clawmessenger/src/process/service-identity.test.ts`,
   `src/rongcloud/worker-supervisor.test.ts`, `src/router/message-router.test.ts`,
   `src/router/router.integration.test.ts`, and `src/service.test.ts`: use OS-native temporary and
   absolute fixture paths so the same security and lifecycle contracts run on Windows and Linux.
+- `packages/quukk-clawmessenger/scripts/audit-tarball.mjs`: excludes bounded HTTP(S) URL text
+  before applying local developer-path checks while continuing to reject checkout paths outside
+  URLs; its package-artifact tests cover Linux CI paths explicitly.
+- `packages/quukk-clawmessenger/src/go/binary.test.ts`, `src/logging/redact.test.ts`, and
+  `src/process/service-identity.test.ts`: remove host-path assumptions and explicitly mock the
+  platform-dependent filesystem behavior exercised by each contract.
 
 New fork-specific files are listed in this task's commit and do not replace upstream source files.

@@ -258,13 +258,14 @@ function containsCheckoutRoot(value, roots) {
 
 function contentIsSensitive(bytes, checkoutRoots) {
   const value = bytes.toString('latin1');
+  const pathText = comparablePathText(value);
   return (
     /(?:["']?(?:token|appkey|appsecret|bridgesecret|password|enrollmentproof)["']?\s*[:=]\s*["'][^"'\r\n]{8,}["'])/i.test(value)
     || /(?:^|\s)_authToken\s*=\s*\S+/im.test(value)
     || /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(value)
     || /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/.test(value)
-    || /\b[A-Za-z]:[\\/]Users[\\/][^\s"']+/i.test(value)
-    || /(?:\/home\/(?!linuxbrew\/|me\/|user\/|username\/)|\/Users\/(?!me\/|user\/|username\/))[A-Za-z0-9._-]+\//.test(value)
+    || /\b[A-Za-z]:\/Users\/[^\s"']+/i.test(pathText)
+    || /(?:\/home\/(?!linuxbrew\/|me\/|user\/|username\/)|\/Users\/(?!me\/|user\/|username\/))[A-Za-z0-9._-]+\//.test(pathText)
     || /sourceMappingURL\s*=/.test(value)
     || containsCheckoutRoot(bytes.toString('utf8'), checkoutRoots)
   );

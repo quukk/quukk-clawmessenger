@@ -1088,6 +1088,7 @@ describe('QuukkService projections and settings', () => {
 
   it('returns newest 100 ascending activity rows and diagnostics with basenames only', async () => {
     const f = await fixture();
+    const executablePath = join(await temporaryDirectory(), 'secret', 'opencode.exe');
     f.logger.activityRecords.push(...Array.from({ length: 120 }, (_, index) => ({
       id: index + 1,
       time: '2026-08-27T08:00:00.000Z',
@@ -1097,7 +1098,7 @@ describe('QuukkService projections and settings', () => {
       taskId: 'task_1_1',
     })));
     f.store.warnings = ['config_recovery_required', 'D:\\secret\\unsafe'];
-    f.runtime.catalog[0] = { ...f.runtime.catalog[0]!, path: 'D:\\secret\\opencode.exe' };
+    f.runtime.catalog[0] = { ...f.runtime.catalog[0]!, path: executablePath };
     await start(f);
 
     const activity = await f.service.activity(new AbortController().signal);
@@ -1106,9 +1107,9 @@ describe('QuukkService projections and settings', () => {
     expect(activity.events.at(-1)?.id).toBe(120);
     const diagnostics = await f.service.diagnostics(new AbortController().signal);
     const serialized = JSON.stringify(diagnostics);
-    expect(diagnostics.runtimes[0]?.executableName).toBe(basename('D:\\secret\\opencode.exe'));
+    expect(diagnostics.runtimes[0]?.executableName).toBe(basename(executablePath));
     expect(diagnostics.warnings).toEqual(['config_recovery_required']);
-    expect(serialized).not.toContain('D:\\secret');
+    expect(serialized).not.toContain(dirname(executablePath));
     expect(serialized).not.toContain('nodeId');
     expect(serialized).not.toContain('tokenRef');
     expect(diagnostics.logging).toEqual({ dropped: 3, retained: 120 });

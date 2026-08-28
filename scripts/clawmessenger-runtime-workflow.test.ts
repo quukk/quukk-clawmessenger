@@ -232,6 +232,7 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
     expect(build.steps.indexOf(pack)).toBeGreaterThan(build.steps.indexOf(dryRun));
     expect(notices.run).toContain('scripts/verify-go-third-party-notices.mjs');
     expect(dryRun.run).toContain('npm pack --dry-run --json --ignore-scripts');
+    expect(dryRun.run).toContain('"./$package_dir"');
     expect(dryRun.run).toContain(
       'packages/quukk-clawmessenger/scripts/audit-tarball.mjs',
     );

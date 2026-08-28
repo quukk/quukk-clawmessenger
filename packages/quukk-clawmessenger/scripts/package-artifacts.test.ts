@@ -707,10 +707,9 @@ describe('audit-tarball', () => {
       knownCheckoutRoots: [checkout],
     })).rejects.toMatchObject({ code: 'sensitive_content' });
 
-    const urlPath = checkout.replaceAll('\\', '/');
     await writeFile(
       join(fixture.entry, 'dist', 'cli.js'),
-      `docs=https://docs.example.invalid/${urlPath}`,
+      'docs=https://docs.example.invalid/home/runner/work/quukk-clawmessenger/project',
     );
     await fixture.writeReport();
     await expect(auditTarball({

@@ -204,7 +204,7 @@ jobs:
           package_dir="packages/${{ matrix.directory }}"
           report_dir=".artifacts/${{ matrix.platform }}-${{ matrix.arch }}"
           mkdir -p "$report_dir"
-          npm pack --dry-run --json --ignore-scripts "$package_dir" > "$report_dir/npm-pack.json"
+          npm pack --dry-run --json --ignore-scripts "./$package_dir" > "$report_dir/npm-pack.json"
           node packages/quukk-clawmessenger/scripts/audit-tarball.mjs "$report_dir/npm-pack.json" "$package_dir"
       - name: Pack runtime
         shell: bash
