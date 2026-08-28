@@ -22,6 +22,10 @@ import { verifyRuntimePackage } from './verify-clawmessenger-runtime.mjs';
 
 const VERSION = '0.1.0-beta.1';
 const SOURCE_COMMIT = 'a'.repeat(40);
+const MODULES = [
+  'github.com/example/common@v1.2.3',
+  'github.com/example/windows-only@v4.5.6',
+];
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const temporaryDirectories: string[] = [];
 const PLATFORM_LABELS: Record<string, string> = {
@@ -36,9 +40,9 @@ const EXPECTED_SOURCE_DOCUMENT = [
   '',
   '- Fork source: https://github.com/quukk/quukk-clawmessenger',
   '- Upstream source: https://github.com/multica-ai/multica',
-  '- Exact source commit, Go toolchain version, binary filename, and SHA-256: `manifest.json`',
+  '- Exact source commit, Go toolchain version, linked Go modules, binary filename, and SHA-256: `manifest.json`',
   '- Fork modifications: `MODIFICATIONS.md`',
-  '- License and attribution: `LICENSE` and `NOTICE`',
+  '- License and attribution: `LICENSE`, `NOTICE`, and `GO_THIRD_PARTY_NOTICES.md`',
   '',
 ].join('\n');
 
@@ -47,6 +51,10 @@ async function fixtureRepository(): Promise<string> {
   temporaryDirectories.push(root);
   await mkdir(join(root, 'server', 'cmd', 'multica'), { recursive: true });
   await mkdir(join(root, 'packages', 'quukk-clawmessenger'), { recursive: true });
+  await writeFile(
+    join(root, 'GO_THIRD_PARTY_NOTICES.md'),
+    `# Go third-party notices\n\n- Go standard library/runtime \`go1.26.6\`\n\n${MODULES.map((module) => `## \`${module}\`\n\nLicense text.\n`).join('\n')}`,
+  );
   await writeFile(
     join(root, 'packages', 'quukk-clawmessenger', 'package.json'),
     `${JSON.stringify({ name: 'quukk-clawmessenger', version: VERSION }, null, 2)}\n`,
@@ -82,6 +90,7 @@ async function validRuntimePackage(
     'LICENSE',
     'NOTICE',
     'MODIFICATIONS.md',
+    'GO_THIRD_PARTY_NOTICES.md',
     'SOURCE.md',
   ];
   await writeFile(
@@ -111,8 +120,10 @@ async function validRuntimePackage(
       2,
     )}\n`,
   );
-  for (const name of ['LICENSE', 'NOTICE', 'MODIFICATIONS.md']) {
-    const bytes = `root-${name}\n`;
+  for (const name of ['LICENSE', 'NOTICE', 'MODIFICATIONS.md', 'GO_THIRD_PARTY_NOTICES.md']) {
+    const bytes = name === 'GO_THIRD_PARTY_NOTICES.md'
+      ? await readFile(join(root, name))
+      : `root-${name}\n`;
     await writeFile(join(root, name), bytes);
     await writeFile(join(packageDirectory, name), bytes);
   }
@@ -128,6 +139,7 @@ async function validRuntimePackage(
         version: VERSION,
         goVersion: 'go1.26.6',
         sourceCommit: SOURCE_COMMIT,
+        modules: MODULES,
         sha256: '24b177832d55e5d95f2aad204a2d6575ebdf1deca301df7df25ce55cf90f5530',
         binary: target.binary,
       },
@@ -241,7 +253,7 @@ describe('buildRuntime', () => {
     }> = [];
     const execute = vi.fn<RuntimeCommandExecutor>(async (file, args, options) => {
       calls.push({ file, args: [...args], options });
-      if (file === 'go' && args[0] === 'version') {
+      if (file === 'go' && args.length === 1 && args[0] === 'version') {
         return { stdout: 'go version go1.26.6 windows/amd64\n', stderr: '' };
       }
       if (file === 'git' && args[0] === 'rev-parse') {
@@ -254,6 +266,20 @@ describe('buildRuntime', () => {
         const outputIndex = args.indexOf('-o');
         await writeFile(args[outputIndex + 1], 'tiny-runtime');
         return { stdout: '', stderr: '' };
+      }
+      if (file === 'go' && args[0] === 'version' && args[1] === '-m') {
+        return {
+          stdout: [
+            args[2],
+            '\tgo\tgo1.26.6',
+            ...MODULES.map((module) => {
+              const separator = module.lastIndexOf('@');
+              return `\tdep\t${module.slice(0, separator)}\t${module.slice(separator + 1)}\th1:test`;
+            }),
+            '',
+          ].join('\n'),
+          stderr: '',
+        };
       }
       throw new Error(`unexpected command: ${file} ${args.join(' ')}`);
     });
@@ -298,6 +324,7 @@ describe('buildRuntime', () => {
         version: VERSION,
         goVersion: 'go1.26.6',
         sourceCommit: SOURCE_COMMIT,
+        modules: MODULES,
         sha256: '24b177832d55e5d95f2aad204a2d6575ebdf1deca301df7df25ce55cf90f5530',
         binary: 'multica.exe',
       },
@@ -467,6 +494,7 @@ describe('verifyRuntimePackage', () => {
       sha256: '24b177832d55e5d95f2aad204a2d6575ebdf1deca301df7df25ce55cf90f5530',
       sourceCommit: SOURCE_COMMIT,
       goVersion: 'go1.26.6',
+      modules: MODULES,
     });
   });
 
@@ -641,6 +669,28 @@ describe('verifyRuntimePackage', () => {
     ).rejects.toThrow(/source attribution/);
   });
 
+  it('rejects a linked Go module that is absent from the packaged notices', async () => {
+    const { root, packageDirectory } = await validRuntimePackage();
+    const incomplete = '# Go third-party notices\n\n- Go standard library/runtime `go1.26.6`\n';
+    await writeFile(join(root, 'GO_THIRD_PARTY_NOTICES.md'), incomplete);
+    await writeFile(join(packageDirectory, 'GO_THIRD_PARTY_NOTICES.md'), incomplete);
+
+    await expect(
+      verifyRuntimePackage(packageDirectory, { repoRoot: root }),
+    ).rejects.toThrow(/Go module.*third-party notices/);
+  });
+
+  it('rejects notices that omit the exact Go runtime version', async () => {
+    const { root, packageDirectory } = await validRuntimePackage();
+    const modulesOnly = MODULES.map((module) => `- \`${module}\``).join('\n');
+    await writeFile(join(root, 'GO_THIRD_PARTY_NOTICES.md'), modulesOnly);
+    await writeFile(join(packageDirectory, 'GO_THIRD_PARTY_NOTICES.md'), modulesOnly);
+
+    await expect(
+      verifyRuntimePackage(packageDirectory, { repoRoot: root }),
+    ).rejects.toThrow(/Go runtime.*third-party notices/);
+  });
+
   it('requires the exact canonical source document instead of matching attribution substrings', async () => {
     const { root, packageDirectory } = await validRuntimePackage();
     await writeFile(
@@ -740,11 +790,12 @@ describe('published runtime package metadata', () => {
           'LICENSE',
           'NOTICE',
           'MODIFICATIONS.md',
+          'GO_THIRD_PARTY_NOTICES.md',
           'SOURCE.md',
         ],
       });
       expect(packageJson.scripts, target.packageName).toBeUndefined();
-      for (const legalFile of ['LICENSE', 'NOTICE', 'MODIFICATIONS.md']) {
+      for (const legalFile of ['LICENSE', 'NOTICE', 'MODIFICATIONS.md', 'GO_THIRD_PARTY_NOTICES.md']) {
         await expect(readFile(join(packageDirectory, legalFile))).resolves.toEqual(
           await readFile(join(REPO_ROOT, legalFile)),
         );

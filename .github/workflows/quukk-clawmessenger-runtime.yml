@@ -50,6 +50,7 @@ jobs:
       - run: >-
           pnpm exec vitest run
           scripts/clawmessenger-runtime.test.ts
+          scripts/go-third-party-notices.test.ts
           scripts/clawmessenger-runtime-workflow.test.ts
 
   build-entry:
@@ -190,12 +191,24 @@ jobs:
             echo "::error::runtime rebuild digest changed"
             exit 1
           fi
+      - name: Verify Go third-party notices
+        run: >-
+          node scripts/verify-go-third-party-notices.mjs
+          packages/${{ matrix.directory }}
+      - name: Audit runtime tarball
+        shell: bash
+        run: |
+          package_dir="packages/${{ matrix.directory }}"
+          report_dir=".artifacts/${{ matrix.platform }}-${{ matrix.arch }}"
+          mkdir -p "$report_dir"
+          npm pack --dry-run --json --ignore-scripts "$package_dir" > "$report_dir/npm-pack.json"
+          node packages/quukk-clawmessenger/scripts/audit-tarball.mjs "$report_dir/npm-pack.json" "$package_dir"
       - name: Pack runtime
         shell: bash
         run: |
           artifact_dir=".artifacts/${{ matrix.platform }}-${{ matrix.arch }}"
           mkdir -p "$artifact_dir"
-          npm pack "./packages/${{ matrix.directory }}" --pack-destination "$artifact_dir"
+          npm pack --ignore-scripts "./packages/${{ matrix.directory }}" --pack-destination "$artifact_dir"
       - name: Attest package provenance
         if: github.event_name != 'pull_request'
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2

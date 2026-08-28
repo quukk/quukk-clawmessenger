@@ -52,10 +52,11 @@
   passwords, node/MAC identity, bindings, sessions, or logs. Validation and atomic-write failures
   leave the legacy bytes and destination config unchanged.
 - `packages/quukk-clawmessenger/scripts/prepare-package.mjs` copies the exact four root legal
-  files into the entry package and the exact root `LICENSE`, `NOTICE`, and `MODIFICATIONS.md`
-  into either zero or the complete six binary-only platform staging packages while rejecting
-  partial matrices, traversal, and symbolic-link/junction components. Platform source
-  attribution remains the build-generated `SOURCE.md` from the reproducible runtime task.
+  files into the entry package and the exact root `LICENSE`, `NOTICE`, `MODIFICATIONS.md`, and
+  `GO_THIRD_PARTY_NOTICES.md` into either zero or the complete six binary-only platform staging
+  packages while rejecting partial matrices, traversal, and symbolic-link/junction components.
+  Platform manifests record the exact linked Go modules and the tarball audit requires every
+  module to appear in the bundled notice generated from checksum-verified module sources.
 - `packages/quukk-clawmessenger/scripts/audit-tarball.mjs` consumes bounded `npm pack --json`
   reports and strictly checks legal files, README, npm/platform manifests, bin, compiled worker,
   Bridge UI assets, source-map absence, path containment, symlinks, credential-like literals, and
@@ -71,8 +72,9 @@
 - `pnpm-lock.yaml`: records the fork workspaces and the focused Bridge UI dependencies used by the local package build.
 - `README.md`: adds the Quukk ClawMessenger derivative entry point while retaining Multica as the
   primary product and attribution.
-- `MODIFICATIONS.md` and `THIRD_PARTY_NOTICES.md`: record migration/package hardening and retain
-  the unresolved RongCloud licensing metadata discrepancy as a publication gate.
+- `MODIFICATIONS.md`, `THIRD_PARTY_NOTICES.md`, and `GO_THIRD_PARTY_NOTICES.md`: record
+  migration/package hardening, retain the unresolved RongCloud licensing metadata discrepancy as
+  a publication gate, and carry the exact notices for Go modules linked into runtime binaries.
 - `server/pkg/agent/launch.go`: bounds synchronous probe output while preserving process ownership and timeout errors.
 - `server/pkg/agent/agent_test.go`: covers oversized version output and timeout precedence without executing an installed agent CLI.
 

@@ -198,12 +198,13 @@ The local package cannot make an incompatible or undeployed server safe.
 ## Packaging checks for maintainers
 
 From a source checkout, copy the exact four root legal files into the entry package and the exact
-root `LICENSE`, `NOTICE`, and `MODIFICATIONS.md` into each binary-only platform staging package.
-Build the Node package and Bridge UI, generate `npm pack --dry-run --json` output, then pass that
-report and package directory to `scripts/audit-tarball.mjs`. Each platform package also requires
-its generated `SOURCE.md`. The audit rejects missing legal/UI/worker/manifest files, unexpected
-files, source maps, symlinks, traversal, credential-like literals, and developer-specific
-absolute paths. It reports only fixed error codes.
+root `LICENSE`, `NOTICE`, `MODIFICATIONS.md`, and `GO_THIRD_PARTY_NOTICES.md` into each
+binary-only platform staging package. Build the Node package and Bridge UI, generate
+`npm pack --dry-run --json` output, then pass that report and package directory to
+`scripts/audit-tarball.mjs`. Each platform package also requires its generated `SOURCE.md` and a
+manifest containing the exact linked Go module list. The audit rejects missing legal/module/UI/
+worker/manifest files, unexpected files, source maps, symlinks, traversal, credential-like
+literals, and developer-specific absolute paths. It reports only fixed error codes.
 
 Publishing remains a separate protected action. Do not publish until the server, six-platform
 matrix, clean-install smoke tests, npm ownership/2FA, and legal review gates all pass.
@@ -213,6 +214,8 @@ matrix, clean-install smoke tests, npm ownership/2FA, and legal review gates all
 This derivative is distributed under the complete [Multica License](LICENSE), including its
 additional conditions. The package also carries the unchanged Multica [NOTICE](NOTICE), the fork
 [modification record](MODIFICATIONS.md), and [third-party notices](THIRD_PARTY_NOTICES.md).
+Platform runtime packages additionally carry the checksum-traced Go dependency notices in
+`GO_THIRD_PARTY_NOTICES.md`.
 
 The Multica License restricts hosted service use for third parties and commercial embedding or
 distribution unless the producer grants the required commercial license. A branding waiver is a

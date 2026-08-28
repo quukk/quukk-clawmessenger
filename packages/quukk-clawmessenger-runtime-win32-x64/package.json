@@ -16,6 +16,7 @@
     "LICENSE",
     "NOTICE",
     "MODIFICATIONS.md",
+    "GO_THIRD_PARTY_NOTICES.md",
     "SOURCE.md"
   ],
   "os": ["win32"],

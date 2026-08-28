@@ -8,5 +8,9 @@ packages/quukk-clawmessenger/src/protocol/fixtures/discussion-wire-cross-runtime
 # Runtime provenance is generated and verified byte-for-byte on every platform.
 packages/quukk-clawmessenger-runtime-*/SOURCE.md text eol=lf
 
+# Vendored legal text must preserve upstream whitespace byte-for-byte.
+GO_THIRD_PARTY_NOTICES.md text eol=lf whitespace=-blank-at-eol
+packages/quukk-clawmessenger-runtime-*/GO_THIRD_PARTY_NOTICES.md text eol=lf whitespace=-blank-at-eol
+
 # Default behavior
 * text=auto

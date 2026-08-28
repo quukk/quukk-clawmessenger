@@ -10,7 +10,7 @@ const PACK_TOTAL_MAX_BYTES = 512 * 1024 * 1024;
 const PACK_FILE_MAX_COUNT = 4096;
 
 const LEGAL_FILES = ['LICENSE', 'NOTICE', 'MODIFICATIONS.md', 'THIRD_PARTY_NOTICES.md'];
-const PLATFORM_LEGAL_FILES = ['LICENSE', 'NOTICE', 'MODIFICATIONS.md'];
+const PLATFORM_LEGAL_FILES = ['LICENSE', 'NOTICE', 'MODIFICATIONS.md', 'GO_THIRD_PARTY_NOTICES.md'];
 const SEMVER = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const GO_RELEASE = /^go1\.[1-9]\d*(?:\.(?:0|[1-9]\d*))?(?:(?:beta|rc)[1-9]\d*)?$/;
 const ENTRY_DEPENDENCIES = Object.freeze({
@@ -264,7 +264,7 @@ function contentIsSensitive(bytes, checkoutRoots) {
     || /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(value)
     || /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/.test(value)
     || /\b[A-Za-z]:[\\/]Users[\\/][^\s"']+/i.test(value)
-    || /\/(?:home|Users)\/(?!me\/|user\/|username\/)[A-Za-z0-9._-]+\//.test(value)
+    || /(?:\/home\/(?!linuxbrew\/|me\/|user\/|username\/)|\/Users\/(?!me\/|user\/|username\/))[A-Za-z0-9._-]+\//.test(value)
     || /sourceMappingURL\s*=/.test(value)
     || containsCheckoutRoot(bytes.toString('utf8'), checkoutRoots)
   );
@@ -376,6 +376,7 @@ async function auditReport(value, packageDirectory, knownCheckoutRoots) {
     }
 
     let platformBinaryBytes;
+    let platformGoNotices;
     for (const file of listed) {
       if (file.path.endsWith('.map')) fail('source_map_rejected');
       const allowed = entry
@@ -390,6 +391,9 @@ async function auditReport(value, packageDirectory, knownCheckoutRoots) {
       const bytes = await readFile(target);
       if (contentIsSensitive(bytes, knownCheckoutRoots)) fail('sensitive_content');
       if (!entry && file.path === platformBinary) platformBinaryBytes = bytes;
+      if (!entry && file.path === 'GO_THIRD_PARTY_NOTICES.md') {
+        platformGoNotices = bytes.toString('utf8');
+      }
       auditedFiles += 1;
     }
 
@@ -462,12 +466,20 @@ async function auditReport(value, packageDirectory, knownCheckoutRoots) {
         || Array.isArray(manifest)
         || !exactStringArray(
           manifestKeys,
-          ['binary', 'goVersion', 'sha256', 'sourceCommit', 'version'],
+          ['binary', 'goVersion', 'modules', 'sha256', 'sourceCommit', 'version'],
         )
         || manifest.version !== record.version
         || manifest.binary !== platformBinary
         || !GO_RELEASE.test(manifest.goVersion)
         || !/^[0-9a-f]{40}$/.test(manifest.sourceCommit)
+        || !Array.isArray(manifest.modules)
+        || manifest.modules.length === 0
+        || manifest.modules.length > 256
+        || manifest.modules.some((module) => typeof module !== 'string' || !/^[^\s@]+@v[^\s@]+$/.test(module))
+        || manifest.modules.some((module, index) => index > 0 && module <= manifest.modules[index - 1])
+        || typeof platformGoNotices !== 'string'
+        || !platformGoNotices.includes(`Go standard library/runtime \`${manifest.goVersion}\``)
+        || manifest.modules.some((module) => !platformGoNotices.includes(`\`${module}\``))
         || !/^[0-9a-f]{64}$/.test(manifest.sha256)
         || platformBinaryBytes === undefined
         || createHash('sha256').update(platformBinaryBytes).digest('hex') !== manifest.sha256

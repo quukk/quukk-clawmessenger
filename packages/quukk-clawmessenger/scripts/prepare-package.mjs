@@ -21,6 +21,7 @@ export const PLATFORM_LEGAL_FILES = Object.freeze([
   'LICENSE',
   'NOTICE',
   'MODIFICATIONS.md',
+  'GO_THIRD_PARTY_NOTICES.md',
 ]);
 
 export const PLATFORM_PACKAGE_DIRECTORIES = Object.freeze([
@@ -128,7 +129,7 @@ export async function preparePackage(options = {}) {
     }
   }
   const legalBytes = new Map();
-  for (const name of LEGAL_FILES) {
+  for (const name of new Set([...LEGAL_FILES, ...PLATFORM_LEGAL_FILES])) {
     const source = join(repositoryRoot, name);
     await inspectContained(repositoryRoot, source, 'file');
     legalBytes.set(name, await readFile(source));

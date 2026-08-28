@@ -43,9 +43,9 @@ export const RUNTIME_SOURCE_DOCUMENT = [
   '',
   '- Fork source: https://github.com/quukk/quukk-clawmessenger',
   '- Upstream source: https://github.com/multica-ai/multica',
-  '- Exact source commit, Go toolchain version, binary filename, and SHA-256: `manifest.json`',
+  '- Exact source commit, Go toolchain version, linked Go modules, binary filename, and SHA-256: `manifest.json`',
   '- Fork modifications: `MODIFICATIONS.md`',
-  '- License and attribution: `LICENSE` and `NOTICE`',
+  '- License and attribution: `LICENSE`, `NOTICE`, and `GO_THIRD_PARTY_NOTICES.md`',
   '',
 ].join('\n');
 
@@ -195,6 +195,20 @@ function parseGoVersion(output) {
   return match[1];
 }
 
+/** @param {string} output */
+function parseGoModules(output) {
+  const modules = output
+    .split(/\r?\n/)
+    .map((line) => /^\s*dep\s+([^\s]+)\s+([^\s]+)(?:\s|$)/.exec(line))
+    .filter(Boolean)
+    .map((match) => `${match[1]}@${match[2]}`)
+    .sort();
+  if (modules.length === 0 || new Set(modules).size !== modules.length) {
+    throw new Error('runtime binary has invalid Go module build information');
+  }
+  return modules;
+}
+
 /** @param {string} value */
 function normalizeBuildDate(value) {
   const date = new Date(value);
@@ -312,10 +326,13 @@ export async function buildRuntime(options) {
   );
   await chmod(binaryPath, 0o755);
 
+  const moduleResult = await execute('go', ['version', '-m', binaryPath], commandOptions);
+
   const manifest = {
     version: entryPackage.version,
     goVersion,
     sourceCommit,
+    modules: parseGoModules(moduleResult.stdout),
     sha256: await sha256File(binaryPath),
     binary: target.binary,
   };

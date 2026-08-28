@@ -46,7 +46,7 @@ async function write(path: string, content: string | Buffer): Promise<void> {
 }
 
 async function makeLegalRoot(root: string): Promise<void> {
-  for (const [index, name] of LEGAL_FILES.entries()) {
+  for (const [index, name] of [...new Set([...LEGAL_FILES, ...PLATFORM_LEGAL_FILES])].entries()) {
     await write(join(root, name), Buffer.from(`root-${index}-${name}\r\n\0exact`, 'utf8'));
   }
 }
@@ -100,7 +100,7 @@ describe('prepare-package', () => {
     }
   });
 
-  it('copies only the three platform legal files into the complete six-package staging matrix', async () => {
+  it('copies only the four platform legal files into the complete six-package staging matrix', async () => {
     const root = await temporaryDirectory();
     const packages = join(root, 'packages');
     await mkdir(join(packages, 'quukk-clawmessenger'), { recursive: true });
@@ -108,6 +108,13 @@ describe('prepare-package', () => {
       await mkdir(join(packages, name), { recursive: true });
     }
     await makeLegalRoot(root);
+
+    expect(PLATFORM_LEGAL_FILES).toEqual([
+      'LICENSE',
+      'NOTICE',
+      'MODIFICATIONS.md',
+      'GO_THIRD_PARTY_NOTICES.md',
+    ]);
 
     const result = await preparePackage({ repositoryRoot: root });
 
@@ -238,8 +245,10 @@ const PLATFORM_FILES = [
   'LICENSE',
   'NOTICE',
   'MODIFICATIONS.md',
+  'GO_THIRD_PARTY_NOTICES.md',
   'SOURCE.md',
 ] as const;
+const PLATFORM_MODULES = ['github.com/example/runtime@v1.2.3'] as const;
 
 const ENTRY_DEPENDENCIES = {
   '@rongcloud/engine': '5.36.6',
@@ -369,11 +378,14 @@ async function platformFixture(): Promise<EntryFixture> {
             version,
             goVersion: 'go1.26.6',
             sourceCommit: 'a'.repeat(40),
+            modules: PLATFORM_MODULES,
             sha256: createHash('sha256').update(binary).digest('hex'),
             binary: 'multica.exe',
           })
         : path === 'multica.exe'
           ? binary
+        : path === 'GO_THIRD_PARTY_NOTICES.md'
+          ? `# Go Third-Party Notices\n\n- Go standard library/runtime \`go1.26.6\`\n- \`${PLATFORM_MODULES[0]}\`\n`
         : `safe platform fixture for ${path}\n`;
     await write(join(entry, path), content);
   }
@@ -499,7 +511,7 @@ describe('audit-tarball', () => {
     })).rejects.toMatchObject({ code: 'manifest_invalid' });
   });
 
-  it('accepts the exact seven-file scoped platform package contract', async () => {
+  it('accepts the exact eight-file scoped platform package contract', async () => {
     const fixture = await platformFixture();
 
     await expect(auditTarball({
@@ -541,6 +553,7 @@ describe('audit-tarball', () => {
 
   it.each([
     [{ goVersion: 'devel go1.27-deadbeef' }, 'manifest_invalid'],
+    [{ modules: [] }, 'manifest_invalid'],
     [{ sha256: 'b'.repeat(64) }, 'manifest_invalid'],
     [{ unexpected: true }, 'manifest_invalid'],
   ])('rejects an invalid runtime manifest override %j', async (override, code) => {
@@ -553,6 +566,47 @@ describe('audit-tarball', () => {
       packJsonPath: fixture.report,
       packageDirectory: fixture.entry,
     })).rejects.toMatchObject({ code });
+  });
+
+  it('rejects a platform notice that omits a linked Go module', async () => {
+    const fixture = await platformFixture();
+    await writeFile(join(fixture.entry, 'GO_THIRD_PARTY_NOTICES.md'), '# Go Third-Party Notices\n');
+    await fixture.writeReport();
+
+    await expect(auditTarball({
+      packJsonPath: fixture.report,
+      packageDirectory: fixture.entry,
+    })).rejects.toMatchObject({ code: 'manifest_invalid' });
+  });
+
+  it('rejects a platform notice that omits the exact Go runtime version', async () => {
+    const fixture = await platformFixture();
+    await writeFile(
+      join(fixture.entry, 'GO_THIRD_PARTY_NOTICES.md'),
+      `# Go Third-Party Notices\n\n- \`${PLATFORM_MODULES[0]}\`\n`,
+    );
+    await fixture.writeReport();
+
+    await expect(auditTarball({
+      packJsonPath: fixture.report,
+      packageDirectory: fixture.entry,
+    })).rejects.toMatchObject({ code: 'manifest_invalid' });
+  });
+
+  it('allows the fixed Linuxbrew installation prefix embedded in a runtime binary', async () => {
+    const fixture = await platformFixture();
+    const binary = Buffer.from('runtime prefix /home/linuxbrew/.linuxbrew/bin/brew\n');
+    await writeFile(join(fixture.entry, 'multica.exe'), binary);
+    const manifestPath = join(fixture.entry, 'manifest.json');
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
+    manifest.sha256 = createHash('sha256').update(binary).digest('hex');
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    await fixture.writeReport();
+
+    await expect(auditTarball({
+      packJsonPath: fixture.report,
+      packageDirectory: fixture.entry,
+    })).resolves.toEqual({ packageCount: 1, fileCount: PLATFORM_FILES.length });
   });
 
   it.each([
@@ -628,6 +682,7 @@ describe('audit-tarball', () => {
     'const token = "super-secret-value-never-print";',
     'const cwd = "D:\\Users\\developer\\private-project";',
     'const cwd = "/home/developer/private-project";',
+    'const cwd = "/Users/linuxbrew/private-project";',
     '//# sourceMappingURL=hidden-artifact',
   ])('rejects sensitive or developer-specific generated content without echoing it', async (content) => {
     const fixture = await entryFixture();

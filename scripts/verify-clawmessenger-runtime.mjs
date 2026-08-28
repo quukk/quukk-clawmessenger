@@ -18,7 +18,7 @@ const SHA256 = /^[0-9a-f]{64}$/;
 const JSON_LIMIT = 64 << 10;
 const FORK_REPOSITORY = 'https://github.com/quukk/quukk-clawmessenger';
 const FORK_REPOSITORY_GIT = 'git+https://github.com/quukk/quukk-clawmessenger.git';
-const LEGAL_FILES = ['LICENSE', 'NOTICE', 'MODIFICATIONS.md'];
+const LEGAL_FILES = ['LICENSE', 'NOTICE', 'MODIFICATIONS.md', 'GO_THIRD_PARTY_NOTICES.md'];
 const PLATFORM_PACKAGE = /^quukk-clawmessenger-runtime-(win32|darwin|linux)-(x64|arm64)$/;
 const PLATFORM_LABELS = Object.freeze({
   win32: 'Windows',
@@ -205,7 +205,7 @@ export async function verifyRuntimePackage(requestedPackage, options = {}) {
     join(packageDirectory, 'manifest.json'),
     'runtime manifest',
   );
-  const manifestFields = ['binary', 'goVersion', 'sha256', 'sourceCommit', 'version'];
+  const manifestFields = ['binary', 'goVersion', 'modules', 'sha256', 'sourceCommit', 'version'];
   if (
     Object.keys(manifest).sort().join('\0') !== manifestFields.sort().join('\0')
   ) {
@@ -226,12 +226,30 @@ export async function verifyRuntimePackage(requestedPackage, options = {}) {
   if (typeof manifest.sha256 !== 'string' || !SHA256.test(manifest.sha256)) {
     throw new Error('runtime manifest SHA-256 is invalid');
   }
+  if (
+    !Array.isArray(manifest.modules) ||
+    manifest.modules.length === 0 ||
+    manifest.modules.length > 256 ||
+    manifest.modules.some((module) => typeof module !== 'string' || !/^[^\s@]+@v[^\s@]+$/.test(module)) ||
+    manifest.modules.some((module, index) => index > 0 && module <= manifest.modules[index - 1])
+  ) {
+    throw new Error('runtime manifest Go modules are invalid');
+  }
 
   for (const legalFile of LEGAL_FILES) {
     const rootBytes = await readFile(join(root, legalFile));
     const packageBytes = await readFile(join(packageDirectory, legalFile));
     if (!rootBytes.equals(packageBytes)) {
       throw new Error(`packaged legal file differs from repository root: ${legalFile}`);
+    }
+  }
+  const goNotices = await readFile(join(packageDirectory, 'GO_THIRD_PARTY_NOTICES.md'), 'utf8');
+  if (!goNotices.includes(`Go standard library/runtime \`${manifest.goVersion}\``)) {
+    throw new Error('runtime Go runtime is missing from third-party notices');
+  }
+  for (const module of manifest.modules) {
+    if (!goNotices.includes(`\`${module}\``)) {
+      throw new Error(`runtime Go module is missing from third-party notices: ${module}`);
     }
   }
   const source = await readFile(join(packageDirectory, 'SOURCE.md'));
@@ -251,6 +269,7 @@ export async function verifyRuntimePackage(requestedPackage, options = {}) {
     sha256: digest,
     sourceCommit: manifest.sourceCommit,
     goVersion: manifest.goVersion,
+    modules: manifest.modules,
   };
 }
 

@@ -116,6 +116,12 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
     expect(test.run).toContain(
       "go test -count=1 -run '^(TestRuntimeAccessGates|TestClaimTask)' ./internal/service",
     );
+    const runtimeTests = contracts.steps.find((step) =>
+      step.run?.includes('scripts/clawmessenger-runtime.test.ts'),
+    );
+    expect(runtimeTests, 'missing runtime script tests').toBeDefined();
+    expect(runtimeTests?.run).toContain('scripts/go-third-party-notices.test.ts');
+    expect(runtimeTests?.run).toContain('scripts/clawmessenger-runtime-workflow.test.ts');
   });
 
   it('builds and attests the entry package after the Bridge UI and TypeScript builds', async () => {
@@ -190,6 +196,10 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
   it('keeps all six runtime builds reproducible, attested, and credential-free', async () => {
     const workflow = await loadWorkflow();
     const build = requiredJob(workflow, 'build-runtime');
+    const reproducible = requiredStep(build, 'Verify reproducible rebuild');
+    const notices = requiredStep(build, 'Verify Go third-party notices');
+    const dryRun = requiredStep(build, 'Audit runtime tarball');
+    const pack = requiredStep(build, 'Pack runtime');
     expect(build.env).toEqual({
       CGO_ENABLED: '0',
       GOENV: 'off',
@@ -211,7 +221,18 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
     expect(commands).toContain('scripts/verify-clawmessenger-runtime.mjs');
     expect(commands).toContain('first_sha256');
     expect(commands).toContain('second_sha256');
-    expect(commands).toContain('npm pack "./packages/');
+    expect(build.steps.indexOf(notices)).toBeGreaterThan(
+      build.steps.indexOf(reproducible),
+    );
+    expect(build.steps.indexOf(dryRun)).toBeGreaterThan(build.steps.indexOf(notices));
+    expect(build.steps.indexOf(pack)).toBeGreaterThan(build.steps.indexOf(dryRun));
+    expect(notices.run).toContain('scripts/verify-go-third-party-notices.mjs');
+    expect(dryRun.run).toContain('npm pack --dry-run --json --ignore-scripts');
+    expect(dryRun.run).toContain(
+      'packages/quukk-clawmessenger/scripts/audit-tarball.mjs',
+    );
+    expect(pack.run).toContain('npm pack --ignore-scripts');
+    expect(pack.run).not.toContain('--dry-run');
     expect(actions).toContain(
       'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
     );
