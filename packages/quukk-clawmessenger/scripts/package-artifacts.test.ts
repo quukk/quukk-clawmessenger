@@ -12,6 +12,7 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
@@ -26,6 +27,7 @@ import {
 } from './prepare-package.mjs';
 
 const execute = promisify(execFile);
+const require = createRequire(import.meta.url);
 const temporaryDirectories: string[] = [];
 
 async function temporaryDirectory(): Promise<string> {
@@ -82,6 +84,41 @@ describe('publish lifecycle', () => {
     expect(packageJson.homepage).toBe(
       'https://github.com/quukk/quukk-clawmessenger/tree/main/packages/quukk-clawmessenger#readme',
     );
+  });
+
+  it('uses the audited matching-license RongCloud release at the package boundary', async () => {
+    const packageJson = JSON.parse(
+      await readFile(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'),
+    ) as { dependencies?: Record<string, string> };
+    const expectedVersion = '5.38.0';
+    const expectedLicenseHash = 'dd806cb0fd9a09522def7af9003be39e21b4586a650a74076783b17eea205339';
+
+    expect(packageJson.dependencies).toMatchObject({
+      '@rongcloud/engine': expectedVersion,
+      '@rongcloud/imlib-next': expectedVersion,
+    });
+    for (const name of ['@rongcloud/engine', '@rongcloud/imlib-next'] as const) {
+      const root = dirname(require.resolve(name));
+      const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8')) as {
+        license?: string;
+        name?: string;
+        peerDependencies?: Record<string, string>;
+        version?: string;
+      };
+      const licenseHash = createHash('sha256')
+        .update(await readFile(join(root, 'LICENSE')))
+        .digest('hex');
+
+      expect(manifest).toMatchObject({
+        name,
+        version: expectedVersion,
+        license: 'SEE LICENSE IN LICENSE',
+      });
+      expect(licenseHash).toBe(expectedLicenseHash);
+      if (name === '@rongcloud/imlib-next') {
+        expect(manifest.peerDependencies).toEqual({ '@rongcloud/engine': `=${expectedVersion}` });
+      }
+    }
   });
 });
 
@@ -251,8 +288,8 @@ const PLATFORM_FILES = [
 const PLATFORM_MODULES = ['github.com/example/runtime@v1.2.3'] as const;
 
 const ENTRY_DEPENDENCIES = {
-  '@rongcloud/engine': '5.36.6',
-  '@rongcloud/imlib-next': '5.36.6',
+  '@rongcloud/engine': '5.38.0',
+  '@rongcloud/imlib-next': '5.38.0',
   'fake-indexeddb': '6.2.5',
   jsdom: '29.0.1',
   ws: '8.20.0',

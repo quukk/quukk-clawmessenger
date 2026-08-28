@@ -548,14 +548,15 @@ SOFTWARE.
 
 ## RongCloud JavaScript SDK
 
-This product includes `@rongcloud/imlib-next` version `5.36.6` and its exact peer `@rongcloud/engine` version `5.36.6`.
+This product includes `@rongcloud/imlib-next` version `5.38.0` and its exact peer `@rongcloud/engine` version `5.38.0`.
 
 - Source packages: https://www.npmjs.com/package/@rongcloud/imlib-next and https://www.npmjs.com/package/@rongcloud/engine
 - RongCloud documentation: https://docs.rongcloud.io/
-- `@rongcloud/imlib-next@5.36.6` integrity: `sha512-pxDUC5CXhFLMrWLhhq3Hj1L+lHTmuBeGiVycV5yFVmh4Y/9N0SQ2GO7bXw5UZN4OdUpKRJa8jFHeLvD/ZnFt5w==`
-- `@rongcloud/engine@5.36.6` integrity: `sha512-iG78XP6zFx1Olygw3xtmtYJ8h2uNH51Sqxs+6Ir07nH49pZH2nsQ762kPYsgWs7iDMTde+WBQqNc1scfj7xTJg==`
+- `@rongcloud/imlib-next@5.38.0` integrity: `sha512-kxsgavtsHlIL4QyLVok/1b+fGARtUfiTGZsL46i386Lq0SM8XtFbeAVyKGo89YRh3dx7uSoOQrSbYNBnYs0jig==`
+- `@rongcloud/engine@5.38.0` integrity: `sha512-1ghHJuMtaS+awkmTD+eCRQC8vo3TATu605UWXfL+eqS2rd+iYEoNib7572WoF4BjsnKDvFYwZpeoCB91uRs6Fw==`
+- Embedded `LICENSE` SHA-256 (identical in both tarballs): `dd806cb0fd9a09522def7af9003be39e21b4586a650a74076783b17eea205339`
 
-The npm registry metadata for both packages declares `LGPL 2.1`, while the `LICENSE` file embedded in each tarball contains the identical permission notice reproduced verbatim below. This discrepancy is unresolved. It must be reviewed at the Task 14 legal gate, and again at the release legal gate, and is not represented here as a resolved licensing conclusion. Reproducing the embedded notice below does not assert that it overrides the registry metadata, determine which terms govern, or grant additional rights. Publication remains blocked until an authoritative license review records the applicable terms and distribution obligations.
+The npm registry metadata for both exact 5.38.0 packages declares `SEE LICENSE IN LICENSE`. Each integrity-verified tarball contains the same `LICENSE` bytes, whose permission notice is reproduced verbatim below. These facts replace the conflicting 5.36.6 registry metadata recorded during the earlier audit. This notice records package evidence and does not provide legal advice or independently determine distribution obligations.
 
 Copyright (c) 2016 RongCloud.
 

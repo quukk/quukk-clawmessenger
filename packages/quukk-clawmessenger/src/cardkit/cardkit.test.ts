@@ -547,9 +547,12 @@ describe('CardKit shared wire fixture and provenance gate', () => {
     expect(notices).toContain('Copyright (c) 2026 Quukk');
     expect(notices).toContain('Copyright (c) 2024 quukk');
     expect(notices).toContain('Copyright (c) 2016 RongCloud.');
-    expect(notices).toContain('declares `LGPL 2.1`');
-    expect(notices).toContain('This discrepancy is unresolved.');
-    expect(notices).toContain('Task 14 legal gate');
+    expect(notices).toContain('declares `SEE LICENSE IN LICENSE`');
+    expect(notices).toContain('@rongcloud/imlib-next@5.38.0');
+    expect(notices).toContain('@rongcloud/engine@5.38.0');
+    expect(notices).toContain(
+      'dd806cb0fd9a09522def7af9003be39e21b4586a650a74076783b17eea205339',
+    );
     for (const [heading, copyright] of [
       ['Codex ClawMessenger', 'Copyright (c) 2026 Quukk'],
       ['OpenClaw ClawMessenger', 'Copyright (c) 2024 quukk'],

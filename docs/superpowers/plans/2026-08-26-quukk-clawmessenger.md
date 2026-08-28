@@ -6,7 +6,7 @@
 
 **Architecture:** Keep the Multica fork and its Go runtime adapters as the execution layer. Add a loopback-only Go Bridge API, a Node.js control plane with one RongCloud child process per selected runtime, and a small React/Vite local UI. The default npm path remains independent of PostgreSQL, Docker, and the hosted Multica server. The separate ClawMessenger registration service receives the minimal Hermes node-type compatibility change.
 
-**Tech stack:** Go 1.26.6, Node.js 22+, TypeScript 5.9, pnpm, React 19, Vite, Vitest, Testing Library, Zod, `@rongcloud/imlib-next` 5.36.6, Node built-ins for CLI/process/config/HTTP, GitHub Actions, npm optional platform packages.
+**Tech stack:** Go 1.26.6, Node.js 22+, TypeScript 5.9, pnpm, React 19, Vite, Vitest, Testing Library, Zod, `@rongcloud/imlib-next` 5.38.0, Node built-ins for CLI/process/config/HTTP, GitHub Actions, npm optional platform packages.
 
 **Spec:** `docs/superpowers/specs/2026-08-26-quukk-clawmessenger-fork-design.md`
 
@@ -675,7 +675,7 @@ git commit -m "feat: unify ClawMessenger wire protocols"
 
 **Step 1: Add pinned dependencies and RED protocol tests**
 
-Pin `@rongcloud/imlib-next` to `5.36.6`; add `fake-indexeddb`, `jsdom`, and `ws` only for the worker/polyfill boundary. Validate IPC with zod and assert tokens can never occur in worker events or serialized errors.
+Pin `@rongcloud/imlib-next` and its exact `@rongcloud/engine` peer to `5.38.0`; add `fake-indexeddb`, `jsdom`, and `ws` only for the worker/polyfill boundary. Validate IPC with zod and assert tokens can never occur in worker events or serialized errors.
 
 ```ts
 type WorkerInit = {
@@ -1081,7 +1081,7 @@ git commit -m "test: verify Quukk ClawMessenger end to end"
 
 **Step 1: Recheck external release preconditions**
 
-Use the official npm registry to confirm `quukk-clawmessenger` and all six platform package names remain available. Verify current Multica license/NOTICE requirements against the retained upstream files and resolve the RongCloud 5.36.6 package-metadata versus bundled-license discrepancy before publishing. Verify the production ClawMessenger server has no anonymous token retrieval/serialization/logging path, enrollment compatibility mode is disabled, owner/node authorization gates are active, shared edge size/rate limits are configured, and exposed-token rotation has been completed or explicitly dispositioned.
+Use the official npm registry to confirm `quukk-clawmessenger` and all six platform package names remain available. Verify current Multica license/NOTICE requirements against the retained upstream files and preserve the audited RongCloud 5.38.0 registry/integrity/license evidence before publishing. Verify the production ClawMessenger server has no anonymous token retrieval/serialization/logging path, enrollment compatibility mode is disabled, owner/node authorization gates are active, shared edge size/rate limits are configured, and exposed-token rotation has been completed or explicitly dispositioned.
 
 **Step 2: Build from a clean commit**
 

@@ -14,8 +14,8 @@ const PLATFORM_LEGAL_FILES = ['LICENSE', 'NOTICE', 'MODIFICATIONS.md', 'GO_THIRD
 const SEMVER = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const GO_RELEASE = /^go1\.[1-9]\d*(?:\.(?:0|[1-9]\d*))?(?:(?:beta|rc)[1-9]\d*)?$/;
 const ENTRY_DEPENDENCIES = Object.freeze({
-  '@rongcloud/engine': '5.36.6',
-  '@rongcloud/imlib-next': '5.36.6',
+  '@rongcloud/engine': '5.38.0',
+  '@rongcloud/imlib-next': '5.38.0',
   'fake-indexeddb': '6.2.5',
   jsdom: '29.0.1',
   ws: '8.20.0',

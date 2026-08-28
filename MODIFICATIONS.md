@@ -73,8 +73,9 @@
 - `README.md`: adds the Quukk ClawMessenger derivative entry point while retaining Multica as the
   primary product and attribution.
 - `MODIFICATIONS.md`, `THIRD_PARTY_NOTICES.md`, and `GO_THIRD_PARTY_NOTICES.md`: record
-  migration/package hardening, retain the unresolved RongCloud licensing metadata discrepancy as
-  a publication gate, and carry the exact notices for Go modules linked into runtime binaries.
+  migration/package hardening, pin the matching RongCloud 5.38.0 package pair whose registry
+  metadata points to the identical integrity-verified embedded license, and carry the exact
+  notices for Go modules linked into runtime binaries.
 - `server/pkg/agent/launch.go`: bounds synchronous probe output while preserving process ownership and timeout errors.
 - `server/pkg/agent/agent_test.go`: covers oversized version output and timeout precedence without executing an installed agent CLI.
 - `server/internal/daemon/bridge_http_test.go`: uses OS-native absolute runtime fixture paths so
