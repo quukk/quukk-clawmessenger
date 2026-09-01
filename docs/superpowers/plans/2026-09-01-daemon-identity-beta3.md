@@ -110,4 +110,3 @@
 - [ ] **Step 3: Perform a clean public install and lifecycle test**
 
   Install into a new temporary directory and use a new empty profile. Verify binary resolution, `start --json --no-open`, `status --json`, ready `doctor --json`, `logs --json`, `stop --json`, and final offline `doctor --json`.
-

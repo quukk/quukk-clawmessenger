@@ -18,4 +18,3 @@ The public `quukk-clawmessenger@0.1.0-beta.2` package installs and resolves its 
 - Refactoring the daemon identity state machine.
 - Changing the CLI protocol, service HTTP API, runtime manifest contract, or package topology.
 - Automating npm credential rotation.
-
