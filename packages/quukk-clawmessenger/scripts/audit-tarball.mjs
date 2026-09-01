@@ -18,7 +18,7 @@ const ENTRY_DEPENDENCIES = Object.freeze({
   '@rongcloud/imlib-next': '5.38.0',
   'fake-indexeddb': '6.2.5',
   jsdom: '29.0.1',
-  ws: '8.20.0',
+  ws: '8.21.0',
   zod: '4.3.6',
 });
 const ENTRY_DEV_DEPENDENCIES = Object.freeze({

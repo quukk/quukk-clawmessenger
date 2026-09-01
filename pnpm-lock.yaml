@@ -790,8 +790,8 @@ importers:
         specifier: 29.0.1
         version: 29.0.1(@noble/hashes@1.8.0)
       ws:
-        specifier: 8.20.0
-        version: 8.20.0
+        specifier: 8.21.0
+        version: 8.21.0
       zod:
         specifier: 4.3.6
         version: 4.3.6
@@ -816,22 +816,22 @@ importers:
         version: 4.1.0(@opentelemetry/api@1.9.1)(@types/node@25.5.0)(jsdom@29.0.1(@noble/hashes@1.8.0))(msw@2.12.14(@types/node@25.5.0)(typescript@5.9.3))(vite@8.0.1(@emnapi/core@1.11.2)(@emnapi/runtime@1.11.2)(@types/node@25.5.0)(jiti@2.7.0)(terser@5.47.1)(yaml@2.9.0))
     optionalDependencies:
       '@quukk/clawmessenger-runtime-darwin-arm64':
-        specifier: 0.1.0-beta.4
+        specifier: 0.1.0-beta.5
         version: link:../quukk-clawmessenger-runtime-darwin-arm64
       '@quukk/clawmessenger-runtime-darwin-x64':
-        specifier: 0.1.0-beta.4
+        specifier: 0.1.0-beta.5
         version: link:../quukk-clawmessenger-runtime-darwin-x64
       '@quukk/clawmessenger-runtime-linux-arm64':
-        specifier: 0.1.0-beta.4
+        specifier: 0.1.0-beta.5
         version: link:../quukk-clawmessenger-runtime-linux-arm64
       '@quukk/clawmessenger-runtime-linux-x64':
-        specifier: 0.1.0-beta.4
+        specifier: 0.1.0-beta.5
         version: link:../quukk-clawmessenger-runtime-linux-x64
       '@quukk/clawmessenger-runtime-win32-arm64':
-        specifier: 0.1.0-beta.4
+        specifier: 0.1.0-beta.5
         version: link:../quukk-clawmessenger-runtime-win32-arm64
       '@quukk/clawmessenger-runtime-win32-x64':
-        specifier: 0.1.0-beta.4
+        specifier: 0.1.0-beta.5
         version: link:../quukk-clawmessenger-runtime-win32-x64
 
   packages/quukk-clawmessenger-runtime-darwin-arm64: {}
@@ -10975,20 +10975,8 @@ packages:
       utf-8-validate:
         optional: true
 
-  ws@8.20.0:
-    resolution: {integrity: sha512-sAt8BhgNbzCtgGbt2OxmpuryO63ZoDk/sqaB/znQm94T4fCEsy/yV+7CdC1kJhOU9lboAEU7R3kquuycDoibVA==}
-    engines: {node: '>=10.0.0'}
-    peerDependencies:
-      bufferutil: ^4.0.1
-      utf-8-validate: '>=5.0.2'
-    peerDependenciesMeta:
-      bufferutil:
-        optional: true
-      utf-8-validate:
-        optional: true
-
-  ws@8.20.1:
-    resolution: {integrity: sha512-It4dO0K5v//JtTXuPkfEOaI3uUN87iYPnqo/ZzqCoG3g8uhA66QUMs/SrM0YK7/NAu+r4LMh/9dq2A7k+rHs+w==}
+  ws@8.21.0:
+    resolution: {integrity: sha512-Vsp28b7DRcimFQvrqu2Wek3z1iYxDCWqHYB8Qsnk/S4RfaCQzPGPyBNuVjJV3cd6UiKtUtp6sNM77gWvzcCH+g==}
     engines: {node: '>=10.0.0'}
     peerDependencies:
       bufferutil: ^4.0.1
@@ -12248,7 +12236,7 @@ snapshots:
       terminal-link: 2.1.1
       toqr: 0.1.1
       wrap-ansi: 7.0.0
-      ws: 8.20.1
+      ws: 8.21.0
       zod: 3.25.76
     optionalDependencies:
       expo-router: 55.0.14(28857138dad78e037ca803b5df54c4f8)
@@ -23031,9 +23019,7 @@ snapshots:
 
   ws@7.5.10: {}
 
-  ws@8.20.0: {}
-
-  ws@8.20.1: {}
+  ws@8.21.0: {}
 
   wsl-utils@0.3.1:
     dependencies:
