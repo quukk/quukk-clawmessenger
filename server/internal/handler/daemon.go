@@ -22,7 +22,6 @@ import (
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/daemonws"
-	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
@@ -1979,36 +1978,7 @@ func claimResponseAgentIdentityMatches(resp AgentTaskResponse) bool {
 func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQueue, runtime db.AgentRuntime, runtimeID, runtimeWorkspaceID string) (resp AgentTaskResponse, deliveredCommentIDs []pgtype.UUID, agentSkillCount, builtinSkillCount int, failure *claimBuildFailure) {
 	// Build response with fresh agent data (name + skills + custom_env + custom_args).
 	resp = taskToResponse(*task, runtimeWorkspaceID)
-	if task.IssueID.Valid {
-		if policy, enabled := h.issueWindowPolicy(r.Context(), runtime.WorkspaceID); enabled {
-			visible, visibilityErr := h.issueIDsWithinWindow(r.Context(), runtime.WorkspaceID, policy, []pgtype.UUID{task.IssueID})
-			if visibilityErr != nil {
-				h.recordIssueWindow(policy.action, "agent_context", "error")
-				if policy.action == entitlement.ActionEnforce {
-					if _, requeueErr := h.TaskService.RequeueTaskAfterClaimFailure(r.Context(), *task); requeueErr != nil {
-						slog.Error("task claim: requeue after issue window failure failed", "task_id", uuidToString(task.ID), "error", requeueErr)
-					}
-					return resp, nil, 0, 0, &claimBuildFailure{
-						outcome: "error_issue_window_check", status: http.StatusInternalServerError, message: "failed to check issue access",
-					}
-				}
-			} else if !visible {
-				if policy.action == entitlement.ActionObserve {
-					h.recordIssueWindow(policy.action, "agent_context", "would_block")
-				} else {
-					h.recordIssueWindow(policy.action, "agent_context", "blocked")
-					return resp, nil, 0, 0, h.failClaimedTaskBeforeLaunch(
-						r.Context(), task,
-						"This issue is outside the workspace's recently created issue window.",
-						taskfailure.ReasonIssueWindowRestricted,
-						"error_issue_window_restricted", http.StatusPaymentRequired, "issue is outside the recently created window",
-					)
-				}
-			} else {
-				h.recordIssueWindow(policy.action, "agent_context", "allowed")
-			}
-		}
-	}
+	var issueNumber int32
 	// Claim-only capability: this server resolves the squad-leader role on the
 	// wire (is_leader_task / squad_id), so the daemon must not re-derive it
 	// from the briefing text. Set unconditionally — on every claim, leader or
@@ -2270,6 +2240,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, failure
 		}
 		resp.ThreadName = issue.Title
+		issueNumber = issue.Number
 
 		// Squad-leader briefing injection: keyed off the task being a
 		// leader-task (is_leader_task) carrying a squad_id — NOT off the
@@ -3081,6 +3052,10 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	// shared context. Empty string when the owner hasn't set one; the daemon
 	// skips rendering the heading in that case.
 	if ws, err := h.Queries.GetWorkspace(r.Context(), parseUUID(resp.WorkspaceID)); err == nil {
+		resp.WorkspaceSlug = ws.Slug
+		if issueNumber > 0 {
+			resp.IssueIdentifier = service.IssueIdentifier(ws.IssuePrefix, issueNumber)
+		}
 		if ws.Context.Valid {
 			resp.WorkspaceContext = ws.Context.String
 		}

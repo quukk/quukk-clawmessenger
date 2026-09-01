@@ -327,7 +327,7 @@
       "upload_failed_toast": "アバターのアップロードに失敗しました"
     }
   },
-  "starter_prompts": {
+  "conversation_starters": {
     "label": "会話の開始例",
     "hint": "このエージェントで新しいチャットを開いたときに表示される例（最大3件）。選ぶと送信せずに入力欄へ入ります。",
     "add": "候補を追加",
@@ -782,7 +782,6 @@
       "skill_bundle_unavailable": "エージェントのスキルをダウンロードできませんでした",
       "runtime_cli_timeout": "ローカルランタイム CLI がタイムアウトしました",
       "invalid_task_identity": "作業のエージェント情報が一致しません",
-      "issue_window_restricted": "ワークスペースの制限によりタスクを利用できません",
       "agent_error_provider_auth_or_access": "プロバイダーの認証に失敗しました",
       "agent_error_provider_quota_limit": "プロバイダーのクォータを使い切りました",
       "agent_error_provider_capacity_or_rate_limit": "プロバイダーによるレート制限",
