@@ -35,7 +35,7 @@
 - Consumes: tab-separated release manifest rows with `name` then `archive`, the release version file, npm registry `dist.shasum` and `dist.integrity`, and mode `preflight | runtimes | complete`.
 - Produces: four tab-separated plan fields in the order `name`, `archive`, `role`, `action`, where role is `runtime | entry` and action is `publish | skip`; exports `compareDistribution(local, remote)` and `classifyReleaseSet(packages, mode)` for focused tests.
 
-- [ ] **Step 1: Write failing tests for digest comparison and release states**
+- [x] **Step 1: Write failing tests for digest comparison and release states**
 
 Create `scripts/plan-clawmessenger-npm-release.test.ts` with literal fixtures for one entry and six runtimes. Cover these observable behaviors:
 
@@ -111,7 +111,7 @@ describe('resumable npm release classification', () => {
 });
 ```
 
-- [ ] **Step 2: Run the planner tests and verify RED**
+- [x] **Step 2: Run the planner tests and verify RED**
 
 Run:
 
@@ -121,7 +121,7 @@ pnpm exec vitest run scripts/plan-clawmessenger-npm-release.test.ts
 
 Expected: FAIL because `scripts/plan-clawmessenger-npm-release.mjs` does not exist.
 
-- [ ] **Step 3: Implement the minimal planner and CLI**
+- [x] **Step 3: Implement the minimal planner and CLI**
 
 Create `scripts/plan-clawmessenger-npm-release.mjs` with these exact public contracts:
 
@@ -163,7 +163,7 @@ The CLI must:
 6. Require both registry `shasum` and `integrity` to match the local tarball before returning `matching`.
 7. Write the release plan atomically with four tab-separated fields in the order `name`, `archive`, `role`, `action`.
 
-- [ ] **Step 4: Run the planner tests and verify GREEN**
+- [x] **Step 4: Run the planner tests and verify GREEN**
 
 Run:
 
@@ -173,7 +173,7 @@ pnpm exec vitest run scripts/plan-clawmessenger-npm-release.test.ts
 
 Expected: all planner tests PASS with no warnings.
 
-- [ ] **Step 5: Commit the planner**
+- [x] **Step 5: Commit the planner**
 
 ```bash
 git add scripts/plan-clawmessenger-npm-release.mjs scripts/plan-clawmessenger-npm-release.test.ts
@@ -192,7 +192,7 @@ git commit -m "feat(release): add resumable npm release planner"
 - Consumes: Task 1 CLI and the existing `.artifacts/release-set.tsv` plus `.artifacts/release-version.txt`.
 - Produces: `.artifacts/release-plan.tsv` refreshed at preflight, after runtime publication, and after entry publication.
 
-- [ ] **Step 1: Change the workflow contract test first**
+- [x] **Step 1: Change the workflow contract test first**
 
 Replace the single-use preflight assertions with required ordered steps:
 
@@ -213,7 +213,7 @@ expect(verifyComplete.run).toContain('--mode complete');
 
 Keep the assertions for explicit protected dispatch, protected environment, seven unique artifact downloads, credential isolation, exact package validation, runtime-before-entry ordering, and `--provenance`.
 
-- [ ] **Step 2: Run the workflow test and verify RED**
+- [x] **Step 2: Run the workflow test and verify RED**
 
 Run:
 
@@ -223,7 +223,7 @@ pnpm exec vitest run scripts/clawmessenger-runtime-workflow.test.ts
 
 Expected: FAIL because the five resumable publication steps are absent.
 
-- [ ] **Step 3: Replace fail-on-existing preflight with the planner**
+- [x] **Step 3: Replace fail-on-existing preflight with the planner**
 
 In `.github/workflows/quukk-clawmessenger-runtime.yml`:
 
@@ -234,7 +234,7 @@ In `.github/workflows/quukk-clawmessenger-runtime.yml`:
 5. Add `Verify complete beta release`, rerunning the planner with `--mode complete`.
 6. Keep `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}` only on npm credential/planning/publish/verification steps and keep both publish commands on `--access public --tag beta --provenance`.
 
-- [ ] **Step 4: Run planner and workflow tests and verify GREEN**
+- [x] **Step 4: Run planner and workflow tests and verify GREEN**
 
 Run:
 
@@ -244,7 +244,7 @@ pnpm exec vitest run scripts/plan-clawmessenger-npm-release.test.ts scripts/claw
 
 Expected: both files PASS.
 
-- [ ] **Step 5: Commit the workflow integration**
+- [x] **Step 5: Commit the workflow integration**
 
 ```bash
 git add .github/workflows/quukk-clawmessenger-runtime.yml scripts/clawmessenger-runtime-workflow.test.ts
@@ -273,11 +273,11 @@ git commit -m "fix(release): resume partial npm beta publications"
 - Consumes: the existing platform-package `files` allowlist and tarball audit/verification contracts.
 - Produces: one main install instruction and six npm package pages that explicitly redirect users to `quukk-clawmessenger`.
 
-- [ ] **Step 1: Make packaging tests require the runtime README**
+- [x] **Step 1: Make packaging tests require the runtime README**
 
 Add `README.md` to the literal expected platform file lists in `packages/quukk-clawmessenger/scripts/package-artifacts.test.ts` and `scripts/clawmessenger-runtime.test.ts`. Add an audit fixture assertion that a platform tarball without `README.md` is rejected as `missing_required_file`.
 
-- [ ] **Step 2: Run the packaging tests and verify RED**
+- [x] **Step 2: Run the packaging tests and verify RED**
 
 Run:
 
@@ -287,7 +287,7 @@ pnpm exec vitest run packages/quukk-clawmessenger/scripts/package-artifacts.test
 
 Expected: FAIL because current runtime package manifests and tarballs omit `README.md`.
 
-- [ ] **Step 3: Add the user-facing and runtime documentation**
+- [x] **Step 3: Add the user-facing and runtime documentation**
 
 After the main install command in `packages/quukk-clawmessenger/README.md`, add:
 
@@ -319,11 +319,11 @@ npm install --global quukk-clawmessenger@beta
 ```
 ```
 
-- [ ] **Step 4: Include and validate runtime READMEs**
+- [x] **Step 4: Include and validate runtime READMEs**
 
 Add `README.md` to each runtime package's `files` array and to the exact platform allowlists in `packages/quukk-clawmessenger/scripts/audit-tarball.mjs` and `scripts/verify-clawmessenger-runtime.mjs`. Do not relax any other tarball restriction.
 
-- [ ] **Step 5: Run packaging tests and verify GREEN**
+- [x] **Step 5: Run packaging tests and verify GREEN**
 
 Run:
 
@@ -333,7 +333,7 @@ pnpm exec vitest run packages/quukk-clawmessenger/scripts/package-artifacts.test
 
 Expected: both files PASS.
 
-- [ ] **Step 6: Commit the package UX changes**
+- [x] **Step 6: Commit the package UX changes**
 
 ```bash
 git add packages/quukk-clawmessenger/README.md packages/quukk-clawmessenger-runtime-* scripts/verify-clawmessenger-runtime.mjs scripts/clawmessenger-runtime.test.ts packages/quukk-clawmessenger/scripts/audit-tarball.mjs packages/quukk-clawmessenger/scripts/package-artifacts.test.ts
@@ -351,7 +351,7 @@ git commit -m "docs(npm): present ClawMessenger as one installable package"
 - Consumes: all implementation tasks.
 - Produces: fresh verification evidence and an integration-ready branch.
 
-- [ ] **Step 1: Run the release and packaging suites together**
+- [x] **Step 1: Run the release and packaging suites together**
 
 ```bash
 pnpm exec vitest run scripts/plan-clawmessenger-npm-release.test.ts scripts/clawmessenger-runtime-workflow.test.ts scripts/clawmessenger-runtime.test.ts packages/quukk-clawmessenger/scripts/package-artifacts.test.ts packages/quukk-clawmessenger/scripts/postinstall.test.ts
@@ -359,7 +359,7 @@ pnpm exec vitest run scripts/plan-clawmessenger-npm-release.test.ts scripts/claw
 
 Expected: all tests PASS with zero failures.
 
-- [ ] **Step 2: Run entry-package tests and typechecks**
+- [x] **Step 2: Run entry-package tests and typechecks**
 
 ```bash
 pnpm --dir packages/quukk-clawmessenger test
@@ -369,7 +369,7 @@ pnpm --dir packages/quukk-clawmessenger typecheck:e2e
 
 Expected: all three commands exit 0.
 
-- [ ] **Step 3: Run repository hygiene checks**
+- [x] **Step 3: Run repository hygiene checks**
 
 ```bash
 git diff --check
@@ -378,7 +378,7 @@ git status --short
 
 Expected: no whitespace errors and only the tracked plan checkbox update remains.
 
-- [ ] **Step 4: Commit the checked implementation plan state**
+- [x] **Step 4: Commit the checked implementation plan state**
 
 ```bash
 git add docs/superpowers/plans/2026-09-01-quukk-single-entry-resumable-beta-release.md
