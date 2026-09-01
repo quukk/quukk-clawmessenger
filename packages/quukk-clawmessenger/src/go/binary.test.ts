@@ -19,6 +19,10 @@ function manifest(overrides: Record<string, unknown> = {}): Record<string, unkno
     sourceCommit: 'a'.repeat(40),
     sha256: abcSHA256,
     binary: 'multica.exe',
+    modules: [
+      'github.com/go-chi/chi/v5@v5.3.0',
+      'github.com/gorilla/websocket@v1.5.3',
+    ],
     ...overrides,
   };
 }
@@ -74,6 +78,27 @@ describe('bridgeRuntimePackage', () => {
 });
 
 describe('resolveBridgeBinary', () => {
+  it('accepts the generated runtime manifest including its Go module inventory', async () => {
+    await expect(resolveBridgeBinary(dependencies())).resolves.toMatchObject({
+      version,
+      sha256: abcSHA256,
+    });
+  });
+
+  it.each([
+    ['an empty', []],
+    ['an oversized', Array.from({ length: 257 }, (_, index) => `example.com/module${index}@v1.0.0`)],
+    ['a malformed', ['github.com/go-chi/chi/v5@5.3.0']],
+  ])('rejects %s Go module inventory', async (_name, modules) => {
+    await expect(
+      resolveBridgeBinary(
+        dependencies({
+          readFile: async () => Buffer.from(JSON.stringify(manifest({ modules }))),
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'manifest_invalid' });
+  });
+
   it('strictly validates package metadata and manifest fields', async () => {
     const invalid: Array<[string, Partial<BridgeBinaryDependencies>]> = [
       ['missing package', { resolvePackageRoot: async () => { throw new Error('path-sentinel'); } }],
