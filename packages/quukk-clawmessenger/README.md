@@ -26,6 +26,10 @@ npm install -g quukk-clawmessenger@beta
 quukk-clawmessenger setup
 ```
 
+This is the only package users install. npm automatically selects the matching signed native
+runtime for the current operating system and CPU; do not install the scoped runtime packages
+directly.
+
 For a terminal-only host, CI, or an environment where a browser must not open:
 
 ```bash

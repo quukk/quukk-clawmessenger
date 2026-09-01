@@ -139,6 +139,7 @@ export async function verifyRuntimePackage(requestedPackage, options = {}) {
     'manifest.json',
     ...LEGAL_FILES,
     'SOURCE.md',
+    'README.md',
   ];
   const entries = await readdir(packageDirectory);
   requireExactEntries(entries, expectedFiles);
@@ -164,6 +165,7 @@ export async function verifyRuntimePackage(requestedPackage, options = {}) {
     'manifest.json',
     ...LEGAL_FILES,
     'SOURCE.md',
+    'README.md',
   ];
   if (
     typeof entryPackage.version !== 'string' ||

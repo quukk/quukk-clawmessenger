@@ -17,7 +17,8 @@
     "NOTICE",
     "MODIFICATIONS.md",
     "GO_THIRD_PARTY_NOTICES.md",
-    "SOURCE.md"
+    "SOURCE.md",
+    "README.md"
   ],
   "os": ["darwin"],
   "cpu": ["x64"],
