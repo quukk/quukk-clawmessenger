@@ -174,14 +174,36 @@ describe('DaemonIdentityStore', () => {
     expect(serviceIdentityModule).not.toHaveProperty('deriveControlCredential');
   });
 
+  it('creates its missing storage directory before the first claim', async () => {
+    await mkdir(TASK_TEMP_ROOT, { recursive: true });
+    const home = await mkdtemp(join(TASK_TEMP_ROOT, 'quukk-task11-first-claim-'));
+    temporaryDirectories.push(home);
+    const filePath = localPaths(home).daemonPid;
+    const identity = starting();
+
+    await expect(new DaemonIdentityStore({ filePath }).claim(identity)).resolves.toBe(true);
+    expect(JSON.parse(await readFile(filePath, 'utf8'))).toEqual(identity);
+    const parent = await fsLstat(dirname(filePath));
+    expect(parent.isDirectory()).toBe(true);
+    expect(parent.isSymbolicLink()).toBe(false);
+  });
+
   it('claims daemon.pid exclusively, returns the raw digest, and enforces Unix modes', async () => {
     const filePath = await identityPath('claim');
     const lifecycleCalls: string[] = [];
     const chmodCalls: Array<{ path: string; mode: number }> = [];
+    const storageDirectoryChmods: number[] = [];
     const dependencies: Partial<DaemonIdentityDependencies> = {
       platform: 'linux' as const,
       open: async (path, flags, mode) => {
         lifecycleCalls.push(`open:${String(flags)}`);
+        if (String(path) === dirname(filePath)) {
+          return {
+            stat: async () => ({ isDirectory: () => true }),
+            chmod: async (nextMode: number) => { storageDirectoryChmods.push(nextMode); },
+            close: async () => undefined,
+          } as unknown as Awaited<ReturnType<typeof fsOpen>>;
+        }
         return fsOpen(path, flags, mode);
       },
       mkdir: (async (...args: Parameters<typeof mkdir>) => {
@@ -202,7 +224,8 @@ describe('DaemonIdentityStore', () => {
 
     const results = await Promise.all([first.claim(starting()), second.claim(starting())]);
     expect([...results].sort()).toEqual([false, true]);
-    expect(lifecycleCalls[0]).toBe('open:wx');
+    expect(lifecycleCalls.filter((call) => call === 'open:wx')).toHaveLength(2);
+    expect(storageDirectoryChmods).toEqual([0o700, 0o700]);
     const snapshot = await first.read();
     expect(snapshot.identity).toEqual(starting());
     const raw = await readFile(filePath);
@@ -554,12 +577,20 @@ describe('DaemonIdentityStore', () => {
     const recoveryDirectory = `${filePath}.recovery`;
     await mkdir(recoveryDirectory, { mode: 0o777 });
     const recoveryChmods: Array<{ mode: number; path: string }> = [];
+    const storageDirectoryChmods: number[] = [];
     const store = new DaemonIdentityStore({
       filePath,
       dependencies: {
         platform: 'linux',
         open: async (path, flags, mode) => {
           const value = String(path);
+          if (value === dirname(filePath)) {
+            return {
+              stat: async () => ({ isDirectory: () => true }),
+              chmod: async (nextMode: number) => { storageDirectoryChmods.push(nextMode); },
+              close: async () => undefined,
+            } as unknown as Awaited<ReturnType<typeof fsOpen>>;
+          }
           if (value === recoveryDirectory || value.startsWith(`${recoveryDirectory}${sep}`)) {
             return {
               stat: async () => ({
@@ -587,6 +618,7 @@ describe('DaemonIdentityStore', () => {
     await store.markReady(cycleStarting, cycleReady.address);
     await store.removeIfMatches(cycleReady);
 
+    expect(storageDirectoryChmods).toEqual([0o700]);
     expect(recoveryChmods.filter((call) => call.path === recoveryDirectory))
       .toEqual([{ path: recoveryDirectory, mode: 0o700 }, { path: recoveryDirectory, mode: 0o700 }]);
     expect(recoveryChmods.filter((call) => call.path !== recoveryDirectory))
