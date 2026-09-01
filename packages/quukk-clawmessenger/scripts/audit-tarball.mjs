@@ -365,7 +365,10 @@ async function auditReport(value, packageDirectory, knownCheckoutRoots) {
     const platformBinary = platform?.platform === 'win32' ? 'multica.exe' : 'multica';
     const required = entry
       ? [...ENTRY_EXACT_FILES]
-      : ['package.json', platformBinary, 'manifest.json', ...PLATFORM_LEGAL_FILES, 'SOURCE.md'];
+      : [
+          'package.json', platformBinary, 'manifest.json', ...PLATFORM_LEGAL_FILES, 'SOURCE.md',
+          'README.md',
+        ];
     if (required.some((path) => !names.has(path.toLowerCase()))) fail('required_file_missing');
     if (entry) {
       if (![...names].some((path) => /^dist\/ui\/assets\/.+\.js$/.test(path))) {
@@ -384,6 +387,7 @@ async function auditReport(value, packageDirectory, knownCheckoutRoots) {
         ? entryAllowed(file.path)
         : new Set([
             'package.json', platformBinary, 'manifest.json', ...PLATFORM_LEGAL_FILES, 'SOURCE.md',
+            'README.md',
           ]).has(file.path);
       if (!allowed) fail('unexpected_file');
       const target = await safePackageFile(packageDirectory, file.path);
@@ -449,6 +453,7 @@ async function auditReport(value, packageDirectory, knownCheckoutRoots) {
         'manifest.json',
         ...PLATFORM_LEGAL_FILES,
         'SOURCE.md',
+        'README.md',
       ];
       if (
         !exactStringArray(packageJson.os, [platform.platform])

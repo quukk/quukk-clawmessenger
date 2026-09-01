@@ -284,6 +284,7 @@ const PLATFORM_FILES = [
   'MODIFICATIONS.md',
   'GO_THIRD_PARTY_NOTICES.md',
   'SOURCE.md',
+  'README.md',
 ] as const;
 const PLATFORM_MODULES = ['github.com/example/runtime@v1.2.3'] as const;
 
@@ -548,7 +549,7 @@ describe('audit-tarball', () => {
     })).rejects.toMatchObject({ code: 'manifest_invalid' });
   });
 
-  it('accepts the exact eight-file scoped platform package contract', async () => {
+  it('accepts the exact nine-file scoped platform package contract', async () => {
     const fixture = await platformFixture();
 
     await expect(auditTarball({
@@ -558,7 +559,6 @@ describe('audit-tarball', () => {
   });
 
   it.each([
-    ['README.md', 'unexpected_file'],
     ['THIRD_PARTY_NOTICES.md', 'unexpected_file'],
   ])('rejects platform-only unexpected file %s', async (path, code) => {
     const fixture = await platformFixture();
@@ -569,6 +569,20 @@ describe('audit-tarball', () => {
       packJsonPath: fixture.report,
       packageDirectory: fixture.entry,
     })).rejects.toMatchObject({ code });
+  });
+
+  it('rejects a platform package that omits its user redirection README', async () => {
+    const fixture = await platformFixture();
+    const report = JSON.parse(await readFile(fixture.report, 'utf8')) as Array<{
+      files: Array<{ path: string }>;
+    }>;
+    report[0].files = report[0].files.filter(({ path }) => path !== 'README.md');
+    await writeFile(fixture.report, JSON.stringify(report));
+
+    await expect(auditTarball({
+      packJsonPath: fixture.report,
+      packageDirectory: fixture.entry,
+    })).rejects.toMatchObject({ code: 'required_file_missing' });
   });
 
   it.each([

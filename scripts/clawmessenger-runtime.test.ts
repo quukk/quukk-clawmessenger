@@ -93,6 +93,7 @@ async function validRuntimePackage(
     'MODIFICATIONS.md',
     'GO_THIRD_PARTY_NOTICES.md',
     'SOURCE.md',
+    'README.md',
   ];
   await writeFile(
     join(packageDirectory, 'package.json'),
@@ -131,6 +132,10 @@ async function validRuntimePackage(
   await writeFile(
     join(packageDirectory, 'SOURCE.md'),
     EXPECTED_SOURCE_DOCUMENT,
+  );
+  await writeFile(
+    join(packageDirectory, 'README.md'),
+    `# ${target.packageName}\n\nInstall quukk-clawmessenger instead.\n`,
   );
   await writeFile(join(packageDirectory, target.binary), 'tiny-runtime');
   await writeFile(
@@ -794,6 +799,7 @@ describe('published runtime package metadata', () => {
           'MODIFICATIONS.md',
           'GO_THIRD_PARTY_NOTICES.md',
           'SOURCE.md',
+          'README.md',
         ],
       });
       expect(packageJson.scripts, target.packageName).toBeUndefined();
@@ -804,6 +810,9 @@ describe('published runtime package metadata', () => {
       }
       const source = await readFile(join(packageDirectory, 'SOURCE.md'));
       expect(source).toEqual(Buffer.from(EXPECTED_SOURCE_DOCUMENT));
+      await expect(readFile(join(packageDirectory, 'README.md'), 'utf8')).resolves.toContain(
+        'npm install --global quukk-clawmessenger@beta',
+      );
     }
   });
 });
