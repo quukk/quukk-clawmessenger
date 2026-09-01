@@ -300,12 +300,20 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
 
     const credential = requiredStep(publish, 'Require npm publish credential');
     const validate = requiredStep(publish, 'Validate seven-package release set');
-    const preflight = requiredStep(publish, 'Preflight npm package versions');
-    const publishRuntimes = requiredStep(publish, 'Publish runtime beta packages');
-    const publishEntry = requiredStep(publish, 'Publish entry beta package');
-    const orderedSteps = [credential, validate, preflight, publishRuntimes, publishEntry].map(
-      (step) => publish.steps.indexOf(step),
-    );
+    const plan = requiredStep(publish, 'Plan resumable beta publication');
+    const publishRuntimes = requiredStep(publish, 'Publish missing runtime beta packages');
+    const verifyRuntimes = requiredStep(publish, 'Verify runtime beta packages');
+    const publishEntry = requiredStep(publish, 'Publish missing entry beta package');
+    const verifyComplete = requiredStep(publish, 'Verify complete beta release');
+    const orderedSteps = [
+      credential,
+      validate,
+      plan,
+      publishRuntimes,
+      verifyRuntimes,
+      publishEntry,
+      verifyComplete,
+    ].map((step) => publish.steps.indexOf(step));
     expect(orderedSteps.every((index, position) => (
       index >= 0 && (position === 0 || index > orderedSteps[position - 1])
     ))).toBe(true);
@@ -327,15 +335,24 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
       expect(validate.run, packageName).toContain(packageName);
     }
 
-    expect(preflight.run).toContain('npm view "$package_name@$expected_version"');
-    expect(preflight.run).toContain('E404');
-    expect(preflight.run).toContain('release-set.tsv');
-    expect(publishRuntimes.run).toContain('release-set.tsv');
+    expect(plan.run).toContain('scripts/plan-clawmessenger-npm-release.mjs');
+    expect(plan.run).toContain('--mode preflight');
+    expect(plan.run).toContain('release-set.tsv');
+    expect(plan.run).toContain('release-plan.tsv');
+    expect(publishRuntimes.run).toContain('release-plan.tsv');
+    expect(publishRuntimes.run).toContain('[ "$action" = \'publish\' ]');
     expect(publishRuntimes.run).toContain('npm publish "$archive" --access public --tag beta --provenance');
+    expect(verifyRuntimes.run).toContain('scripts/plan-clawmessenger-npm-release.mjs');
+    expect(verifyRuntimes.run).toContain('--mode runtimes');
     expect(publishEntry.run).toContain('quukk-clawmessenger');
+    expect(publishEntry.run).toContain('release-plan.tsv');
+    expect(publishEntry.run).toContain('[ "$entry_action" = \'publish\' ]');
     expect(publishEntry.run).toContain('npm publish "$entry_archive" --access public --tag beta --provenance');
-    expect(publishRuntimes.env?.NODE_AUTH_TOKEN).toBe('${{ secrets.NPM_TOKEN }}');
-    expect(publishEntry.env?.NODE_AUTH_TOKEN).toBe('${{ secrets.NPM_TOKEN }}');
+    expect(verifyComplete.run).toContain('scripts/plan-clawmessenger-npm-release.mjs');
+    expect(verifyComplete.run).toContain('--mode complete');
+    for (const step of [plan, publishRuntimes, verifyRuntimes, publishEntry, verifyComplete]) {
+      expect(step.env?.NODE_AUTH_TOKEN).toBe('${{ secrets.NPM_TOKEN }}');
+    }
 
     const allPublishCommands = publish.steps.map((step) => step.run ?? '').join('\n');
     expect(allPublishCommands.match(/npm publish /g)).toHaveLength(2);
