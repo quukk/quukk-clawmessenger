@@ -816,22 +816,22 @@ importers:
         version: 4.1.0(@opentelemetry/api@1.9.1)(@types/node@25.5.0)(jsdom@29.0.1(@noble/hashes@1.8.0))(msw@2.12.14(@types/node@25.5.0)(typescript@5.9.3))(vite@8.0.1(@emnapi/core@1.11.2)(@emnapi/runtime@1.11.2)(@types/node@25.5.0)(jiti@2.7.0)(terser@5.47.1)(yaml@2.9.0))
     optionalDependencies:
       '@quukk/clawmessenger-runtime-darwin-arm64':
-        specifier: 0.1.0-beta.2
+        specifier: 0.1.0-beta.3
         version: link:../quukk-clawmessenger-runtime-darwin-arm64
       '@quukk/clawmessenger-runtime-darwin-x64':
-        specifier: 0.1.0-beta.2
+        specifier: 0.1.0-beta.3
         version: link:../quukk-clawmessenger-runtime-darwin-x64
       '@quukk/clawmessenger-runtime-linux-arm64':
-        specifier: 0.1.0-beta.2
+        specifier: 0.1.0-beta.3
         version: link:../quukk-clawmessenger-runtime-linux-arm64
       '@quukk/clawmessenger-runtime-linux-x64':
-        specifier: 0.1.0-beta.2
+        specifier: 0.1.0-beta.3
         version: link:../quukk-clawmessenger-runtime-linux-x64
       '@quukk/clawmessenger-runtime-win32-arm64':
-        specifier: 0.1.0-beta.2
+        specifier: 0.1.0-beta.3
         version: link:../quukk-clawmessenger-runtime-win32-arm64
       '@quukk/clawmessenger-runtime-win32-x64':
-        specifier: 0.1.0-beta.2
+        specifier: 0.1.0-beta.3
         version: link:../quukk-clawmessenger-runtime-win32-x64
 
   packages/quukk-clawmessenger-runtime-darwin-arm64: {}

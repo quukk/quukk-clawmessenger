@@ -202,6 +202,7 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
   async claim(value: StartingDaemonIdentity): Promise<boolean> {
     const parsed = StartingDaemonIdentitySchema.safeParse(value);
     if (!parsed.success) throw new DaemonIdentityError('identity_invalid');
+    await this.#ensureStorageDirectory();
     const result = await this.#writeExclusive(this.#path, parsed.data);
     if (result === 'exists') return false;
     if (result === 'created_failed') {
@@ -349,6 +350,42 @@ export class DaemonIdentityStore implements DaemonIdentityPersistence {
       await handle.close().catch(() => undefined);
     }
     return 'written';
+  }
+
+  async #ensureStorageDirectory(): Promise<void> {
+    let metadata;
+    try {
+      metadata = await this.#deps.lstat(this.#directory);
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') {
+        throw new DaemonIdentityError('identity_write_failed');
+      }
+      try {
+        await this.#deps.mkdir(this.#directory, { recursive: true, mode: 0o700 });
+        metadata = await this.#deps.lstat(this.#directory);
+      } catch {
+        throw new DaemonIdentityError('identity_write_failed');
+      }
+    }
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new DaemonIdentityError('identity_write_failed');
+    }
+    if (this.#deps.platform === 'win32') return;
+    let handle;
+    try {
+      handle = await this.#deps.open(
+        this.#directory,
+        fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+      );
+      const opened = await handle.stat();
+      if (!opened.isDirectory()) throw new DaemonIdentityError('identity_write_failed');
+      await handle.chmod(0o700);
+    } catch (error) {
+      if (error instanceof DaemonIdentityError) throw error;
+      throw new DaemonIdentityError('identity_write_failed');
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
   }
 
   async #discardCreatedPath(
