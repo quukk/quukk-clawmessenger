@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -191,7 +192,7 @@ func outputOwned(cmd *exec.Cmd, logger *slog.Logger) ([]byte, error) {
 	if cmd.Stdout != nil {
 		return nil, errors.New("exec: Stdout already set")
 	}
-	var stdout bytes.Buffer
+	stdout := boundedBuffer{max: probeOutputLimitBytes}
 	cmd.Stdout = &stdout
 
 	// A caller that set its own Stderr wants it; only fill in the sample when
@@ -207,6 +208,12 @@ func outputOwned(cmd *exec.Cmd, logger *slog.Logger) ([]byte, error) {
 	if stderr != nil && errors.As(err, &exitErr) {
 		exitErr.Stderr = stderr.Bytes()
 	}
+	if stdout.exceeded {
+		if err != nil {
+			return nil, err
+		}
+		return nil, bufio.ErrTooLong
+	}
 	return stdout.Bytes(), err
 }
 
@@ -220,17 +227,45 @@ func combinedOutputOwned(cmd *exec.Cmd, logger *slog.Logger) ([]byte, error) {
 	if cmd.Stderr != nil {
 		return nil, errors.New("exec: Stderr already set")
 	}
-	var combined bytes.Buffer
+	combined := boundedBuffer{max: probeOutputLimitBytes}
 	cmd.Stdout = &combined
 	cmd.Stderr = &combined
 	err := runOwned(cmd, logger)
+	if combined.exceeded {
+		if err != nil {
+			return nil, err
+		}
+		return nil, bufio.ErrTooLong
+	}
 	return combined.Bytes(), err
 }
+
+const probeOutputLimitBytes = 64 << 10
 
 // probeStderrSampleBytes bounds the stderr kept for a failed probe's error.
 // os/exec bounds the same sample at 32 KiB; a CLI stuck in a log loop should
 // not be able to grow the daemon's heap through a `--version` call.
 const probeStderrSampleBytes = 32 << 10
+
+type boundedBuffer struct {
+	buf      bytes.Buffer
+	max      int
+	exceeded bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	remaining := b.max - b.buf.Len()
+	if remaining >= len(p) {
+		return b.buf.Write(p)
+	}
+	if remaining > 0 {
+		_, _ = b.buf.Write(p[:remaining])
+	}
+	b.exceeded = true
+	return len(p), nil
+}
+
+func (b *boundedBuffer) Bytes() []byte { return b.buf.Bytes() }
 
 // tailBuffer keeps the last max bytes written to it and discards the rest. It
 // always reports a full write, so a child is never blocked or shortened by the

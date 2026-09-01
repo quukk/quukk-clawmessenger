@@ -1,0 +1,187 @@
+@import "tailwindcss";
+@import "@multica/ui/styles/tokens.css";
+@import "@multica/ui/styles/base.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@source "../../../packages/ui/**/*.tsx";
+@source "./**/*.{ts,tsx}";
+
+:root {
+  --font-sans: "Segoe UI Variable", "Segoe UI", -apple-system, BlinkMacSystemFont,
+    "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-serif: Georgia, "Times New Roman", serif;
+  --font-mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100dvh;
+  margin: 0;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+.app-container {
+  width: min(100% - 2rem, 72rem);
+  margin-inline: auto;
+}
+
+.nav-strip {
+  display: flex;
+  max-width: 100%;
+  gap: 0.25rem;
+  overflow-x: auto;
+  padding-bottom: 0.125rem;
+}
+
+.runtime-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.field-group {
+  display: grid;
+  gap: 0.375rem;
+  min-width: 0;
+  color: var(--foreground);
+  font-size: var(--text-body);
+  line-height: var(--text-body--line-height);
+  font-weight: 500;
+}
+
+.field-group input,
+.field-group textarea,
+.field-group select {
+  width: 100%;
+  min-height: 2.25rem;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-md);
+  background: var(--background);
+  color: var(--foreground);
+  padding: 0.5rem 0.625rem;
+  font-weight: 400;
+  outline: none;
+}
+
+.field-group textarea {
+  resize: vertical;
+}
+
+.field-group input::placeholder,
+.field-group textarea::placeholder {
+  color: var(--muted-foreground);
+  opacity: 0.88;
+}
+
+.field-group input:focus-visible,
+.field-group textarea:focus-visible,
+.field-group select:focus-visible {
+  border-color: var(--ring);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 30%, transparent);
+}
+
+.field-group small {
+  color: var(--muted-foreground);
+  font-size: var(--text-caption);
+  line-height: var(--text-caption--line-height);
+  font-weight: 400;
+}
+
+.empty-state {
+  display: grid;
+  justify-items: start;
+  gap: 0.5rem;
+  border: 1px solid var(--surface-border);
+  border-radius: var(--radius-xl);
+  background: var(--surface);
+  padding: 2rem;
+}
+
+.empty-state h1,
+.empty-state h2 {
+  margin: 0;
+  font-size: var(--text-title-lg);
+  line-height: var(--text-title-lg--line-height);
+  font-weight: 600;
+}
+
+.empty-state p {
+  margin: 0;
+  color: var(--muted-foreground);
+}
+
+.skeleton-line,
+.skeleton-block {
+  border-radius: var(--radius-lg);
+  background: var(--muted);
+  animation: bridge-skeleton 1.2s ease-in-out infinite alternate;
+}
+
+.skeleton-line {
+  height: 1.5rem;
+}
+
+.skeleton-block {
+  min-height: 8rem;
+}
+
+.diagnostics-output {
+  max-height: 34rem;
+  overflow: auto;
+  border: 1px solid var(--surface-border);
+  border-radius: var(--radius-xl);
+  background: var(--surface);
+  padding: 1rem;
+  color: var(--surface-foreground);
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+@keyframes bridge-skeleton {
+  from {
+    opacity: 0.55;
+  }
+  to {
+    opacity: 0.9;
+  }
+}
+
+@media (max-width: 767px) {
+  .app-container {
+    width: min(100% - 1.25rem, 72rem);
+  }
+
+  .runtime-grid,
+  .settings-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-line,
+  .skeleton-block {
+    animation: none;
+  }
+
+  [data-slot="dialog-overlay"],
+  [data-slot="dialog-content"] {
+    animation: none !important;
+    transition: none !important;
+  }
+}

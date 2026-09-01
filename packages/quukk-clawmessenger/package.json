@@ -1,0 +1,56 @@
+{
+  "name": "quukk-clawmessenger",
+  "version": "0.1.0-beta.1",
+  "description": "Connect local AI agents to ClawMessenger, built on Multica",
+  "type": "module",
+  "engines": { "node": ">=22.13.0" },
+  "bin": { "quukk-clawmessenger": "bin/quukk-clawmessenger.js" },
+  "files": ["bin", "dist", "scripts/audit-tarball.mjs", "scripts/postinstall.mjs", "LICENSE", "NOTICE", "MODIFICATIONS.md", "THIRD_PARTY_NOTICES.md", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "typecheck:e2e": "tsc -p test/e2e/tsconfig.json",
+    "test": "vitest run",
+    "prepublishOnly": "node scripts/audit-tarball.mjs",
+    "postinstall": "node scripts/postinstall.mjs"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/quukk/quukk-clawmessenger.git",
+    "directory": "packages/quukk-clawmessenger"
+  },
+  "bugs": {
+    "url": "https://github.com/quukk/quukk-clawmessenger/issues"
+  },
+  "homepage": "https://github.com/quukk/quukk-clawmessenger/tree/main/packages/quukk-clawmessenger#readme",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "tag": "beta"
+  },
+  "dependencies": {
+    "@rongcloud/engine": "5.38.0",
+    "@rongcloud/imlib-next": "5.38.0",
+    "fake-indexeddb": "6.2.5",
+    "jsdom": "29.0.1",
+    "ws": "8.20.0",
+    "zod": "4.3.6"
+  },
+  "optionalDependencies": {
+    "@quukk/clawmessenger-runtime-win32-x64": "0.1.0-beta.1",
+    "@quukk/clawmessenger-runtime-win32-arm64": "0.1.0-beta.1",
+    "@quukk/clawmessenger-runtime-darwin-x64": "0.1.0-beta.1",
+    "@quukk/clawmessenger-runtime-darwin-arm64": "0.1.0-beta.1",
+    "@quukk/clawmessenger-runtime-linux-x64": "0.1.0-beta.1",
+    "@quukk/clawmessenger-runtime-linux-arm64": "0.1.0-beta.1"
+  },
+  "devDependencies": {
+    "@multica/tsconfig": "workspace:*",
+    "@types/jsdom": "21.1.7",
+    "@types/node": "catalog:",
+    "@types/ws": "8.18.1",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

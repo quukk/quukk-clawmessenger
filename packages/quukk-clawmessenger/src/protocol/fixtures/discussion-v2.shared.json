@@ -1,0 +1,146 @@
+{
+  "hostTurn": {
+    "msg_type": "discussion_host_turn",
+    "protocolVersion": 2,
+    "discussionId": "discussion-42",
+    "chatroomId": "room-42",
+    "requestId": "host-request-1",
+    "stateVersion": 7,
+    "round": 2,
+    "timestamp": 1723950000000,
+    "topic": "Choose a safe migration path",
+    "goal": "Produce an actionable public plan",
+    "roles": {
+      "host-1": {
+        "memberId": "host-1",
+        "nodeId": "node-host",
+        "nickname": "Moderator",
+        "roleName": "Host",
+        "roleInstructions": "Coordinate the public discussion",
+        "capabilities": ["discussion_host"],
+        "isHost": true
+      },
+      "member-1": {
+        "memberId": "member-1",
+        "nodeId": "node-member",
+        "nickname": "Reviewer",
+        "roleName": "Safety reviewer",
+        "roleInstructions": "Identify migration and rollback risks",
+        "capabilities": ["discussion_participant", "artifact_markdown"],
+        "model": "openai/model-a",
+        "speakingOrder": 1
+      }
+    },
+    "allowedDecisions": ["assign", "synthesize", "finish", "fail"],
+    "remainingRounds": 2,
+    "eventSummary": "The team agreed to keep a rollback window.",
+    "currentArtifact": {
+      "artifactId": "artifact-7",
+      "artifactType": "markdown",
+      "title": "Migration plan",
+      "version": 3
+    }
+  },
+  "roundtableHostTurn": {
+    "msg_type": "discussion_host_turn",
+    "protocolVersion": 2,
+    "discussionId": "discussion-42",
+    "chatroomId": "room-42",
+    "requestId": "summary-request-1",
+    "stateVersion": 8,
+    "round": 2,
+    "timestamp": 1723950000100,
+    "topic": "Choose a safe migration path",
+    "goal": "Produce an actionable public plan",
+    "roles": {
+      "member-1": {
+        "memberId": "member-1",
+        "nodeId": "node-member",
+        "nickname": "Reviewer",
+        "roleName": "Safety reviewer",
+        "roleInstructions": "Identify migration and rollback risks",
+        "capabilities": ["discussion_participant"]
+      }
+    },
+    "allowedDecisions": ["checkpoint"],
+    "remainingRounds": 1,
+    "eventSummary": "Round two completed.",
+    "currentArtifact": null,
+    "mode": "roundtable",
+    "phase": "round_summary",
+    "roundSummaries": [],
+    "userInterjections": []
+  },
+  "assignment": {
+    "msg_type": "discussion_assignment",
+    "protocolVersion": 2,
+    "discussionId": "discussion-42",
+    "chatroomId": "room-42",
+    "requestId": "assignment-request-1",
+    "stateVersion": 7,
+    "round": 2,
+    "timestamp": 1723950000200,
+    "assignmentId": "assignment-1",
+    "targetId": "node-member",
+    "task": "List the two largest rollback risks.",
+    "topic": "Choose a safe migration path",
+    "goal": "Produce an actionable public plan",
+    "mode": "roundtable",
+    "model": "openai/model-a",
+    "role": {
+      "roleName": "Safety reviewer",
+      "roleInstructions": "Identify migration and rollback risks"
+    },
+    "speakingOrder": 1,
+    "roundFocus": "Compare migration failure modes",
+    "priorContributions": [],
+    "roundSummaries": [],
+    "userInterjections": [],
+    "attempt": 1
+  },
+  "cancel": {
+    "msg_type": "discussion_cancel",
+    "protocolVersion": 2,
+    "discussionId": "discussion-42",
+    "chatroomId": "room-42",
+    "requestId": "cancel-request-1",
+    "stateVersion": 8,
+    "round": 2,
+    "timestamp": 1723950000300,
+    "reason": "The owner stopped this round."
+  },
+  "artifactAck": {
+    "msg_type": "discussion_artifact_ack",
+    "protocolVersion": 2,
+    "discussionId": "discussion-42",
+    "chatroomId": "room-42",
+    "requestId": "host-request-1",
+    "stateVersion": 7,
+    "round": 2,
+    "timestamp": 1723950000400,
+    "updateId": "update-1",
+    "idempotencyKey": "update-1",
+    "artifactId": "artifact-7",
+    "artifactVersion": 4
+  },
+  "modelCatalogRequest": {
+    "msg_type": "discussion_model_catalog_request",
+    "protocolVersion": 2,
+    "requestId": "catalog-request-1",
+    "timestamp": 1723950000500
+  },
+  "modelCatalogResponse": {
+    "msg_type": "discussion_model_catalog_response",
+    "protocolVersion": 2,
+    "requestId": "catalog-request-1",
+    "defaultModel": "openai/model-a",
+    "providers": [
+      {
+        "id": "openai",
+        "name": "OpenAI",
+        "models": [{ "id": "model-a", "name": "Model A" }]
+      }
+    ],
+    "timestamp": 1723950000600
+  }
+}

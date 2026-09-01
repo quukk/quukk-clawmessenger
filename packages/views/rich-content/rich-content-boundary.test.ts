@@ -14,7 +14,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 
 const VIEWS_ROOT = join(__dirname, "..");
 
@@ -48,11 +48,15 @@ function stripComments(text: string): string {
   return text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 }
 
+function relativeSourcePath(from: string, to: string): string {
+  return relative(from, to).split(sep).join("/");
+}
+
 function sourceFiles(subdirs: string[]): { path: string; text: string }[] {
   return subdirs
     .flatMap((d) => walk(join(VIEWS_ROOT, d)))
     .map((path) => ({
-      path: relative(VIEWS_ROOT, path),
+      path: relativeSourcePath(VIEWS_ROOT, path),
       text: stripComments(readFileSync(path, "utf8")),
     }));
 }
@@ -122,7 +126,7 @@ describe("RichContent import boundary", () => {
     const offenders = walk(join(VIEWS_ROOT, "editor"))
       .filter((p) => !/readonly-content\.tsx$/.test(p))
       .map((path) => ({
-        path: relative(VIEWS_ROOT, path),
+        path: relativeSourcePath(VIEWS_ROOT, path),
         // stripComments, consistently with the other checks: an editor file may
         // *mention* RichContent in a doc comment (explaining why a helper is
         // shaped the way it is). Only real code references are violations.
@@ -141,7 +145,7 @@ describe("RichContent import boundary", () => {
     const offenders = walk(uiRoot)
       .map((path) => ({ path, text: stripComments(readFileSync(path, "utf8")) }))
       .filter(({ text }) => /\bRichContent\b|from\s+["']@multica\/views/.test(text))
-      .map(({ path }) => relative(uiRoot, path));
+      .map(({ path }) => relativeSourcePath(uiRoot, path));
 
     expect(offenders).toEqual([]);
   });

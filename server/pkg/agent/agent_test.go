@@ -1,15 +1,25 @@
 package agent
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+)
+
+const (
+	detectVersionOutputHelperEnv = "MULTICA_DETECT_VERSION_OUTPUT_HELPER"
+	combinedOutputOwnedHelperEnv = "MULTICA_COMBINED_OUTPUT_OWNED_HELPER"
+	combinedOutputSecret         = "secret-combined-output"
 )
 
 func TestNewReturnsClaudeBackend(t *testing.T) {
@@ -120,6 +130,132 @@ func TestDetectVersionFailsForMissingBinary(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing binary")
 	}
+}
+
+func TestDetectVersionRejectsOversizedOutput(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary: %v", err)
+	}
+	t.Setenv(detectVersionOutputHelperEnv, "oversized")
+
+	version, err := DetectVersion(context.Background(), NewCommand(self, []string{
+		"-test.run=^TestDetectVersionOutputLimitHelper$",
+		"--",
+	}))
+	if !errors.Is(err, bufio.ErrTooLong) {
+		t.Fatalf("DetectVersion error = %v, version bytes = %d, want output-limit classification", err, len(version))
+	}
+	if version != "" {
+		t.Fatalf("DetectVersion retained oversized output: %d bytes", len(version))
+	}
+	if strings.Contains(err.Error(), "secret-probe-output") || len(err.Error()) > 512 {
+		t.Fatalf("DetectVersion exposed probe output in error: %q", err)
+	}
+}
+
+func TestDetectVersionOutputLimitDoesNotMaskTimeout(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary: %v", err)
+	}
+	t.Setenv(detectVersionOutputHelperEnv, "timeout")
+	originalTimeout := detectVersionTimeout
+	detectVersionTimeout = 2 * time.Second
+	t.Cleanup(func() { detectVersionTimeout = originalTimeout })
+
+	version, err := DetectVersion(context.Background(), NewCommand(self, []string{
+		"-test.run=^TestDetectVersionOutputLimitHelper$",
+		"--",
+	}))
+	if err == nil || errors.Is(err, bufio.ErrTooLong) {
+		t.Fatalf("DetectVersion error = %v, want the execution timeout to take precedence", err)
+	}
+	if version != "" {
+		t.Fatalf("DetectVersion retained timed-out output: %d bytes", len(version))
+	}
+}
+
+func TestDetectVersionOutputLimitHelper(t *testing.T) {
+	mode := os.Getenv(detectVersionOutputHelperEnv)
+	if mode == "" {
+		t.Skip("helper process")
+	}
+	if _, err := os.Stdout.Write(bytes.Repeat([]byte("secret-probe-output\n"), 4<<10)); err != nil {
+		os.Exit(3)
+	}
+	if mode == "timeout" {
+		time.Sleep(time.Minute)
+	}
+	os.Exit(0)
+}
+
+func TestCombinedOutputOwnedLimit(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary: %v", err)
+	}
+
+	for _, test := range []struct {
+		name string
+		mode string
+	}{
+		{name: "exactly 64 KiB succeeds", mode: "exact"},
+		{name: "oversized success returns output limit", mode: "oversized"},
+		{name: "execution error takes precedence", mode: "oversized-exit"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(combinedOutputOwnedHelperEnv, test.mode)
+			cmd := NewCommand(self, []string{
+				"-test.run=^TestCombinedOutputOwnedHelper$",
+				"--",
+			}).exec(context.Background())
+			output, err := combinedOutputOwned(cmd, nil)
+
+			switch test.mode {
+			case "exact":
+				if err != nil || len(output) != probeOutputLimitBytes {
+					t.Fatalf("exact-limit result: output bytes = %d, error = %v", len(output), err)
+				}
+			case "oversized":
+				if !errors.Is(err, bufio.ErrTooLong) {
+					t.Fatalf("oversized success error = %v, want output-limit classification", err)
+				}
+			case "oversized-exit":
+				var exitErr *exec.ExitError
+				if errors.Is(err, bufio.ErrTooLong) || !errors.As(err, &exitErr) || exitErr.ExitCode() != 7 {
+					t.Fatalf("oversized failed process error = %v, want exit code 7 with execution precedence", err)
+				}
+			}
+			if test.mode != "exact" && (len(output) != 0 || strings.Contains(err.Error(), combinedOutputSecret)) {
+				t.Fatalf("oversized result leaked output: output bytes = %d, error = %q", len(output), err)
+			}
+		})
+	}
+}
+
+func TestCombinedOutputOwnedHelper(t *testing.T) {
+	mode := os.Getenv(combinedOutputOwnedHelperEnv)
+	if mode == "" {
+		t.Skip("helper process")
+	}
+	size := probeOutputLimitBytes
+	if mode != "exact" {
+		size++
+	}
+	payload := bytes.Repeat([]byte("x"), size)
+	copy(payload, combinedOutputSecret)
+	middle := len(payload) / 2
+	if _, err := os.Stdout.Write(payload[:middle]); err != nil {
+		os.Exit(3)
+	}
+	if _, err := os.Stderr.Write(payload[middle:]); err != nil {
+		os.Exit(4)
+	}
+	if mode == "oversized-exit" {
+		os.Exit(7)
+	}
+	os.Exit(0)
 }
 
 // TestDetectVersionTimesOutOnHang guards MUL-3812: a CLI whose `--version`

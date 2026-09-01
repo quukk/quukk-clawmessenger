@@ -1,0 +1,45 @@
+{
+  "passTurn": {
+    "msg_type": "discussion_token",
+    "service": "openclaw_coord",
+    "discussion_id": "discussion-1",
+    "version": 1,
+    "action": "pass_turn",
+    "payload": {
+      "group_id": "group-1",
+      "turn_order": ["node-a", "node-b"],
+      "current_speaker": "node-a",
+      "current_speaker_name": "Agent A",
+      "next_speaker": "node-b",
+      "round": 1,
+      "max_rounds": 2,
+      "originator_user": "user-1",
+      "originator_text": "Compare the migration choices.",
+      "originator_msg_uid": "origin-1",
+      "started_at": 1723950000000,
+      "mention_ordered": true,
+      "last_speaker_response": "Option A keeps rollback simple."
+    },
+    "timestamp": 1723950000100
+  },
+  "endDiscussion": {
+    "msg_type": "discussion_token",
+    "service": "openclaw_coord",
+    "discussion_id": "discussion-1",
+    "version": 1,
+    "action": "end_discussion",
+    "payload": {
+      "group_id": "group-1",
+      "turn_order": ["node-a", "node-b"],
+      "current_speaker": "node-b",
+      "round": 2,
+      "max_rounds": 2,
+      "originator_user": "user-1",
+      "originator_text": "Compare the migration choices.",
+      "originator_msg_uid": "origin-1",
+      "started_at": 1723950000000,
+      "mention_ordered": true
+    },
+    "timestamp": 1723950000200
+  }
+}

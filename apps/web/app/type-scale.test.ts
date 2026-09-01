@@ -54,7 +54,10 @@ const sourceExtensions = [".ts", ".tsx", ".css"];
  * relative-unit rule is lifted for them.
  */
 const marketingPaths = ["apps/web/app/(landing)", "apps/web/features/landing"];
-const isMarketing = (rel: string) => marketingPaths.some((p) => rel.startsWith(p));
+const isMarketing = (rel: string) => {
+  const portablePath = rel.replaceAll("\\", "/");
+  return marketingPaths.some((path) => portablePath.startsWith(path));
+};
 
 /**
  * Tailwind's default steps that the role scale replaces one-for-one. `text-4xl`
@@ -148,6 +151,12 @@ function collectSourceFiles(dir: string, found: string[] = []): string[] {
 
 describe("type scale", () => {
   const tokens = readFileSync(resolve(repoRoot, "packages/ui/styles/tokens.css"), "utf8");
+
+  it("recognizes marketing paths on POSIX and Windows", () => {
+    expect(isMarketing("apps/web/app/(landing)/page.tsx")).toBe(true);
+    expect(isMarketing("apps\\web\\features\\landing\\hero.tsx")).toBe(true);
+    expect(isMarketing("apps/web/app/settings/page.tsx")).toBe(false);
+  });
 
   it.each(SCALE)("defines --text-%s with a paired line-height", (name, size, lineHeight) => {
     expect(tokens).toContain(`--text-${name}: ${size}px;`);
