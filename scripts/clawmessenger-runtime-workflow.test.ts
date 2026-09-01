@@ -90,6 +90,12 @@ async function loadWorkflow(): Promise<RuntimeWorkflow> {
   ) as RuntimeWorkflow;
 }
 
+async function loadCiWorkflow(): Promise<RuntimeWorkflow> {
+  return parseYaml(
+    await readFile(join(REPO_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8'),
+  ) as RuntimeWorkflow;
+}
+
 function requiredJob(workflow: RuntimeWorkflow, id: string): WorkflowJob {
   const job = workflow.jobs[id];
   expect(job, `missing ${id} job`).toBeDefined();
@@ -101,6 +107,20 @@ function requiredStep(job: WorkflowJob, name: string): WorkflowStep {
   expect(step, `missing ${name} step`).toBeDefined();
   return step;
 }
+
+describe('main CI runtime test environment', () => {
+  it('provides task-scoped temp and avoids cross-package timeout contention', async () => {
+    const workflow = await loadCiWorkflow();
+    const frontendTest = requiredJob(workflow, 'frontend-test');
+    const test = requiredStep(frontendTest, 'Test web, core, and desktop');
+
+    expect(test.env).toMatchObject({
+      TEMP: '${{ runner.temp }}',
+      TMP: '${{ runner.temp }}',
+    });
+    expect(test.run).toContain('--concurrency=1');
+  });
+});
 
 describe('Quukk ClawMessenger seven-package workflow', () => {
   it('runs the exact Bridge and runtime-access Go contracts before artifact builds', async () => {
