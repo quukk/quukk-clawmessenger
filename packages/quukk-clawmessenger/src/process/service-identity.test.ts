@@ -186,6 +186,42 @@ describe('DaemonIdentityStore', () => {
     const parent = await fsLstat(dirname(filePath));
     expect(parent.isDirectory()).toBe(true);
     expect(parent.isSymbolicLink()).toBe(false);
+    if (process.platform !== 'win32') {
+      expect((await fsStat(dirname(filePath))).mode & 0o777).toBe(0o700);
+    }
+  });
+
+  it('rejects a file in place of the storage directory without creating daemon.pid', async () => {
+    await mkdir(TASK_TEMP_ROOT, { recursive: true });
+    const home = await mkdtemp(join(TASK_TEMP_ROOT, 'quukk-task11-storage-file-'));
+    temporaryDirectories.push(home);
+    const filePath = localPaths(home).daemonPid;
+    const storageDirectory = dirname(filePath);
+    await mkdir(dirname(storageDirectory), { recursive: true });
+    await writeFile(storageDirectory, 'not-a-directory');
+
+    await expect(new DaemonIdentityStore({ filePath }).claim(starting()))
+      .rejects.toMatchObject({ code: 'identity_write_failed' });
+    expect(await fsLstat(filePath).then(() => true, () => false)).toBe(false);
+    await expect(readFile(storageDirectory, 'utf8')).resolves.toBe('not-a-directory');
+  });
+
+  it('rejects a storage-directory symlink without creating daemon.pid', async () => {
+    await mkdir(TASK_TEMP_ROOT, { recursive: true });
+    const home = await mkdtemp(join(TASK_TEMP_ROOT, 'quukk-task11-storage-symlink-'));
+    temporaryDirectories.push(home);
+    const filePath = localPaths(home).daemonPid;
+    const storageDirectory = dirname(filePath);
+    const outsideStorage = join(home, 'outside-storage');
+    await mkdir(dirname(storageDirectory), { recursive: true });
+    await mkdir(outsideStorage);
+    await symlink(outsideStorage, storageDirectory, process.platform === 'win32' ? 'junction' : 'dir');
+
+    await expect(new DaemonIdentityStore({ filePath }).claim(starting()))
+      .rejects.toMatchObject({ code: 'identity_write_failed' });
+    expect((await fsLstat(storageDirectory)).isSymbolicLink()).toBe(true);
+    expect(await fsLstat(filePath).then(() => true, () => false)).toBe(false);
+    expect(await fsLstat(join(outsideStorage, 'daemon.pid')).then(() => true, () => false)).toBe(false);
   });
 
   it('claims daemon.pid exclusively, returns the raw digest, and enforces Unix modes', async () => {
@@ -237,11 +273,21 @@ describe('DaemonIdentityStore', () => {
     const filePath = await identityPath('claim-loser');
     await new DaemonIdentityStore({ filePath }).claim(starting());
     const lifecycleCalls: string[] = [];
+    const storageDirectoryChmods: number[] = [];
+    const identityMetadataCalls: string[] = [];
     const loser = new DaemonIdentityStore({
       filePath,
       dependencies: {
+        platform: 'linux',
         open: async (path, flags, mode) => {
           lifecycleCalls.push(`open:${String(flags)}`);
+          if (String(path) === dirname(filePath)) {
+            return {
+              stat: async () => ({ isDirectory: () => true }),
+              chmod: async (nextMode: number) => { storageDirectoryChmods.push(nextMode); },
+              close: async () => undefined,
+            } as unknown as Awaited<ReturnType<typeof fsOpen>>;
+          }
           return fsOpen(path, flags, mode);
         },
         mkdir: (async (...args: Parameters<typeof mkdir>) => {
@@ -249,26 +295,28 @@ describe('DaemonIdentityStore', () => {
           return mkdir(...args);
         }) as DaemonIdentityDependencies['mkdir'],
         chmod: async (path, mode) => {
-          lifecycleCalls.push('chmod');
+          identityMetadataCalls.push('chmod');
           await fsChmod(path, mode);
         },
         rename: async (source, destination) => {
-          lifecycleCalls.push('rename');
+          identityMetadataCalls.push('rename');
           await rename(source, destination);
         },
         link: async (existingPath, newPath) => {
-          lifecycleCalls.push('link');
+          identityMetadataCalls.push('link');
           await fsLink(existingPath, newPath);
         },
         unlink: async (path) => {
-          lifecycleCalls.push('unlink');
+          identityMetadataCalls.push('unlink');
           await fsUnlink(path);
         },
       },
     });
 
     await expect(loser.claim(starting())).resolves.toBe(false);
-    expect(lifecycleCalls).toEqual(['open:wx']);
+    expect(lifecycleCalls.filter((call) => call === 'open:wx')).toHaveLength(1);
+    expect(storageDirectoryChmods).toEqual([0o700]);
+    expect(identityMetadataCalls).toEqual([]);
     await expect(new DaemonIdentityStore({ filePath }).read())
       .resolves.toMatchObject({ identity: starting() });
   });
