@@ -13,6 +13,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { parse as parseYaml } from 'yaml';
 import {
   buildRuntime,
   parseBuildArguments,
@@ -21,7 +22,7 @@ import {
 } from './build-clawmessenger-runtime.mjs';
 import { verifyRuntimePackage } from './verify-clawmessenger-runtime.mjs';
 
-const VERSION = '0.1.0-beta.4';
+const VERSION = '0.1.0-beta.5';
 const SOURCE_COMMIT = 'a'.repeat(40);
 const MODULES = [
   'github.com/example/common@v1.2.3',
@@ -751,6 +752,39 @@ describe('verifyRuntimePackage', () => {
 });
 
 describe('published runtime package metadata', () => {
+  it('pins the public entry package to the patched ws release', async () => {
+    const entryPackage = JSON.parse(
+      await readFile(join(REPO_ROOT, 'packages', 'quukk-clawmessenger', 'package.json'), 'utf8'),
+    );
+
+    expect(entryPackage.dependencies.ws).toBe('8.21.0');
+  });
+
+  it('keeps every platform runtime pinned in the cross-platform lockfile importer', async () => {
+    const lockfile = parseYaml(await readFile(join(REPO_ROOT, 'pnpm-lock.yaml'), 'utf8')) as {
+      importers?: Record<string, {
+        optionalDependencies?: Record<string, { specifier?: string }>;
+      }>;
+    };
+    const optionalDependencies = lockfile.importers?.['packages/quukk-clawmessenger']
+      ?.optionalDependencies;
+    const targets = [
+      runtimeTarget('win32', 'x64'),
+      runtimeTarget('win32', 'arm64'),
+      runtimeTarget('darwin', 'x64'),
+      runtimeTarget('darwin', 'arm64'),
+      runtimeTarget('linux', 'x64'),
+      runtimeTarget('linux', 'arm64'),
+    ];
+
+    expect(optionalDependencies).toEqual(Object.fromEntries(
+      targets.map((target) => [target.packageName, {
+        specifier: VERSION,
+        version: `link:../${target.directory}`,
+      }]),
+    ));
+  });
+
   it('pins all six optional packages to the entry version with exact platform payloads', async () => {
     const entryPackage = JSON.parse(
       await readFile(join(REPO_ROOT, 'packages', 'quukk-clawmessenger', 'package.json'), 'utf8'),
