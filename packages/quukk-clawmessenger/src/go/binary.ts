@@ -53,6 +53,7 @@ const ManifestSchema = z.strictObject({
   sourceCommit: z.string().regex(/^[0-9a-f]{40}$/),
   sha256: z.string().regex(/^[0-9a-f]{64}$/),
   binary: z.enum(['multica.exe', 'multica']),
+  modules: z.array(z.string().regex(/^[^\s@]+@v[^\s@]+$/)).min(1).max(256),
 });
 
 const packageMatrix: Record<string, BridgeRuntimePackage> = {
