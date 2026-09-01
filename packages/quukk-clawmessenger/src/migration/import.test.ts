@@ -3,6 +3,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rename,
   rm,
   symlink,
@@ -253,11 +254,12 @@ describe('legacy OpenCode ClawMessenger migration', () => {
     expect(await lstat(localPaths(home).config).then(() => true, () => false)).toBe(false);
 
     const imported = await importLegacyConfig({ confirmed: true, candidate: importable, store });
+    const canonicalWorkdir = await realpath(workdir);
 
     expect(imported).toMatchObject({
       serverUrl: 'https://bridge.example.test/im',
-      defaultWorkdir: workdir,
-      authorizedWorkRoots: [workdir],
+      defaultWorkdir: canonicalWorkdir,
+      authorizedWorkRoots: [canonicalWorkdir],
       providerPathOverrides: {},
     });
     expect(await store.snapshot({}, {})).toMatchObject({ config: imported, bindings: [] });

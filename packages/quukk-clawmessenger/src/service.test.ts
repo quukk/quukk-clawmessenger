@@ -1,6 +1,6 @@
-import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -390,6 +390,7 @@ type Fixture = Awaited<ReturnType<typeof fixture>>;
 async function fixture(input: {
   bindings?: RuntimeBinding[];
   storageRoot?: string;
+  ServiceClass?: typeof QuukkService;
   configOverrides?: ConfigOverrides;
   configEnvironment?: NodeJS.ProcessEnv;
   startupTimeoutMs?: number;
@@ -427,7 +428,8 @@ async function fixture(input: {
     stop: async () => { trace.push('bridge.stop'); },
   };
   let capturedControlCredential: string | undefined;
-  const service = new QuukkService({
+  const ServiceClass = input.ServiceClass ?? QuukkService;
+  const service = new ServiceClass({
     identity: STARTING,
     identityStore,
     store,
@@ -624,6 +626,58 @@ describe('QuukkService lifecycle', () => {
       storageDir: join(f.storageRoot, binding.runtimeId),
     }]);
     await f.service.stop();
+  });
+
+  it('accepts a canonical Windows storage alias after checking the configured path for reparses', async () => {
+    const aliasRoot = await temporaryDirectory();
+    const expandedRoot = await temporaryDirectory();
+    const actualFs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    const canonicalExpandedRoot = await actualFs.realpath(expandedRoot);
+    vi.resetModules();
+    vi.doMock('node:fs/promises', () => ({
+      ...actualFs,
+      realpath: async (path: Parameters<typeof actualFs.realpath>[0]) => {
+        const requested = resolve(String(path));
+        const aliasChild = relative(aliasRoot, requested);
+        if (aliasChild === '') return canonicalExpandedRoot;
+        if (!aliasChild.startsWith('..') && !isAbsolute(aliasChild)) {
+          return join(canonicalExpandedRoot, aliasChild);
+        }
+        return actualFs.realpath(path);
+      },
+    }));
+    try {
+      const isolated = await import('./service.js');
+      const runtimeRoot = await temporaryDirectory();
+      const binding = completeBinding('opencode', runtimeRoot);
+      const f = await fixture({
+        bindings: [binding],
+        storageRoot: aliasRoot,
+        ServiceClass: isolated.QuukkService,
+      });
+      f.runtime.catalog = runtimeCatalog(runtimeRoot);
+
+      await expect(f.service.start()).resolves.toEqual(READY);
+      expect((await stat(join(aliasRoot, binding.runtimeId))).isDirectory()).toBe(true);
+      await f.service.stop();
+    } finally {
+      vi.doUnmock('node:fs/promises');
+      vi.resetModules();
+    }
+  });
+
+  it('still rejects a storage root reached through a directory reparse', async () => {
+    const parent = await temporaryDirectory();
+    const target = await temporaryDirectory();
+    const linkedStorage = join(parent, 'linked-storage');
+    await symlink(target, linkedStorage, process.platform === 'win32' ? 'junction' : 'dir');
+    const runtimeRoot = await temporaryDirectory();
+    const binding = completeBinding('opencode', runtimeRoot);
+    const f = await fixture({ bindings: [binding], storageRoot: linkedStorage });
+    f.runtime.catalog = runtimeCatalog(runtimeRoot);
+
+    await expect(f.service.start()).rejects.toMatchObject({ code: 'operation_unavailable' });
+    expect(f.trace).not.toContain(`router.activate:${binding.runtimeId}:${binding.nodeId}`);
   });
 
   it('rejects a different runtime client and rolls every owned component back in reverse order', async () => {

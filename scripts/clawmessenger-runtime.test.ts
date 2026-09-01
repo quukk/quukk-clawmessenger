@@ -3,6 +3,7 @@ import {
   writeFile,
   mkdir,
   mkdtemp,
+  realpath,
   rename,
   rm,
   symlink,
@@ -312,8 +313,9 @@ describe('buildRuntime', () => {
       execute,
     });
 
+    const expectedRoot = await realpath(root);
     const expectedDirectory = join(
-      root,
+      expectedRoot,
       'packages',
       'quukk-clawmessenger-runtime-win32-x64',
     );
@@ -369,7 +371,7 @@ describe('buildRuntime', () => {
         './cmd/multica',
       ],
       options: expect.objectContaining({
-        cwd: join(root, 'server'),
+        cwd: join(expectedRoot, 'server'),
         shell: false,
         env: expectedBuildEnvironment,
       }),

@@ -1,5 +1,5 @@
 import { chmod, lstat, mkdir, realpath } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 
@@ -356,6 +356,16 @@ function samePath(left: string, right: string): boolean {
     : resolve(left) === resolve(right);
 }
 
+async function assertNoSymlinkTraversal(input: string): Promise<void> {
+  const normalized = resolve(input);
+  const filesystemRoot = parse(normalized).root;
+  let current = filesystemRoot;
+  for (const segment of normalized.slice(filesystemRoot.length).split(/[\\/]+/u).filter(Boolean)) {
+    current = join(current, segment);
+    if ((await lstat(current)).isSymbolicLink()) throw new ServiceError('operation_unavailable');
+  }
+}
+
 function safeLog(logger: ServiceLoggerPort | undefined, level: 'info' | 'warn' | 'error', event: SafeLogEvent): void {
   try {
     logger?.[level](event);
@@ -489,13 +499,13 @@ async function ensureProtectedStorage(root: string, runtimeId: string): Promise<
   if (!RUNTIME_ID_PATTERN.test(runtimeId)) throw new ServiceError('operation_unavailable');
   try {
     await mkdir(root, { recursive: true, mode: 0o700 });
+    await assertNoSymlinkTraversal(root);
     const rootMetadata = await lstat(root);
     if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
       throw new ServiceError('operation_unavailable');
     }
     if (process.platform !== 'win32') await chmod(root, 0o700);
     const canonicalRoot = await realpath(root);
-    if (!samePath(canonicalRoot, root)) throw new ServiceError('operation_unavailable');
     const requested = join(root, runtimeId);
     await mkdir(requested, { recursive: true, mode: 0o700 });
     const metadata = await lstat(requested);

@@ -121,9 +121,6 @@ export async function verifyRuntimePackage(requestedPackage, options = {}) {
   if (!match) throw new Error('path is outside supported runtime package');
   const target = runtimeTarget(match[1], match[2]);
   const expectedPackage = join(packages, target.directory);
-  if (!samePath(requested, expectedPackage)) {
-    throw new Error('path is outside supported runtime package');
-  }
 
   const packageInfo = await lstat(requested);
   if (packageInfo.isSymbolicLink()) throw new Error('runtime package may not be a symlink');
