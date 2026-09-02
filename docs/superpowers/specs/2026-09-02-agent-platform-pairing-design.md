@@ -198,7 +198,7 @@ Client-visible readiness values are `ready`, `not_ready`, and `already_registere
 
 - **Expired QR:** reject inspection or confirmation and direct the user to regenerate it on the computer.
 - **Plugin temporarily offline:** retain a confirmed selection for up to one additional minute within the session deadline; resume when the package polls again.
-- **Plugin process restart:** because the private device secret and candidate-to-runtime map are memory-only, cancel the old session during startup recovery and require a fresh QR code. Already committed bindings remain valid.
+- **Plugin process restart:** because the private device secret and candidate-to-runtime map are memory-only, startup creates a fresh session with the same installation abuse key; the server atomically expires that installation's previous active session. Already committed bindings remain valid.
 - **Runtime disappears after selection:** fail only that candidate with `runtime_unavailable`; other candidates continue.
 - **Partial failure:** keep successful bindings and expose retry for eligible failed candidates. Do not delete successfully created nodes.
 - **Duplicate requests:** return the recorded result for the same idempotency key.

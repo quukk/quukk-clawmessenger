@@ -65,6 +65,7 @@ The four repositories form one protocol and are not independently shippable for 
 
 - Create `src/utils/pairing-contract.js` and test.
 - Create `src/utils/pairing-service.js` and test.
+- Modify `src/utils/system-service-client.js`: add authenticated pairing command methods.
 - Create `src/subPackages/remote/utils/pairing-qr.js` and test.
 - Create `src/subPackages/remote/components/pairing-platform-picker.vue` and test.
 - Modify `src/subPackages/remote/pages/remote/index.vue`: remove node-ID entry and connect scanning to selection/progress.
@@ -111,6 +112,12 @@ def test_audit_records_safe_transition_metadata_only(repository, session):
     assert event["event_type"] == "session_claimed"
     assert "ticket" not in json.dumps(event)
     assert "device_secret" not in json.dumps(event)
+
+def test_new_session_expires_previous_active_session_for_same_installation(repository):
+    first = repository.create_session([ready_candidate("cand-a")], "same-bucket")
+    second = repository.create_session([ready_candidate("cand-b")], "same-bucket")
+    assert repository.inspect(first.ticket).error_code == "session_expired"
+    assert repository.inspect(second.ticket).status == "waiting"
 ```
 
 - [ ] **Step 2: Run the new repository tests and verify failure**
@@ -327,7 +334,7 @@ git commit -m "feat: register paired agents atomically"
 
 **Interfaces:**
 - Produces: `PairingCandidate`, `PairingSession`, `PairingSelection`, `PairingProgress`, and `PairingRegistrationAuthorization`.
-- Produces: `PairingClient.createSession`, `pollSelection`, `registerCandidate`, and `cancelSession`.
+- Produces: `PairingClient.createSession`, `pollSelection`, and `cancelSession`; node credential registration remains owned by `RegistrationClient` in Task 5.
 
 - [ ] **Step 1: Write schema and transport failure tests**
 
@@ -408,8 +415,10 @@ it('registers exactly the selected ready runtimes', async () => {
 it('invalidates an in-memory session after service restart', async () => {
   const first = await service.start();
   await restartedService.recover();
-  expect(client.cancelSession).toHaveBeenCalledWith(first.ticket, expect.any(String));
-  expect(restartedService.snapshot().state).toBe('idle');
+  const second = restartedService.snapshot();
+  expect(client.createSession).toHaveBeenCalledTimes(2);
+  expect(second.state).toBe('waiting');
+  expect(second.ticket).not.toBe(first.ticket);
 });
 ```
 
@@ -688,6 +697,7 @@ git commit -m "feat(web): select local agents after QR scan"
 - Create: `clawmessenger-uniapp/src/utils/pairing-contract.test.js`
 - Create: `clawmessenger-uniapp/src/utils/pairing-service.js`
 - Create: `clawmessenger-uniapp/src/utils/pairing-service.test.js`
+- Modify: `clawmessenger-uniapp/src/utils/system-service-client.js`
 - Create: `clawmessenger-uniapp/src/subPackages/remote/utils/pairing-qr.js`
 - Create: `clawmessenger-uniapp/src/subPackages/remote/utils/pairing-qr.test.js`
 
