@@ -108,7 +108,6 @@ export function PairingPanel({ api, initialSnapshot, now: clock = Date.now }: Pa
   const [actionBusy, setActionBusy] = useState(false);
   const [requestFailed, setRequestFailed] = useState(false);
   const actionGeneration = useRef(0);
-  const mounted = useRef(true);
   const actionController = useRef<AbortController | undefined>(undefined);
   const pollController = useRef<AbortController | undefined>(undefined);
   const displayState: PairingState = isExpiredWaiting(snapshot, currentTime)
@@ -117,7 +116,6 @@ export function PairingPanel({ api, initialSnapshot, now: clock = Date.now }: Pa
 
   useEffect(
     () => () => {
-      mounted.current = false;
       actionGeneration.current += 1;
       actionController.current?.abort();
       pollController.current?.abort();
@@ -133,18 +131,18 @@ export function PairingPanel({ api, initialSnapshot, now: clock = Date.now }: Pa
     const timer = window.setTimeout(() => {
       const requestTime = clock();
       if (isExpiredWaiting(snapshot, requestTime)) {
-        if (active && mounted.current) setCurrentTime(requestTime);
+        if (active) setCurrentTime(requestTime);
         return;
       }
       void api.getPairing(controller.signal).then(
         (next) => {
-          if (active && mounted.current) {
+          if (active) {
             setRequestFailed(false);
             setSnapshot({ ...next });
           }
         },
         () => {
-          if (active && mounted.current && !controller.signal.aborted) {
+          if (active && !controller.signal.aborted) {
             setRequestFailed(true);
             setSnapshot((current) => ({ ...current }));
           }
@@ -174,7 +172,7 @@ export function PairingPanel({ api, initialSnapshot, now: clock = Date.now }: Pa
       const observedTime = clock();
       const remaining = deadline - observedTime;
       if (remaining <= 0) {
-        if (active && mounted.current) setCurrentTime(observedTime);
+        if (active) setCurrentTime(observedTime);
         return;
       }
       timer = window.setTimeout(schedule, Math.min(remaining, MAX_TIMEOUT_MS));
@@ -213,7 +211,7 @@ export function PairingPanel({ api, initialSnapshot, now: clock = Date.now }: Pa
   }
 
   function isCurrent(generation: number): boolean {
-    return mounted.current && actionGeneration.current === generation;
+    return actionGeneration.current === generation;
   }
 
   async function regenerate() {

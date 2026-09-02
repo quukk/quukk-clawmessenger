@@ -1,7 +1,7 @@
 import '@testing-library/jest-dom/vitest';
 
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
-import { useState } from 'react';
+import { StrictMode, useState } from 'react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -154,7 +154,11 @@ describe('pairing panel', () => {
       );
     }
 
-    render(<Harness />);
+    render(
+      <StrictMode>
+        <Harness />
+      </StrictMode>,
+    );
     expect(screen.getByLabelText(/pairing qr code/i)).toBeVisible();
 
     await act(async () => {
