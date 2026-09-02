@@ -8,6 +8,7 @@ import {
   RUNTIME_SOURCE_DOCUMENT,
   isRecognizedGoVersion,
   isSafePackageVersion,
+  runtimeDependencyVersion,
   runtimeTarget,
 } from './build-clawmessenger-runtime.mjs';
 
@@ -160,6 +161,7 @@ export async function verifyRuntimePackage(requestedPackage, options = {}) {
     join(packageDirectory, 'package.json'),
     'runtime package metadata',
   );
+  const runtimeVersion = runtimeDependencyVersion(entryPackage);
   const packagedFiles = [
     target.binary,
     'manifest.json',
@@ -170,9 +172,9 @@ export async function verifyRuntimePackage(requestedPackage, options = {}) {
   if (
     typeof entryPackage.version !== 'string' ||
     !isSafePackageVersion(entryPackage.version) ||
-    packageJson.version !== entryPackage.version
+    packageJson.version !== runtimeVersion
   ) {
-    throw new Error('runtime package version does not match a safe entry package version');
+    throw new Error('runtime package version does not match a safe entry dependency pin');
   }
   if (
     !isExactStringArray(Object.keys(packageJson).sort(), RUNTIME_PACKAGE_FIELDS) ||

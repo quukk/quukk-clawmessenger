@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 
 import { z } from 'zod';
 
-import { VERSION } from '../version.js';
+import { RUNTIME_VERSION } from '../version.js';
 
 const MANIFEST_LIMIT = 64 << 10;
 
@@ -131,7 +131,7 @@ function defaults(
   return {
     platform: overrides.platform ?? process.platform,
     arch: overrides.arch ?? process.arch,
-    expectedVersion: overrides.expectedVersion ?? VERSION,
+    expectedVersion: overrides.expectedVersion ?? RUNTIME_VERSION,
     resolvePackageRoot: overrides.resolvePackageRoot ?? defaultResolvePackageRoot,
     readFile: overrides.readFile ?? readBoundedFile,
     stat: overrides.stat ?? fsStat,

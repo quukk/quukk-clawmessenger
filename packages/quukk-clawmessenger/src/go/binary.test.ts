@@ -2,6 +2,8 @@ import { join, resolve } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
 
+import packageJson from '../../package.json' with { type: 'json' };
+
 import {
   BridgeBinaryError,
   bridgeRuntimePackage,
@@ -78,6 +80,26 @@ describe('bridgeRuntimePackage', () => {
 });
 
 describe('resolveBridgeBinary', () => {
+  it('uses the pinned runtime dependency version when it differs from the entry version', async () => {
+    const runtimeVersion = packageJson.optionalDependencies[
+      '@quukk/clawmessenger-runtime-win32-x64'
+    ];
+    const configured = dependencies({
+      resolvePackageRoot: async () => ({
+        root: 'D:\\fixture\\runtime',
+        packageVersion: runtimeVersion,
+      }),
+      readFile: async () => Buffer.from(JSON.stringify(manifest({ version: runtimeVersion }))),
+    });
+    const { expectedVersion: _entryVersionDefault, ...usesPackageDefault } = configured;
+
+    expect(packageJson.version).not.toBe(runtimeVersion);
+    await expect(resolveBridgeBinary(usesPackageDefault)).resolves.toMatchObject({
+      version: runtimeVersion,
+      sha256: abcSHA256,
+    });
+  });
+
   it('accepts the generated runtime manifest including its Go module inventory', async () => {
     await expect(resolveBridgeBinary(dependencies())).resolves.toMatchObject({
       version,

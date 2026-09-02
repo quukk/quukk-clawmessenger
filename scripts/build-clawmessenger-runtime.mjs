@@ -73,6 +73,9 @@ const TARGETS = new Map(
     ];
   }),
 );
+const RUNTIME_PACKAGE_NAMES = Object.freeze(
+  [...TARGETS.values()].map((target) => target.packageName).sort(),
+);
 
 /** @typedef {(file: string, args: readonly string[], options: {cwd: string, env: NodeJS.ProcessEnv, shell: false}) => Promise<{stdout: string, stderr: string}>} RuntimeCommandExecutor */
 
@@ -112,6 +115,30 @@ export function isRecognizedGoVersion(value) {
 /** @param {string} value */
 export function isSafePackageVersion(value) {
   return PACKAGE_VERSION.test(value);
+}
+
+/** @param {unknown} entryPackage */
+export function runtimeDependencyVersion(entryPackage) {
+  const dependencies = entryPackage !== null && typeof entryPackage === 'object'
+    && !Array.isArray(entryPackage)
+    ? entryPackage.optionalDependencies
+    : undefined;
+  if (dependencies === null || typeof dependencies !== 'object' || Array.isArray(dependencies)) {
+    throw new Error('entry package runtime dependency pins must be exact, safe, and uniform');
+  }
+  const names = Object.keys(dependencies).sort();
+  const versions = RUNTIME_PACKAGE_NAMES.map((name) => dependencies[name]);
+  const version = versions[0];
+  if (
+    names.length !== RUNTIME_PACKAGE_NAMES.length
+    || names.some((name, index) => name !== RUNTIME_PACKAGE_NAMES[index])
+    || typeof version !== 'string'
+    || !isSafePackageVersion(version)
+    || versions.some((candidate) => candidate !== version)
+  ) {
+    throw new Error('entry package runtime dependency pins must be exact, safe, and uniform');
+  }
+  return version;
 }
 
 /** @type {RuntimeCommandExecutor} */
@@ -265,13 +292,14 @@ export async function buildRuntime(options) {
     join(location.root, 'packages', 'quukk-clawmessenger', 'package.json'),
   );
   const runtimePackage = await readJson(join(location.packageDirectory, 'package.json'));
+  const runtimeVersion = runtimeDependencyVersion(entryPackage);
   if (
     typeof entryPackage.version !== 'string' ||
     !isSafePackageVersion(entryPackage.version) ||
-    runtimePackage.version !== entryPackage.version ||
+    runtimePackage.version !== runtimeVersion ||
     runtimePackage.name !== target.packageName
   ) {
-    throw new Error('runtime package version or name does not match entry package');
+    throw new Error('runtime package version or name does not match entry dependency pin');
   }
 
   const binaryPath = join(location.packageDirectory, target.binary);
@@ -300,7 +328,7 @@ export async function buildRuntime(options) {
     '-s',
     '-w',
     '-X',
-    `main.version=${entryPackage.version}`,
+    `main.version=${runtimeVersion}`,
     '-X',
     `main.commit=${sourceCommit}`,
     '-X',
@@ -329,7 +357,7 @@ export async function buildRuntime(options) {
   const moduleResult = await execute('go', ['version', '-m', binaryPath], commandOptions);
 
   const manifest = {
-    version: entryPackage.version,
+    version: runtimeVersion,
     goVersion,
     sourceCommit,
     modules: parseGoModules(moduleResult.stdout),

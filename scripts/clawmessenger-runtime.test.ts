@@ -23,7 +23,7 @@ import {
 import { verifyRuntimePackage } from './verify-clawmessenger-runtime.mjs';
 
 const VERSION = '0.1.0-beta.5';
-const ENTRY_VERSION = '0.1.0-beta.6';
+const ENTRY_VERSION = '0.1.0-beta.7';
 const SOURCE_COMMIT = 'a'.repeat(40);
 const MODULES = [
   'github.com/example/common@v1.2.3',
@@ -54,22 +54,29 @@ async function fixtureRepository(): Promise<string> {
   temporaryDirectories.push(root);
   await mkdir(join(root, 'server', 'cmd', 'multica'), { recursive: true });
   await mkdir(join(root, 'packages', 'quukk-clawmessenger'), { recursive: true });
-  await writeFile(
-    join(root, 'GO_THIRD_PARTY_NOTICES.md'),
-    `# Go third-party notices\n\n- Go standard library/runtime \`go1.26.6\`\n\n${MODULES.map((module) => `## \`${module}\`\n\nLicense text.\n`).join('\n')}`,
-  );
-  await writeFile(
-    join(root, 'packages', 'quukk-clawmessenger', 'package.json'),
-    `${JSON.stringify({ name: 'quukk-clawmessenger', version: VERSION }, null, 2)}\n`,
-  );
-  for (const target of [
+  const targets = [
     runtimeTarget('win32', 'x64'),
     runtimeTarget('win32', 'arm64'),
     runtimeTarget('darwin', 'x64'),
     runtimeTarget('darwin', 'arm64'),
     runtimeTarget('linux', 'x64'),
     runtimeTarget('linux', 'arm64'),
-  ]) {
+  ];
+  await writeFile(
+    join(root, 'GO_THIRD_PARTY_NOTICES.md'),
+    `# Go third-party notices\n\n- Go standard library/runtime \`go1.26.6\`\n\n${MODULES.map((module) => `## \`${module}\`\n\nLicense text.\n`).join('\n')}`,
+  );
+  await writeFile(
+    join(root, 'packages', 'quukk-clawmessenger', 'package.json'),
+    `${JSON.stringify({
+      name: 'quukk-clawmessenger',
+      version: ENTRY_VERSION,
+      optionalDependencies: Object.fromEntries(
+        targets.map((target) => [target.packageName, VERSION]),
+      ),
+    }, null, 2)}\n`,
+  );
+  for (const target of targets) {
     const packageDirectory = join(root, 'packages', target.directory);
     await mkdir(packageDirectory, { recursive: true });
     await writeFile(
@@ -387,6 +394,31 @@ describe('buildRuntime', () => {
     for (const { options } of calls) expect(options.env).toEqual(expectedBuildEnvironment);
   });
 
+  it('rejects missing or mixed entry runtime dependency pins before invoking Go', async () => {
+    for (const mutate of [
+      (dependencies: Record<string, string>) => {
+        delete dependencies['@quukk/clawmessenger-runtime-linux-arm64'];
+      },
+      (dependencies: Record<string, string>) => {
+        dependencies['@quukk/clawmessenger-runtime-linux-arm64'] = '0.1.0-beta.4';
+      },
+    ]) {
+      const root = await fixtureRepository();
+      const entryPath = join(root, 'packages', 'quukk-clawmessenger', 'package.json');
+      const entryPackage = JSON.parse(await readFile(entryPath, 'utf8')) as {
+        optionalDependencies: Record<string, string>;
+      };
+      mutate(entryPackage.optionalDependencies);
+      await writeFile(entryPath, JSON.stringify(entryPackage));
+      const execute = vi.fn<RuntimeCommandExecutor>();
+
+      await expect(
+        buildRuntime({ repoRoot: root, platform: 'win32', arch: 'x64', execute }),
+      ).rejects.toThrow(/runtime dependency pins/);
+      expect(execute).not.toHaveBeenCalled();
+    }
+  });
+
   it('rejects a package path redirected outside the repository before invoking Go', async () => {
     const root = await fixtureRepository();
     const outside = await mkdtemp(join(tmpdir(), 'quukk-runtime-outside-'));
@@ -505,6 +537,21 @@ describe('verifyRuntimePackage', () => {
       goVersion: 'go1.26.6',
       modules: MODULES,
     });
+  });
+
+  it('rejects a runtime package when the entry dependency pins are mixed', async () => {
+    const { root, packageDirectory } = await validRuntimePackage();
+    const entryPath = join(root, 'packages', 'quukk-clawmessenger', 'package.json');
+    const entryPackage = JSON.parse(await readFile(entryPath, 'utf8')) as {
+      optionalDependencies: Record<string, string>;
+    };
+    entryPackage.optionalDependencies['@quukk/clawmessenger-runtime-linux-arm64'] =
+      '0.1.0-beta.4';
+    await writeFile(entryPath, JSON.stringify(entryPackage));
+
+    await expect(
+      verifyRuntimePackage(packageDirectory, { repoRoot: root }),
+    ).rejects.toThrow(/runtime dependency pins/);
   });
 
   it('rejects malformed provenance and a digest that is not the packaged binary', async () => {

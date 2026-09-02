@@ -4,6 +4,8 @@ import { PassThrough } from 'node:stream';
 
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 
+import packageJson from '../../package.json' with { type: 'json' };
+
 import { localPaths } from '../config/paths.js';
 import { BridgeClientError } from '../go/client.js';
 import type { BridgeHealth, BridgeTaskPort } from '../go/types.js';
@@ -586,6 +588,37 @@ describe('BridgeProcessIdentityStore', () => {
 describe('BridgeSupervisor startup', () => {
   it('exposes the task port required by downstream routing', () => {
     expectTypeOf<RunningBridge['client']>().toMatchTypeOf<BridgeTaskPort>();
+  });
+
+  it('uses the pinned runtime dependency version for the Go startup handshake', async () => {
+    const runtimeVersion = packageJson.optionalDependencies[
+      '@quukk/clawmessenger-runtime-win32-x64'
+    ];
+    const child = new FakeChild();
+    const client = fakeClient();
+    client.health.mockResolvedValue(health({ version: runtimeVersion }));
+    const input: Buffer[] = [];
+    child.stdin.on('data', (chunk) => input.push(Buffer.from(chunk)));
+    const configured = dependencies(child, client, {
+      resolveBinary: async () => ({
+        path: binaryPath,
+        packageName: '@quukk/clawmessenger-runtime-win32-x64',
+        version: runtimeVersion,
+        sha256: 'b'.repeat(64),
+      }),
+    });
+    const { version: _entryVersionDefault, ...usesPackageDefault } = configured;
+    startReady(child, readinessLine({ version: runtimeVersion }));
+
+    await new BridgeSupervisor({
+      store: store(),
+      identityStore: new MemoryIdentityStore(),
+      dependencies: usesPackageDefault,
+    }).ensureStarted();
+
+    const startup = JSON.parse(Buffer.concat(input).toString('utf8')) as { version: string };
+    expect(packageJson.version).not.toBe(runtimeVersion);
+    expect(startup.version).toBe(runtimeVersion);
   });
 
   it('spawns exact argv/options, writes bounded secret startup only to stdin, and persists the fence', async () => {

@@ -8,7 +8,7 @@ import {
   type BridgeHealth,
   type BridgeProvider,
 } from '../go/types.js';
-import { VERSION } from '../version.js';
+import { RUNTIME_VERSION } from '../version.js';
 import {
   type BridgeProcessIdentity,
   type BridgeProcessIdentityPersistence,
@@ -175,7 +175,7 @@ function waitForCurrentExit(
 function defaults(overrides: Partial<BridgeSupervisorDependencies>): BridgeSupervisorDependencies {
   const sleep = overrides.sleep ?? abortableSleep;
   const deps: BridgeSupervisorDependencies = {
-    version: overrides.version ?? VERSION,
+    version: overrides.version ?? RUNTIME_VERSION,
     environment: overrides.environment ?? process.env,
     resolveBinary: overrides.resolveBinary ?? (() => resolveBridgeBinary()),
     spawn:
