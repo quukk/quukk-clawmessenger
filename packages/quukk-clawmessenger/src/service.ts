@@ -546,6 +546,27 @@ function operationSignal(callSignal: AbortSignal, lifecycleSignal: AbortSignal):
   return AbortSignal.any([callSignal, lifecycleSignal]);
 }
 
+function waitForCaller<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new ServiceError('operation_unavailable'));
+  return new Promise<T>((resolvePromise, reject) => {
+    const aborted = () => {
+      signal.removeEventListener('abort', aborted);
+      reject(new ServiceError('operation_unavailable'));
+    };
+    signal.addEventListener('abort', aborted, { once: true });
+    void operation.then(
+      (value) => {
+        signal.removeEventListener('abort', aborted);
+        resolvePromise(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', aborted);
+        reject(error);
+      },
+    );
+  });
+}
+
 function supervisorBindings(
   storageRoot: string,
   bindings: readonly RuntimeBinding[],
@@ -809,17 +830,19 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
   }
 
   pairingStart(signal: AbortSignal): Promise<PairingResponse> {
-    if (this.#pairingStartInFlight !== undefined) return this.#pairingStartInFlight;
-    const start = this.#mutate(signal, async (combined) => {
-      const snapshot = await this.#pairing.start();
-      if (combined.aborted) throw new ServiceError('operation_unavailable');
-      return this.#pairingResponse(snapshot);
-    });
-    this.#pairingStartInFlight = start;
-    void start.finally(() => {
-      if (this.#pairingStartInFlight === start) this.#pairingStartInFlight = undefined;
-    }).catch(() => undefined);
-    return start;
+    this.#assertMutation(signal);
+    let shared = this.#pairingStartInFlight;
+    if (shared === undefined) {
+      shared = this.#mutate(this.#lifecycle.signal, async () => {
+        const snapshot = await this.#pairing.start();
+        return this.#pairingResponse(snapshot);
+      });
+      this.#pairingStartInFlight = shared;
+      void shared.finally(() => {
+        if (this.#pairingStartInFlight === shared) this.#pairingStartInFlight = undefined;
+      }).catch(() => undefined);
+    }
+    return waitForCaller(shared, signal);
   }
 
   async pairingStatus(signal: AbortSignal): Promise<PairingResponse> {

@@ -901,6 +901,43 @@ describe('QuukkService mutations', () => {
     await f.service.stop();
   });
 
+  it('isolates each concurrent pairing start from another caller aborting', async () => {
+    const f = await fixture();
+    await start(f);
+    let release!: () => void;
+    f.pairing.startHook = () => new Promise((resolvePromise) => {
+      release = () => resolvePromise(f.pairing.snapshotValue);
+    });
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const first = f.service.pairingStart(firstController.signal).then(
+      () => 'resolved' as const,
+      (error: unknown) => error,
+    );
+    const second = f.service.pairingStart(secondController.signal).then(
+      (value) => value,
+      (error: unknown) => error,
+    );
+    await vi.waitFor(() => expect(f.pairing.calls).toEqual(['start']));
+
+    firstController.abort();
+    const firstPromptResult = await Promise.race([
+      first,
+      new Promise<'still_pending'>((resolvePromise) => setImmediate(() => resolvePromise('still_pending'))),
+    ]);
+    release();
+    const secondResult = await second;
+
+    expect(firstPromptResult).toMatchObject({ code: 'operation_unavailable' });
+    expect(secondResult).toMatchObject({
+      schemaVersion: 1,
+      state: 'waiting',
+      qrContent: expect.any(String),
+    });
+    expect(f.pairing.calls).toEqual(['start']);
+    await f.service.stop();
+  });
+
   it('rejects structurally invalid enable requests before any binding, router, or worker side effect', async () => {
     const f = await fixture();
     await start(f);
