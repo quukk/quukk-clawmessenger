@@ -17,6 +17,7 @@ const TERMINAL_STATES = new Set<PairingState>([
   'cancelled',
   'expired',
 ]);
+const MAX_TIMEOUT_MS = 2_147_483_647;
 
 const STATE_COPY: Record<PairingState, string> = {
   idle: 'Pairing is ready to start.',
@@ -163,6 +164,27 @@ export function PairingPanel({ api, initialSnapshot, now: clock = Date.now }: Pa
     const timer = window.setInterval(() => setCurrentTime(clock()), 1_000);
     return () => window.clearInterval(timer);
   }, [clock, displayState, snapshot.expiresAt]);
+
+  useEffect(() => {
+    if (snapshot.state !== 'waiting' || snapshot.expiresAt === null) return;
+    const deadline = Date.parse(snapshot.expiresAt);
+    let active = true;
+    let timer: number | undefined;
+    const schedule = () => {
+      const observedTime = clock();
+      const remaining = deadline - observedTime;
+      if (remaining <= 0) {
+        if (active && mounted.current) setCurrentTime(observedTime);
+        return;
+      }
+      timer = window.setTimeout(schedule, Math.min(remaining, MAX_TIMEOUT_MS));
+    };
+    schedule();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [clock, snapshot.expiresAt, snapshot.state]);
 
   const resultByCandidate = useMemo(
     () => new Map(snapshot.results.map((result) => [result.candidateId, result])),

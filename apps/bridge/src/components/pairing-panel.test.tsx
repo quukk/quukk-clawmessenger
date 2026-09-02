@@ -1,6 +1,7 @@
 import '@testing-library/jest-dom/vitest';
 
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { useState } from 'react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -119,6 +120,52 @@ describe('pairing panel', () => {
     expect(screen.queryByLabelText(/pairing qr code/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/expires in 0:00/i)).not.toBeInTheDocument();
 
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(getPairing).not.toHaveBeenCalled();
+  });
+
+  it('hides a waiting QR at its exact deadline without polling or revival', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime('2026-09-02T10:00:00.000Z');
+    const deadline = Date.now() + 1;
+    const expiring = {
+      ...waiting,
+      expiresAt: new Date(deadline).toISOString(),
+      qrContent: JSON.stringify({
+        ...JSON.parse(waiting.qrContent!),
+        expiresAt: deadline,
+      }),
+    };
+    const getPairing = vi.fn<BridgeApi['getPairing']>().mockResolvedValue(expiring);
+    const api = createApi({ getPairing });
+    const clock = () => Date.now();
+
+    function Harness() {
+      const [renderCount, setRenderCount] = useState(0);
+      return (
+        <>
+          <button type="button" onClick={() => setRenderCount((count) => count + 1)}>
+            Unrelated render {renderCount}
+          </button>
+          <PairingPanel api={api} initialSnapshot={expiring} now={clock} />
+        </>
+      );
+    }
+
+    render(<Harness />);
+    expect(screen.getByLabelText(/pairing qr code/i)).toBeVisible();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(screen.getByText(/pairing code expired/i)).toBeVisible();
+    expect(screen.queryByLabelText(/pairing qr code/i)).not.toBeInTheDocument();
+    expect(getPairing).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: /unrelated render/i }));
+    expect(screen.queryByLabelText(/pairing qr code/i)).not.toBeInTheDocument();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(10_000);
     });
