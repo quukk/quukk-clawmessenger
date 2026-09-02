@@ -6,6 +6,30 @@ import { BridgeApiError, createBridgeApi, createBridgeApiProvider } from './api'
 import type { BridgeApi } from './types';
 
 const runtimeId = `rt_${'1'.repeat(32)}`;
+const pairingResponse = {
+  schemaVersion: 1 as const,
+  state: 'waiting' as const,
+  expiresAt: '2099-09-02T10:05:00.000Z',
+  qrContent: JSON.stringify({
+    type: 'clawmessenger_pairing',
+    version: 1,
+    server: 'https://configured.example',
+    ticket: 'p'.repeat(43),
+    expiresAt: Date.parse('2099-09-02T10:05:00.000Z'),
+  }),
+  candidates: [
+    {
+      candidateId: 'cand-a',
+      provider: 'opencode' as const,
+      displayName: 'OpenCode',
+      version: '1.2.3',
+      readiness: 'ready' as const,
+      statusReason: null,
+      registrationState: 'unregistered' as const,
+    },
+  ],
+  results: [],
+};
 
 function response(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -19,6 +43,98 @@ afterEach(() => {
 });
 
 describe('local bridge API client', () => {
+  it('uses the exact pairing routes and strictly parses every response', async () => {
+    const ticket = 't'.repeat(43);
+    const csrfToken = 'c'.repeat(43);
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(
+        response({ schemaVersion: 1, csrfToken, expiresInMs: 28_800_000 }),
+      )
+      .mockResolvedValueOnce(response(pairingResponse))
+      .mockResolvedValueOnce(response({ ...pairingResponse, state: 'claimed', qrContent: null }))
+      .mockResolvedValueOnce(response({ ...pairingResponse, state: 'cancelled', qrContent: null }))
+      .mockResolvedValueOnce(response({ ...pairingResponse, state: 'processing', qrContent: null }));
+    const api = createBridgeApi({
+      fetch,
+      href: `http://127.0.0.1:48321/#ticket=${ticket}`,
+      replaceUrl: vi.fn(),
+    });
+
+    const { schemaVersion: _schemaVersion, ...expectedPairing } = pairingResponse;
+    await expect(api.startPairing()).resolves.toEqual(expectedPairing);
+    await expect(api.getPairing()).resolves.toMatchObject({ state: 'claimed' });
+    await expect(api.cancelPairing()).resolves.toMatchObject({ state: 'cancelled' });
+    await expect(api.retryPairing(['cand-a'])).resolves.toMatchObject({ state: 'processing' });
+
+    expect(fetch).toHaveBeenNthCalledWith(
+      2,
+      '/api/pairing/session',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      3,
+      '/api/pairing/session',
+      expect.objectContaining({ credentials: 'same-origin' }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      4,
+      '/api/pairing/session',
+      expect.objectContaining({ method: 'DELETE' }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      5,
+      '/api/pairing/session/retry',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ candidateIds: ['cand-a'] }),
+      }),
+    );
+  });
+
+  it('rejects extra sensitive pairing fields and inconsistent candidate results', async () => {
+    const invalidResponses = [
+      { ...pairingResponse, deviceSecret: 's'.repeat(43) },
+      {
+        ...pairingResponse,
+        qrContent: JSON.stringify({
+          ...JSON.parse(pairingResponse.qrContent),
+          deviceSecret: 's'.repeat(43),
+        }),
+      },
+      {
+        ...pairingResponse,
+        qrContent: JSON.stringify({
+          ...JSON.parse(pairingResponse.qrContent),
+          server: 'https://user:password@configured.example?token=secret',
+        }),
+      },
+      { ...pairingResponse, candidates: [pairingResponse.candidates[0], pairingResponse.candidates[0]] },
+      {
+        ...pairingResponse,
+        results: [
+          {
+            candidateId: 'cand-unknown',
+            status: 'failed',
+            errorCode: 'runtime_unavailable',
+            nodeId: null,
+            retryable: true,
+          },
+        ],
+      },
+    ];
+
+    for (const body of invalidResponses) {
+      const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValueOnce(response(body));
+      const api = createBridgeApi({
+        fetch,
+        href: 'http://127.0.0.1:48321/',
+        replaceUrl: vi.fn(),
+      });
+      await expect(api.getPairing()).rejects.toMatchObject({ code: 'invalid_response' });
+    }
+  });
+
   it('creates one browser API instance when React probes a render twice', () => {
     const api = {} as BridgeApi;
     const factory = vi.fn(() => api);

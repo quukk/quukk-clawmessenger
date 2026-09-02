@@ -60,6 +60,41 @@ export type BridgeSettings = {
   logLevel: 'silent' | 'error' | 'warn' | 'info' | 'debug';
 };
 
+export type PairingState =
+  | 'idle'
+  | 'waiting'
+  | 'claimed'
+  | 'processing'
+  | 'completed'
+  | 'partial'
+  | 'cancelled'
+  | 'expired';
+
+export type PairingCandidate = {
+  candidateId: string;
+  provider: Provider;
+  displayName: string;
+  version: string | null;
+  readiness: 'ready' | 'not_ready' | 'already_registered';
+  statusReason: string | null;
+  registrationState: 'unregistered' | 'registered';
+};
+
+export type PairingCandidateResult = {
+  candidateId: string;
+  status: 'pending' | 'registering' | 'bound' | 'already_bound' | 'failed';
+  errorCode: string | null;
+  retryable: boolean;
+};
+
+export type PairingSnapshot = {
+  state: PairingState;
+  expiresAt: string | null;
+  qrContent: string | null;
+  candidates: readonly PairingCandidate[];
+  results: readonly PairingCandidateResult[];
+};
+
 export type ActivityEntry = {
   id: number;
   time: string;
@@ -112,6 +147,10 @@ export interface BridgeApi {
   getDiagnostics(): Promise<DiagnosticsSnapshot>;
   getSettings(): Promise<BridgeSettings>;
   updateSettings(settings: BridgeSettings): Promise<BridgeSettings>;
+  startPairing(signal?: AbortSignal): Promise<PairingSnapshot>;
+  getPairing(signal?: AbortSignal): Promise<PairingSnapshot>;
+  cancelPairing(signal?: AbortSignal): Promise<PairingSnapshot>;
+  retryPairing(candidateIds: readonly string[], signal?: AbortSignal): Promise<PairingSnapshot>;
 }
 
 export type RegistrationProgress = {

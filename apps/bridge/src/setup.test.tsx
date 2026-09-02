@@ -5,12 +5,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { App } from './app';
-import type {
-  BindingMutationResult,
-  BridgeApi,
-  BridgeRuntime,
-  BridgeSettings,
-} from './types';
+import type { BridgeApi, BridgeRuntime, BridgeSettings, PairingSnapshot } from './types';
 
 const capabilities = {
   sessionResume: true,
@@ -49,14 +44,36 @@ const emptySettings: BridgeSettings = {
   logLevel: 'info',
 };
 
+const pairing: PairingSnapshot = {
+  state: 'waiting',
+  expiresAt: '2099-09-02T10:05:00.000Z',
+  qrContent: JSON.stringify({
+    type: 'clawmessenger_pairing',
+    version: 1,
+    server: 'https://configured.example',
+    ticket: 'p'.repeat(43),
+    expiresAt: Date.parse('2099-09-02T10:05:00.000Z'),
+  }),
+  candidates: [
+    {
+      candidateId: 'cand-opencode',
+      provider: 'opencode',
+      displayName: 'OpenCode',
+      version: '1.2.3',
+      readiness: 'ready',
+      statusReason: null,
+      registrationState: 'unregistered',
+    },
+  ],
+  results: [],
+};
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+  const promise = new Promise<T>((resolvePromise) => {
     resolve = resolvePromise;
-    reject = rejectPromise;
   });
-  return { promise, resolve, reject };
+  return { promise, resolve };
 }
 
 function createApi(overrides: Partial<BridgeApi> = {}): BridgeApi {
@@ -86,6 +103,10 @@ function createApi(overrides: Partial<BridgeApi> = {}): BridgeApi {
     }),
     getSettings: vi.fn().mockResolvedValue(emptySettings),
     updateSettings: vi.fn().mockImplementation(async (settings) => settings),
+    startPairing: vi.fn().mockResolvedValue(pairing),
+    getPairing: vi.fn().mockResolvedValue(pairing),
+    cancelPairing: vi.fn().mockResolvedValue({ ...pairing, state: 'cancelled', qrContent: null }),
+    retryPairing: vi.fn().mockResolvedValue(pairing),
     ...overrides,
   };
 }
@@ -101,9 +122,6 @@ async function completePolicyForm(user: ReturnType<typeof userEvent.setup>) {
   await user.click(
     screen.getByRole('checkbox', { name: /i understand the permission policy/i }),
   );
-  await user.click(
-    screen.getByRole('checkbox', { name: /i understand the cloud registration disclosure/i }),
-  );
 }
 
 afterEach(() => {
@@ -112,52 +130,28 @@ afterEach(() => {
 });
 
 describe('runtime setup', () => {
-  it('detects all providers and selects only ready runtimes by default', async () => {
+  it('shows discovered agents without registration checkboxes or local identifiers', async () => {
     const api = createApi();
-    await renderReady(api);
-
-    expect(screen.getByRole('checkbox', { name: /select opencode/i })).toBeChecked();
-    expect(screen.getByRole('checkbox', { name: /select openclaw/i })).toBeChecked();
-    expect(screen.getByRole('checkbox', { name: /select codex/i })).toHaveAttribute(
-      'aria-disabled',
-      'true',
-    );
-    expect(screen.getByRole('checkbox', { name: /select hermes/i })).toHaveAttribute(
-      'aria-disabled',
-      'true',
-    );
+    const { container } = render(<App api={api} />);
+    expect(await screen.findByText('OpenCode')).toBeVisible();
+    expect(screen.queryByRole('checkbox', { name: /OpenCode/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('checkbox', { name: /select all ready agents/i })).not.toBeInTheDocument();
+    expect(container).not.toHaveTextContent('rt_11111111111111111111111111111111');
+    expect(container).not.toHaveTextContent('C:\\tools\\opencode.exe');
     expect(within(screen.getByTestId('runtime-codex')).getAllByText(/not found/i)).not.toHaveLength(0);
-    expect(within(screen.getByTestId('runtime-hermes')).getAllByText(/not found/i)).not.toHaveLength(0);
   });
 
-  it('supports individual keyboard selection and select all without unavailable runtimes', async () => {
-    const user = userEvent.setup();
-    await renderReady(createApi());
-
-    const openClaw = screen.getByRole('checkbox', { name: /select openclaw/i });
-    openClaw.focus();
-    await user.keyboard(' ');
-    expect(openClaw).not.toBeChecked();
-
-    await user.click(screen.getByRole('checkbox', { name: /select all ready agents/i }));
-    expect(screen.getByRole('checkbox', { name: /select opencode/i })).toBeChecked();
-    expect(openClaw).toBeChecked();
-    expect(screen.getByRole('checkbox', { name: /select codex/i })).not.toBeChecked();
-  });
-
-  it('does not register before explicit consent and submit', async () => {
+  it('saves local policy and starts exactly one QR session', async () => {
     const user = userEvent.setup();
     const api = createApi();
     await renderReady(api);
 
-    expect(screen.getByText(/headless permission mode/i)).toBeVisible();
-    expect(screen.getByText(/interactive approval is not available/i)).toBeVisible();
-    expect(api.enableBindings).not.toHaveBeenCalled();
-    expect(api.updateSettings).not.toHaveBeenCalled();
-
+    expect(screen.queryByRole('checkbox', { name: /cloud registration/i })).not.toBeInTheDocument();
+    const generate = screen.getByRole('button', { name: /generate pairing qr code/i });
+    expect(generate).toBeDisabled();
     await completePolicyForm(user);
-    expect(api.enableBindings).not.toHaveBeenCalled();
-    await user.click(screen.getByRole('button', { name: /register 2 agents/i }));
+    expect(generate).toBeEnabled();
+    await user.click(generate);
 
     expect(api.updateSettings).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -165,169 +159,9 @@ describe('runtime setup', () => {
         defaultWorkdir: 'C:\\work\\project',
       }),
     );
-    expect(api.enableBindings).toHaveBeenCalledTimes(2);
-  });
-
-  it('requires consent to the outbound registration disclosure', async () => {
-    const user = userEvent.setup();
-    const api = createApi();
-    await renderReady(api);
-
-    expect(screen.getByRole('heading', { name: /cloud registration disclosure/i })).toBeVisible();
-    expect(screen.getByText(/hostname-derived node label/i)).toBeVisible();
-    expect(screen.getByText(/network-interface MAC address/i)).toBeVisible();
-    expect(screen.getByText(/newsradar\.dreamdt\.cn\/im/i)).toBeVisible();
-    expect(screen.getByText(/no self-service remote identity deletion/i)).toBeVisible();
-
-    await user.type(screen.getByLabelText(/authorized work root/i), 'C:\\work');
-    await user.type(screen.getByLabelText(/default work directory/i), 'C:\\work\\project');
-    await user.click(
-      screen.getByRole('checkbox', { name: /i understand the permission policy/i }),
-    );
-    expect(screen.getByRole('button', { name: /register 2 agents/i })).toBeDisabled();
+    expect(api.startPairing).toHaveBeenCalledTimes(1);
     expect(api.enableBindings).not.toHaveBeenCalled();
-
-    await user.click(
-      screen.getByRole('checkbox', { name: /i understand the cloud registration disclosure/i }),
-    );
-    expect(screen.getByRole('button', { name: /register 2 agents/i })).toBeEnabled();
-  });
-
-  it('keeps independent progress and successful rows when another registration fails', async () => {
-    const user = userEvent.setup();
-    const openCode = deferred<readonly BindingMutationResult[]>();
-    const openClaw = deferred<readonly BindingMutationResult[]>();
-    const enableBindings = vi.fn((runtimeIds: readonly string[]) =>
-      runtimeIds[0] === detectedRuntimes[0]?.id ? openCode.promise : openClaw.promise,
-    );
-    const refreshedRuntimes: BridgeRuntime[] = [
-      {
-        ...detectedRuntimes[0]!,
-        binding: { enabled: true, registrationState: 'online' },
-      },
-      {
-        ...detectedRuntimes[1]!,
-        binding: {
-          enabled: false,
-          registrationState: 'error',
-          lastErrorCode: 'registration_transport',
-        },
-      },
-      detectedRuntimes[2]!,
-      detectedRuntimes[3]!,
-    ];
-    const getRuntimes = vi
-      .fn<BridgeApi['getRuntimes']>()
-      .mockResolvedValueOnce(detectedRuntimes)
-      .mockResolvedValue(refreshedRuntimes);
-    const api = createApi({ enableBindings, getRuntimes });
-    await renderReady(api);
-    await completePolicyForm(user);
-    await user.click(screen.getByRole('button', { name: /register 2 agents/i }));
-
-    const openCodeRow = screen.getByTestId('runtime-opencode');
-    const openClawRow = screen.getByTestId('runtime-openclaw');
-    expect(within(openCodeRow).getByText(/registering/i)).toBeVisible();
-    expect(within(openClawRow).getByText(/registering/i)).toBeVisible();
-
-    await act(async () => {
-      openCode.resolve([{ runtimeId: detectedRuntimes[0]!.id!, ok: true }]);
-      await openCode.promise;
-    });
-    expect(within(openCodeRow).getByText(/connected/i)).toBeVisible();
-    expect(within(openClawRow).getByText(/registering/i)).toBeVisible();
-
-    await act(async () => {
-      openClaw.resolve([
-        {
-          runtimeId: detectedRuntimes[1]!.id!,
-          ok: false,
-          errorCode: 'registration_transport',
-        },
-      ]);
-      await openClaw.promise;
-    });
-    expect(within(openCodeRow).getByText(/connected/i)).toBeVisible();
-    expect(within(openClawRow).getByText(/registration failed/i)).toBeVisible();
-    expect(screen.getByRole('alert')).toHaveTextContent(/openclaw/i);
-    expect(getRuntimes).toHaveBeenCalledTimes(3);
-
-    await user.click(screen.getByRole('button', { name: /^runtimes$/i }));
-    const refreshedOpenCode = screen.getByTestId('runtime-opencode');
-    expect(within(refreshedOpenCode).getByText(/online/i)).toBeVisible();
-    expect(within(refreshedOpenCode).getByRole('button', { name: /disable opencode/i })).toBeVisible();
-  });
-
-  it('keeps successful progress visible when the post-registration refresh fails', async () => {
-    const user = userEvent.setup();
-    const getRuntimes = vi
-      .fn<BridgeApi['getRuntimes']>()
-      .mockResolvedValueOnce(detectedRuntimes)
-      .mockRejectedValueOnce(new Error('refresh failed'));
-    const api = createApi({
-      getRuntimes,
-      enableBindings: vi.fn().mockResolvedValue([
-        { runtimeId: detectedRuntimes[0]!.id!, ok: true },
-      ]),
-    });
-    await renderReady(api);
-    await user.click(screen.getByRole('checkbox', { name: /select openclaw/i }));
-    await completePolicyForm(user);
-    await user.click(screen.getByRole('button', { name: /register 1 agent/i }));
-
-    const openCodeRow = screen.getByTestId('runtime-opencode');
-    expect(await within(openCodeRow).findByText(/connected/i)).toBeVisible();
-    expect(screen.getByRole('alert')).toHaveTextContent(/status could not be refreshed/i);
-  });
-
-  it('refreshes on Runtimes after navigating while the Setup refresh is still pending', async () => {
-    const user = userEvent.setup();
-    const runtimeId = detectedRuntimes[0]!.id!;
-    const setupRefresh = deferred<readonly BridgeRuntime[]>();
-    const registeredStarting: BridgeRuntime[] = [
-      {
-        ...detectedRuntimes[0]!,
-        binding: { enabled: true, registrationState: 'offline' },
-        worker: { state: 'starting', restartCount: 0 },
-      },
-      ...detectedRuntimes.slice(1),
-    ];
-    const registeredOnline: BridgeRuntime[] = [
-      {
-        ...registeredStarting[0]!,
-        worker: { state: 'online', restartCount: 0 },
-      },
-      ...registeredStarting.slice(1),
-    ];
-    const getRuntimes = vi
-      .fn<BridgeApi['getRuntimes']>()
-      .mockResolvedValueOnce(detectedRuntimes)
-      .mockImplementationOnce(() => setupRefresh.promise)
-      .mockResolvedValueOnce(registeredOnline);
-    const api = createApi({
-      getRuntimes,
-      enableBindings: vi.fn().mockResolvedValue([{ runtimeId, ok: true }]),
-    });
-
-    await renderReady(api);
-    await user.click(screen.getByRole('checkbox', { name: /select openclaw/i }));
-    await completePolicyForm(user);
-    await user.click(screen.getByRole('button', { name: /register 1 agent/i }));
-
-    expect(
-      await within(screen.getByTestId('runtime-opencode')).findByText(/connected/i),
-    ).toBeVisible();
-    expect(getRuntimes).toHaveBeenCalledTimes(2);
-    await user.click(screen.getByRole('button', { name: /^runtimes$/i }));
-    await vi.waitFor(() => expect(getRuntimes).toHaveBeenCalledTimes(3));
-    expect(
-      within(screen.getByTestId('runtime-opencode')).getByLabelText(/status: online/i),
-    ).toBeVisible();
-
-    await act(async () => {
-      setupRefresh.resolve(registeredStarting);
-      await setupRefresh.promise;
-    });
+    expect(await screen.findByLabelText(/pairing qr code/i)).toBeVisible();
   });
 
   it('replaces only the edited first authorized root and removes duplicates', async () => {
@@ -341,7 +175,6 @@ describe('runtime setup', () => {
     const api = createApi({
       getSettings: vi.fn().mockResolvedValue(configuredSettings),
       updateSettings,
-      enableBindings: vi.fn().mockResolvedValue([]),
     });
     await renderReady(api);
 
@@ -351,10 +184,7 @@ describe('runtime setup', () => {
     await user.click(
       screen.getByRole('checkbox', { name: /i understand the permission policy/i }),
     );
-    await user.click(
-      screen.getByRole('checkbox', { name: /i understand the cloud registration disclosure/i }),
-    );
-    await user.click(screen.getByRole('button', { name: /register 2 agents/i }));
+    await user.click(screen.getByRole('button', { name: /generate pairing qr code/i }));
 
     expect(updateSettings).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -364,17 +194,17 @@ describe('runtime setup', () => {
     );
   });
 
-  it('does not continue registration after setup unmounts while settings are pending', async () => {
+  it('does not start pairing after setup unmounts while settings are pending', async () => {
     const user = userEvent.setup();
     const update = deferred<BridgeSettings>();
-    const enableBindings = vi.fn<BridgeApi['enableBindings']>().mockResolvedValue([]);
+    const startPairing = vi.fn<BridgeApi['startPairing']>().mockResolvedValue(pairing);
     const api = createApi({
       updateSettings: vi.fn(() => update.promise),
-      enableBindings,
+      startPairing,
     });
     await renderReady(api);
     await completePolicyForm(user);
-    await user.click(screen.getByRole('button', { name: /register 2 agents/i }));
+    await user.click(screen.getByRole('button', { name: /generate pairing qr code/i }));
     await user.click(screen.getByRole('button', { name: /^runtimes$/i }));
 
     await act(async () => {
@@ -386,9 +216,24 @@ describe('runtime setup', () => {
       await update.promise;
     });
 
-    expect(enableBindings).not.toHaveBeenCalled();
-    await user.click(screen.getByRole('button', { name: /^settings$/i }));
-    expect(await screen.findByLabelText(/default work directory/i)).toHaveValue('');
+    expect(startPairing).not.toHaveBeenCalled();
+  });
+
+  it('aborts a pending pairing start when Setup unmounts', async () => {
+    const user = userEvent.setup();
+    let startSignal: AbortSignal | undefined;
+    const startPairing = vi.fn<BridgeApi['startPairing']>((signal) => {
+      startSignal = signal;
+      return new Promise(() => undefined);
+    });
+    const api = createApi({ startPairing });
+    await renderReady(api);
+    await completePolicyForm(user);
+    await user.click(screen.getByRole('button', { name: /generate pairing qr code/i }));
+    await vi.waitFor(() => expect(startPairing).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole('button', { name: /^runtimes$/i }));
+    expect(startSignal?.aborted).toBe(true);
   });
 
   it('explains authentication, non-runnable, and probe failures', async () => {

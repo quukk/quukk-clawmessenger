@@ -8,15 +8,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@multica/ui/components/ui/dialog';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
-import { RuntimeCard, runtimeDisplayLabel } from '../components/runtime-card';
-import type {
-  BridgeApi,
-  BridgeRuntime,
-  BridgeSettings,
-  RegistrationProgress,
-} from '../types';
+import { PairingPanel } from '../components/pairing-panel';
+import { RuntimeCard } from '../components/runtime-card';
+import type { BridgeApi, BridgeRuntime, BridgeSettings, PairingSnapshot } from '../types';
 import { useRequestFence } from '../use-request-fence';
 
 type SetupPageProps = {
@@ -27,94 +23,58 @@ type SetupPageProps = {
   onSettingsChange(settings: BridgeSettings): void;
 };
 
-function registrationErrorCode(error: unknown): string {
-  if (typeof error === 'object' && error !== null && 'code' in error) {
-    const code = (error as { code?: unknown }).code;
-    if (typeof code === 'string') return code;
-  }
-  return 'request_failed';
-}
-
 function replaceFirstAuthorizedRoot(roots: readonly string[], replacement: string): string[] {
   return [replacement, ...roots.slice(1)].filter(
     (root, index, allRoots) => allRoots.indexOf(root) === index,
   );
 }
 
+function discoveryView(runtime: BridgeRuntime): BridgeRuntime {
+  return {
+    provider: runtime.provider,
+    status: runtime.status,
+    capabilities: runtime.capabilities,
+    ...(runtime.version === undefined ? {} : { version: runtime.version }),
+    ...(runtime.binding === undefined ? {} : { binding: runtime.binding }),
+    ...(runtime.worker === undefined ? {} : { worker: runtime.worker }),
+  };
+}
+
 export function SetupPage({
   api,
   runtimes,
   settings,
-  onRuntimesChange,
   onSettingsChange,
 }: SetupPageProps) {
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [progress, setProgress] = useState<Record<string, RegistrationProgress>>({});
   const [authorizedRoot, setAuthorizedRoot] = useState(settings.authorizedWorkRoots[0] ?? '');
   const [defaultWorkdir, setDefaultWorkdir] = useState(settings.defaultWorkdir ?? '');
   const [policyAccepted, setPolicyAccepted] = useState(false);
-  const [registrationDisclosureAccepted, setRegistrationDisclosureAccepted] = useState(false);
   const [policyOpen, setPolicyOpen] = useState(false);
   const [savingPolicy, setSavingPolicy] = useState(false);
-  const [refreshError, setRefreshError] = useState(false);
-  const initializedSelection = useRef(false);
+  const [pairing, setPairing] = useState<PairingSnapshot | null>(null);
+  const [startFailed, setStartFailed] = useState(false);
+  const pairingStartController = useRef<AbortController | undefined>(undefined);
   const requestFence = useRequestFence();
-
-  useEffect(() => {
-    if (initializedSelection.current || runtimes.length === 0) return;
-    initializedSelection.current = true;
-    setSelectedIds(
-      new Set(
-        runtimes
-          .filter((runtime) => runtime.status === 'ready' && runtime.id !== undefined)
-          .map((runtime) => runtime.id!),
-      ),
-    );
-  }, [runtimes]);
-
-  const readyIds = useMemo(
-    () =>
-      runtimes
-        .filter((runtime) => runtime.status === 'ready' && runtime.id !== undefined)
-        .map((runtime) => runtime.id!),
-    [runtimes],
-  );
-  const allReadySelected = readyIds.length > 0 && readyIds.every((id) => selectedIds.has(id));
-  const someReadySelected = readyIds.some((id) => selectedIds.has(id));
-  const selectedCount = selectedIds.size;
-  const registering = Object.values(progress).some((entry) => entry.state === 'registering');
-  const failedRuntimes = runtimes.filter(
-    (runtime) => runtime.id && progress[runtime.id]?.state === 'failed',
-  );
-  const connectedCount = Object.values(progress).filter(
-    (entry) => entry.state === 'connected',
-  ).length;
   const policyComplete =
     authorizedRoot.trim().length > 0 &&
     defaultWorkdir.trim().length > 0 &&
-    policyAccepted &&
-    registrationDisclosureAccepted;
+    policyAccepted;
 
-  function toggleRuntime(runtimeId: string, selected: boolean) {
-    setSelectedIds((current) => {
-      const next = new Set(current);
-      if (selected) next.add(runtimeId);
-      else next.delete(runtimeId);
-      return next;
-    });
-  }
+  useEffect(
+    () => () => {
+      pairingStartController.current?.abort();
+    },
+    [],
+  );
 
-  function toggleAll(selected: boolean) {
-    setSelectedIds(selected ? new Set(readyIds) : new Set());
-  }
-
-  async function registerSelected() {
-    const ids = [...selectedIds];
-    if (ids.length === 0 || !policyComplete || registering) return;
+  async function generatePairing() {
+    if (!policyComplete || savingPolicy || pairing !== null) return;
     const generation = requestFence.begin();
-    const isCurrent = () => requestFence.isCurrent(generation);
-    setRefreshError(false);
+    pairingStartController.current?.abort();
+    const controller = new AbortController();
+    pairingStartController.current = controller;
     setSavingPolicy(true);
+    setStartFailed(false);
     try {
       const nextSettings = await api.updateSettings({
         ...settings,
@@ -124,105 +84,37 @@ export function SetupPage({
         ),
         defaultWorkdir: defaultWorkdir.trim(),
       });
-      if (!isCurrent()) return;
+      if (!requestFence.isCurrent(generation)) return;
       onSettingsChange(nextSettings);
+      const nextPairing = await api.startPairing(controller.signal);
+      if (!requestFence.isCurrent(generation)) return;
+      setPairing(nextPairing);
     } catch {
-      if (!isCurrent()) return;
-      setProgress(
-        Object.fromEntries(
-          ids.map((id) => [id, { state: 'failed', errorCode: 'settings_update_failed' }]),
-        ),
-      );
-      setSavingPolicy(false);
-      return;
+      if (requestFence.isCurrent(generation)) setStartFailed(true);
+    } finally {
+      if (pairingStartController.current === controller) {
+        pairingStartController.current = undefined;
+      }
+      if (requestFence.isCurrent(generation)) setSavingPolicy(false);
     }
-    if (!isCurrent()) return;
-    setSavingPolicy(false);
-    setProgress((current) => ({
-      ...current,
-      ...Object.fromEntries(ids.map((id) => [id, { state: 'registering' as const }])),
-    }));
-
-    let refreshTail = Promise.resolve();
-    const queueRefresh = () => {
-      refreshTail = refreshTail.then(async () => {
-        if (!isCurrent()) return;
-        try {
-          const nextRuntimes = await api.getRuntimes();
-          if (isCurrent()) onRuntimesChange(nextRuntimes);
-        } catch {
-          if (isCurrent()) setRefreshError(true);
-        }
-      });
-      return refreshTail;
-    };
-
-    await Promise.all(
-      ids.map(async (runtimeId) => {
-        try {
-          const results = await api.enableBindings([runtimeId]);
-          if (!isCurrent()) return;
-          const result = results.find((entry) => entry.runtimeId === runtimeId);
-          setProgress((current) => ({
-            ...current,
-            [runtimeId]: result?.ok
-              ? { state: 'connected' }
-              : {
-                  state: 'failed',
-                  errorCode: result?.errorCode ?? 'invalid_response',
-                },
-          }));
-        } catch (error) {
-          if (!isCurrent()) return;
-          setProgress((current) => ({
-            ...current,
-            [runtimeId]: { state: 'failed', errorCode: registrationErrorCode(error) },
-          }));
-        }
-        await queueRefresh();
-      }),
-    );
   }
 
   return (
     <section className="grid gap-6" aria-labelledby="setup-title">
       <header className="grid max-w-2xl gap-2">
-        <p className="text-label font-medium text-brand">Detect, select, register</p>
+        <p className="text-label font-medium text-brand">Detect, authorize, pair</p>
         <h1 id="setup-title" className="font-heading text-display-sm font-semibold tracking-tight">
           Choose local agents
         </h1>
         <p className="text-body-lg text-muted-foreground">
-          Each selected agent receives an independent RongCloud identity and connection.
+          Review detected platforms, authorize local work, then scan one short-lived code in
+          ClawMessenger to choose which platforms to add.
         </p>
       </header>
 
-      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-surface-border bg-surface px-4 py-3">
-        <label className="flex cursor-pointer items-center gap-2 font-medium">
-          <Checkbox
-            aria-label="Select all ready agents"
-            checked={allReadySelected}
-            indeterminate={someReadySelected && !allReadySelected}
-            disabled={readyIds.length === 0 || registering}
-            onCheckedChange={(checked) => toggleAll(checked === true)}
-          />
-          Select all ready agents
-        </label>
-        <span className="text-caption text-muted-foreground">{selectedCount} selected</span>
-      </div>
-
-      <div className="runtime-grid">
+      <div className="runtime-grid" aria-label="Detected local agents">
         {runtimes.map((runtime) => (
-          <RuntimeCard
-            key={runtime.provider}
-            runtime={runtime}
-            selectable
-            selected={runtime.id ? selectedIds.has(runtime.id) : false}
-            progress={runtime.id ? progress[runtime.id] : undefined}
-            busy={registering}
-            onSelectedChange={(selected) => {
-              if (runtime.id) toggleRuntime(runtime.id, selected);
-            }}
-          />
+          <RuntimeCard key={runtime.provider} runtime={discoveryView(runtime)} />
         ))}
       </div>
 
@@ -252,7 +144,7 @@ export function SetupPage({
               onChange={(event) => setAuthorizedRoot(event.target.value)}
               placeholder="C:\\work or /Users/me/work"
               autoComplete="off"
-              disabled={registering || savingPolicy}
+              disabled={savingPolicy || pairing !== null}
             />
             <small>Remote tasks are rejected outside this directory.</small>
           </label>
@@ -264,7 +156,7 @@ export function SetupPage({
               onChange={(event) => setDefaultWorkdir(event.target.value)}
               placeholder="C:\\work\\project or /Users/me/work/project"
               autoComplete="off"
-              disabled={registering || savingPolicy}
+              disabled={savingPolicy || pairing !== null}
             />
             <small>Choose a real project directory inside the authorized root.</small>
           </label>
@@ -274,85 +166,34 @@ export function SetupPage({
           <Checkbox
             aria-label="I understand the permission policy"
             checked={policyAccepted}
-            disabled={registering || savingPolicy}
+            disabled={savingPolicy || pairing !== null}
             onCheckedChange={(checked) => setPolicyAccepted(checked === true)}
             className="mt-0.5"
           />
           <span>I understand the permission policy and authorize the directory above.</span>
         </label>
 
-        <div className="grid gap-2 rounded-lg border border-warning/40 bg-warning/8 p-3">
-          <h2 className="font-heading text-title-sm font-medium">
-            Cloud registration disclosure
-          </h2>
-          <p className="text-body text-muted-foreground">
-            Registration contacts the configured service at {settings.serverUrl}. It sends a
-            hostname-derived node label, a network-interface MAC address when available (or a
-            stable install-derived fallback), the selected provider and capability flags, and
-            enrollment proof. Each enabled agent then connects to RongCloud, where its chat and
-            task messages use that cloud IM connection.
+        {startFailed ? (
+          <p role="alert" className="rounded-lg border border-destructive/30 bg-destructive/8 p-3 text-body">
+            A pairing code could not be created. Check the local service and try again.
           </p>
-          <p className="text-body text-muted-foreground">
-            This beta has no self-service remote identity deletion. Contact the operator of the
-            configured service before enabling agents if you require deletion or privacy terms.
-          </p>
-        </div>
+        ) : null}
 
-        <label className="flex cursor-pointer items-start gap-3 text-body">
-          <Checkbox
-            aria-label="I understand the cloud registration disclosure"
-            checked={registrationDisclosureAccepted}
-            disabled={registering || savingPolicy}
-            onCheckedChange={(checked) => setRegistrationDisclosureAccepted(checked === true)}
-            className="mt-0.5"
-          />
-          <span>I understand the cloud registration disclosure and consent to registration.</span>
-        </label>
-
-        {failedRuntimes.length > 0 ? (
-          <div role="alert" className="rounded-lg border border-destructive/30 bg-destructive/8 p-3">
-            <p className="font-medium text-destructive">Some agents could not be registered.</p>
-            <ul className="mt-1 grid gap-1 text-body text-muted-foreground">
-              {failedRuntimes.map((runtime) => (
-                <li key={runtime.provider}>
-                  {runtimeDisplayLabel(runtime)}: {progress[runtime.id!]?.errorCode}
-                </li>
-              ))}
-            </ul>
+        {pairing === null ? (
+          <div className="flex justify-end">
+            <Button
+              type="button"
+              size="lg"
+              disabled={!policyComplete || savingPolicy}
+              onClick={() => void generatePairing()}
+            >
+              {savingPolicy ? 'Generating pairing QR code' : 'Generate pairing QR code'}
+            </Button>
           </div>
         ) : null}
-
-        {refreshError ? (
-          <p role="alert" className="rounded-lg border border-warning/40 bg-warning/10 p-3 text-body">
-            Registration finished, but the latest runtime status could not be refreshed. Your
-            completed registrations were not changed; use Rescan on the Runtimes page.
-          </p>
-        ) : null}
-
-        {connectedCount > 0 && policyComplete ? (
-          <p role="status" aria-live="polite" className="text-body font-medium text-success">
-            {connectedCount} {connectedCount === 1 ? 'agent is' : 'agents are'} connected and
-            task-ready.
-          </p>
-        ) : (
-          <p role="status" aria-live="polite" className="sr-only">
-            {registering ? 'Registration is in progress.' : 'Ready for your confirmation.'}
-          </p>
-        )}
-
-        <div className="flex flex-wrap justify-end gap-2">
-          <Button
-            type="button"
-            size="lg"
-            disabled={selectedCount === 0 || !policyComplete || registering || savingPolicy}
-            onClick={() => void registerSelected()}
-          >
-            {registering || savingPolicy
-              ? 'Registering agents'
-              : `Register ${selectedCount} ${selectedCount === 1 ? 'agent' : 'agents'}`}
-          </Button>
-        </div>
       </div>
+
+      {pairing === null ? null : <PairingPanel api={api} initialSnapshot={pairing} />}
 
       <Dialog open={policyOpen} onOpenChange={setPolicyOpen}>
         <DialogContent>
@@ -366,7 +207,7 @@ export function SetupPage({
           <div className="grid gap-2 text-body text-muted-foreground">
             <p>Only allowlisted commands and message actions are routed.</p>
             <p>Every task directory must resolve inside an authorized work root.</p>
-            <p>Review each provider login and local permission configuration before enabling it.</p>
+            <p>Review each provider login and local permission configuration before pairing it.</p>
           </div>
           <DialogFooter>
             <Button type="button" onClick={() => setPolicyOpen(false)}>

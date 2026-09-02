@@ -7,6 +7,7 @@ import type {
   BridgeRuntime,
   BridgeSettings,
   DiagnosticsSnapshot,
+  PairingSnapshot,
 } from './types';
 
 const providerSchema = z.enum(['opencode', 'openclaw', 'codex', 'hermes']);
@@ -298,6 +299,136 @@ const diagnosticsSchema = z
   })
   .strict();
 
+const pairingCandidateIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
+const pairingTextSchema = (maximum: number) =>
+  z.string().min(1).max(maximum).refine((value) => value === value.trim());
+const pairingCandidateSchema = z
+  .object({
+    candidateId: pairingCandidateIdSchema,
+    provider: providerSchema,
+    displayName: pairingTextSchema(80),
+    version: pairingTextSchema(64).nullable(),
+    readiness: z.enum(['ready', 'not_ready', 'already_registered']),
+    statusReason: pairingTextSchema(80).nullable(),
+    registrationState: z.enum(['unregistered', 'registered']),
+  })
+  .strict();
+const pairingResultSchema = z
+  .object({
+    candidateId: pairingCandidateIdSchema,
+    status: z.enum(['pending', 'registering', 'bound', 'already_bound', 'failed']),
+    errorCode: z.string().regex(/^[a-z][a-z0-9_]{0,63}$/).nullable(),
+    nodeId: pairingTextSchema(137).nullable(),
+    retryable: z.boolean(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.status === 'failed' && value.errorCode === null) {
+      context.addIssue({ code: 'custom', path: ['errorCode'] });
+    }
+    if (value.status !== 'failed' && value.errorCode !== null) {
+      context.addIssue({ code: 'custom', path: ['errorCode'] });
+    }
+    if ((value.status === 'bound' || value.status === 'already_bound') && value.nodeId === null) {
+      context.addIssue({ code: 'custom', path: ['nodeId'] });
+    }
+  });
+const pairingQrSchema = z
+  .object({
+    type: z.literal('clawmessenger_pairing'),
+    version: z.literal(1),
+    server: z.string().min(1).max(4096).url().refine((value) => {
+      const url = new URL(value);
+      const loopback =
+        url.hostname === 'localhost' ||
+        url.hostname === '::1' ||
+        /^127(?:\.\d{1,3}){3}$/.test(url.hostname);
+      const safeAuthority =
+        url.username === '' && url.password === '' && url.search === '' && url.hash === '';
+      return (
+        safeAuthority &&
+        (url.protocol === 'https:' || (url.protocol === 'http:' && loopback))
+      );
+    }),
+    ticket: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    expiresAt: z.number().int().positive().finite(),
+  })
+  .strict();
+const pairingEnvelopeSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    state: z.enum([
+      'idle',
+      'waiting',
+      'claimed',
+      'processing',
+      'completed',
+      'partial',
+      'cancelled',
+      'expired',
+    ]),
+    expiresAt: z.iso.datetime({ offset: true }).nullable(),
+    qrContent: z.string().min(1).max(8 << 10).nullable(),
+    candidates: z.array(pairingCandidateSchema).max(16),
+    results: z.array(pairingResultSchema).max(16),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const candidateIds = new Set<string>();
+    value.candidates.forEach((candidate, index) => {
+      if (candidateIds.has(candidate.candidateId)) {
+        context.addIssue({ code: 'custom', path: ['candidates', index, 'candidateId'] });
+      }
+      candidateIds.add(candidate.candidateId);
+    });
+    const resultIds = new Set<string>();
+    value.results.forEach((result, index) => {
+      if (!candidateIds.has(result.candidateId) || resultIds.has(result.candidateId)) {
+        context.addIssue({ code: 'custom', path: ['results', index, 'candidateId'] });
+      }
+      resultIds.add(result.candidateId);
+    });
+    if (value.state === 'idle') {
+      if (
+        value.expiresAt !== null ||
+        value.qrContent !== null ||
+        value.candidates.length !== 0 ||
+        value.results.length !== 0
+      ) {
+        context.addIssue({ code: 'custom', path: ['state'] });
+      }
+      return;
+    }
+    if (value.state === 'waiting') {
+      if (value.expiresAt === null || value.qrContent === null || value.candidates.length === 0) {
+        context.addIssue({ code: 'custom', path: ['state'] });
+        return;
+      }
+      let qr: unknown;
+      try {
+        qr = JSON.parse(value.qrContent);
+      } catch {
+        context.addIssue({ code: 'custom', path: ['qrContent'] });
+        return;
+      }
+      const parsedQr = pairingQrSchema.safeParse(qr);
+      if (!parsedQr.success || parsedQr.data.expiresAt !== Date.parse(value.expiresAt)) {
+        context.addIssue({ code: 'custom', path: ['qrContent'] });
+      }
+    } else if (value.qrContent !== null) {
+      context.addIssue({ code: 'custom', path: ['qrContent'] });
+    }
+  })
+  .transform(
+    (value): PairingSnapshot => ({
+      state: value.state,
+      expiresAt: value.expiresAt,
+      qrContent: value.qrContent,
+      candidates: value.candidates,
+      results: value.results.map(({ nodeId: _nodeId, ...result }) => result),
+    }),
+  );
+
 const base64UrlTokenSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const exchangeSchema = z
   .object({
@@ -524,6 +655,34 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
       const parsed = settingsEnvelopeSchema.safeParse(data);
       if (!parsed.success) throw new BridgeApiError('invalid_response');
       return parsed.data.settings;
+    },
+    async startPairing(signal) {
+      const data = await request('/api/pairing/session', { method: 'POST', signal });
+      const parsed = pairingEnvelopeSchema.safeParse(data);
+      if (!parsed.success) throw new BridgeApiError('invalid_response');
+      return parsed.data;
+    },
+    async getPairing(signal) {
+      const data = await request('/api/pairing/session', { signal });
+      const parsed = pairingEnvelopeSchema.safeParse(data);
+      if (!parsed.success) throw new BridgeApiError('invalid_response');
+      return parsed.data;
+    },
+    async cancelPairing(signal) {
+      const data = await request('/api/pairing/session', { method: 'DELETE', signal });
+      const parsed = pairingEnvelopeSchema.safeParse(data);
+      if (!parsed.success) throw new BridgeApiError('invalid_response');
+      return parsed.data;
+    },
+    async retryPairing(candidateIds, signal) {
+      const data = await request('/api/pairing/session/retry', {
+        method: 'POST',
+        signal,
+        body: JSON.stringify({ candidateIds }),
+      });
+      const parsed = pairingEnvelopeSchema.safeParse(data);
+      if (!parsed.success) throw new BridgeApiError('invalid_response');
+      return parsed.data;
     },
   };
 }

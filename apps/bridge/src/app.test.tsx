@@ -88,6 +88,34 @@ function createApi(overrides: Partial<BridgeApi> = {}): BridgeApi {
     getDiagnostics: vi.fn().mockResolvedValue(diagnostics('0.1.0-beta.1')),
     getSettings: vi.fn().mockResolvedValue(settings),
     updateSettings: vi.fn().mockImplementation(async (next) => next),
+    startPairing: vi.fn().mockResolvedValue({
+      state: 'idle',
+      expiresAt: null,
+      qrContent: null,
+      candidates: [],
+      results: [],
+    }),
+    getPairing: vi.fn().mockResolvedValue({
+      state: 'idle',
+      expiresAt: null,
+      qrContent: null,
+      candidates: [],
+      results: [],
+    }),
+    cancelPairing: vi.fn().mockResolvedValue({
+      state: 'idle',
+      expiresAt: null,
+      qrContent: null,
+      candidates: [],
+      results: [],
+    }),
+    retryPairing: vi.fn().mockResolvedValue({
+      state: 'idle',
+      expiresAt: null,
+      qrContent: null,
+      candidates: [],
+      results: [],
+    }),
     ...overrides,
   };
 }
