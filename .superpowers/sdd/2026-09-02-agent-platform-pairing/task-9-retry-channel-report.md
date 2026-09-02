@@ -98,3 +98,31 @@ Immediately before this report commit:
 - This integration task does not include the dialog wiring by design. The original UI implementer must call the new Web `retryPairing(ticket, candidateIds)` service and then exercise the browser-visible interaction.
 - A deployed end-to-end run spanning real command delivery, the production-like backend, and an installed npm package remains for later integration/manual test tasks.
 - The five unrelated server full-suite baseline failures listed above remain unresolved.
+
+## Independent review fix round 1
+
+All three Important findings and the Minor polling finding were addressed with tests first.
+
+### Changes
+
+- The Server `ai.retryPairing` command boundary now accepts a ticket only when it is exactly 43 URL-safe characters, equivalent to the generated credential contract. Tests cover 42 characters, 44 characters, and an illegal character at the correct length.
+- A Server device-route contract test confirms a remotely cancelled retry poll returns only the strict safe DTO `{ "code": 410, "error": "session_cancelled" }`. This endpoint behavior was already correct; the package interpretation was the defect.
+- The package client now bounded-parses HTTP 410 bodies with a strict discriminated DTO and maps `session_cancelled` to `pairing_cancelled` separately from `session_expired`. Unknown or extra response fields become `pairing_response_invalid` without retaining response data.
+- The package retry watcher now retries ACK independently after registration has reached `completed`. Every attempt reuses the same request ID and ACK idempotency key, and the consumed request is not registered twice.
+- Empty retry polls are paced at 2.5 seconds (at most 24 ordinary polls/minute). Retryable poll and ACK failures use injected-sleep exponential backoff of 5, 10, 20, then at most 30 seconds, leaving room below the Server's 30/minute device-IP limit even when the HTTP client uses its bounded second attempt.
+
+### TDD evidence
+
+- Server red: `.\.venv\Scripts\python.exe -m pytest tests/test_system_host.py::TestPairingCommand::test_retry_pairing_rejects_ticket_outside_exact_43_char_urlsafe_contract tests/test_pairing_api.py::test_device_retry_poll_returns_strict_safe_cancelled_error -q` -> **3 failed, 1 passed**. The three credential-boundary cases reached the service instead of returning malformed-request errors; the strict cancelled DTO contract already passed.
+- Server green focused: `.\.venv\Scripts\python.exe -m pytest tests/test_pairing_repository.py tests/test_pairing_service.py tests/test_pairing_api.py tests/test_pairing_migrations.py tests/test_system_host.py -q` -> **170 passed, 3 subtests passed**.
+- Server full: `.\.venv\Scripts\python.exe -m pytest -q` -> **5 failed, 751 passed, 15 skipped, 9 warnings, 156 subtests passed**. The same five unrelated baseline failures listed above remain.
+- Package red: `corepack pnpm --filter quukk-clawmessenger test -- src/pairing/client.test.ts src/pairing/service.test.ts` -> **4 failed, 995 passed**. The failures reproduced cancelled-as-expired, acceptance of an unsafe extra DTO field, loss of a transient ACK after completion, and 500 ms retry polling.
+- Package green/full: the same command executed the package suite -> **35 test files, 999 passed**.
+- Package type check: `corepack pnpm --filter quukk-clawmessenger typecheck` -> **passed**.
+- `git diff --check` passed in both repositories before their commits.
+
+### Fix commits
+
+- Server: `461d874 fix: validate retry tickets at command boundary`
+- npm package: `bec6932a0 fix(clawmessenger): harden retry delivery lifecycle`
+- This report update is committed separately in the npm package repository.
