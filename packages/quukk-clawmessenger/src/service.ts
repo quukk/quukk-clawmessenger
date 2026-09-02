@@ -1,3 +1,4 @@
+import { createHmac } from 'node:crypto';
 import { chmod, lstat, mkdir, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -17,7 +18,6 @@ import {
   type RuntimeBinding,
   type RuntimeDiscoveryStatus,
   type StoredConfig,
-  type TrustedRuntime,
 } from './config/schema.js';
 import { localPaths } from './config/paths.js';
 import {
@@ -41,6 +41,7 @@ import {
   LocalRoutes,
   RuntimesResponseSchema,
   SettingsResponseSchema,
+  PairingResponseSchema,
   type ActivityResponse,
   type BindingMutationResponse,
   type ControlStatusResponse,
@@ -52,10 +53,22 @@ import {
   type RuntimeView,
   type SafeBindingView,
   type SettingsResponse,
+  type PairingResponse,
 } from './http/routes.js';
 import { BrowserSessionStore, deriveControlCredential } from './http/security.js';
 import { LocalHttpServer, type LocalHttpServerOptions } from './http/server.js';
 import { LaunchTicketStore } from './http/tickets.js';
+import { PairingClient } from './pairing/client.js';
+import {
+  PairingService,
+  type PairingRuntimeSource,
+  type PairingServiceSnapshot,
+} from './pairing/service.js';
+import {
+  PAIRING_CANDIDATE_ID_PATTERN,
+  PAIRING_MAX_CANDIDATES,
+  pairingQrSchemaFor,
+} from './pairing/schema.js';
 import {
   LocalLogger,
   type ActivityRecord as LoggerActivityRecord,
@@ -142,7 +155,12 @@ export interface ServiceBridgePort {
 
 export type ServiceBindingPort = Pick<
   BindingService,
-  'list' | 'enableSelected' | 'disable' | 'reregister'
+  'list' | 'enableSelected' | 'enablePairingSelection' | 'disable' | 'reregister'
+>;
+
+export type ServicePairingPort = Pick<
+  PairingService,
+  'start' | 'snapshot' | 'cancel' | 'retryFailed'
 >;
 
 export type ServiceWorkerPort = Pick<
@@ -179,6 +197,7 @@ export interface QuukkServiceOptions {
   bridge: ServiceBridgePort;
   runtimes: ServiceRuntimePort;
   bindings: ServiceBindingPort;
+  pairing: ServicePairingPort;
   workers: ServiceWorkerPort;
   router: ServiceRouterPort;
   logger: ServiceLoggerPort;
@@ -549,6 +568,7 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
   readonly #bridge: ServiceBridgePort;
   readonly #runtimesPort: ServiceRuntimePort;
   readonly #bindings: ServiceBindingPort;
+  readonly #pairing: ServicePairingPort;
   readonly #workers: ServiceWorkerPort;
   readonly #router: ServiceRouterPort;
   readonly #logger: ServiceLoggerPort;
@@ -571,6 +591,7 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
   #readyIdentity?: ReadyDaemonIdentity;
   #ownedIdentity: DaemonIdentity;
   #markReadyTransition?: Promise<ReadyDaemonIdentity>;
+  #pairingStartInFlight?: Promise<PairingResponse>;
 
   constructor(options: QuukkServiceOptions) {
     const identity = StartingDaemonIdentitySchema.safeParse(options.identity);
@@ -582,6 +603,7 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
     this.#bridge = options.bridge;
     this.#runtimesPort = options.runtimes;
     this.#bindings = options.bindings;
+    this.#pairing = options.pairing;
     this.#workers = options.workers;
     this.#router = options.router;
     this.#logger = options.logger;
@@ -783,6 +805,51 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
       const parsed = BindingMutationResponseSchema.safeParse({ schemaVersion: 1, binding: safeBinding(current) });
       if (!parsed.success) throw new ServiceError('operation_unavailable');
       return parsed.data;
+    });
+  }
+
+  pairingStart(signal: AbortSignal): Promise<PairingResponse> {
+    if (this.#pairingStartInFlight !== undefined) return this.#pairingStartInFlight;
+    const start = this.#mutate(signal, async (combined) => {
+      const snapshot = await this.#pairing.start();
+      if (combined.aborted) throw new ServiceError('operation_unavailable');
+      return this.#pairingResponse(snapshot);
+    });
+    this.#pairingStartInFlight = start;
+    void start.finally(() => {
+      if (this.#pairingStartInFlight === start) this.#pairingStartInFlight = undefined;
+    }).catch(() => undefined);
+    return start;
+  }
+
+  async pairingStatus(signal: AbortSignal): Promise<PairingResponse> {
+    this.#assertReadable(signal);
+    try {
+      return await this.#pairingResponse(this.#pairing.snapshot());
+    } catch (error) {
+      throw normalizedServiceError(error, 'operation_unavailable');
+    }
+  }
+
+  pairingCancel(signal: AbortSignal): Promise<PairingResponse> {
+    return this.#mutate(signal, async (combined) => {
+      const snapshot = await this.#pairing.cancel();
+      if (combined.aborted) throw new ServiceError('operation_unavailable');
+      return this.#pairingResponse(snapshot);
+    });
+  }
+
+  pairingRetry(candidateIds: readonly string[], signal: AbortSignal): Promise<PairingResponse> {
+    return this.#mutate(signal, async () => {
+      if (
+        candidateIds.length < 1
+        || candidateIds.length > PAIRING_MAX_CANDIDATES
+        || new Set(candidateIds).size !== candidateIds.length
+        || !candidateIds.every((candidateId) => PAIRING_CANDIDATE_ID_PATTERN.test(candidateId))
+      ) {
+        throw new ServiceError('invalid_request');
+      }
+      return this.#pairingResponse(this.#pairing.retryFailed(candidateIds));
     });
   }
 
@@ -1158,6 +1225,45 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
     }
   }
 
+  async #pairingResponse(snapshot: PairingServiceSnapshot): Promise<PairingResponse> {
+    const effective = await this.#store.snapshot(this.#configOverrides, this.#configEnvironment);
+    let qrContent: string | null = null;
+    if (snapshot.state === 'waiting' && snapshot.ticket !== null && snapshot.expiresAt !== null) {
+      const qr = pairingQrSchemaFor({ now: this.#now, allowLoopbackHttp: true }).parse({
+        type: 'clawmessenger_pairing',
+        version: 1,
+        server: effective.config.serverUrl,
+        ticket: snapshot.ticket,
+        expiresAt: Date.parse(snapshot.expiresAt),
+      });
+      qrContent = JSON.stringify(qr);
+    }
+    const parsed = PairingResponseSchema.safeParse({
+      schemaVersion: 1,
+      state: snapshot.state,
+      expiresAt: snapshot.expiresAt,
+      qrContent,
+      candidates: snapshot.candidates.map((candidate) => ({
+        candidateId: candidate.candidateId,
+        provider: candidate.provider,
+        displayName: candidate.displayName,
+        version: candidate.version,
+        readiness: candidate.readiness,
+        statusReason: candidate.statusReason,
+        registrationState: candidate.registrationState,
+      })),
+      results: snapshot.results.map((result) => ({
+        candidateId: result.candidateId,
+        status: result.status,
+        errorCode: result.errorCode,
+        nodeId: result.nodeId,
+        retryable: result.retryable,
+      })),
+    });
+    if (!parsed.success) throw new ServiceError('operation_unavailable');
+    return parsed.data;
+  }
+
   #mutate<T>(signal: AbortSignal, operation: (combined: AbortSignal) => Promise<T>): Promise<T> {
     const run = enqueueServiceMutation(this.#mutationGate, async () => {
       this.#assertMutation(signal);
@@ -1257,12 +1363,18 @@ export function createConservativeRouterControl(options: {
   };
 }
 
-function productionRuntimeSource(client: ProductionBridgeClient): { runtimes(): Promise<readonly TrustedRuntime[]> } {
+function productionRuntimeSource(client: ProductionBridgeClient): PairingRuntimeSource {
   return {
     runtimes: async () => parseCatalog(await client.runtimes()).flatMap((runtime) =>
       runtime.id === undefined || runtime.path === undefined
         ? []
-        : [{ id: runtime.id, provider: runtime.provider, path: runtime.path, status: runtime.status }]),
+        : [{
+            id: runtime.id,
+            provider: runtime.provider,
+            path: runtime.path,
+            status: runtime.status,
+            version: runtime.version,
+          }]),
   };
 }
 
@@ -1526,6 +1638,17 @@ async function composeProductionServiceWithin(
       }),
       deadline,
     );
+    const bridgeIdentity = store.bridgeIdentity();
+    const installAbuseKey = createHmac('sha256', Buffer.from(bridgeIdentity.secret, 'base64url'))
+      .update(`quukk-pairing-abuse-v1\0${bridgeIdentity.installId}`, 'utf8')
+      .digest('hex');
+    const pairing = new PairingService({
+      client: new PairingClient({ serverUrl: effective.config.serverUrl }),
+      bindings,
+      runtimeSource: productionRuntimeSource(client),
+      installAbuseKey,
+      now: options.now,
+    });
     const routerState = factories.createRouterState({ filePath: paths.sessions });
     await productionAcquisition(routerState.initialize(), deadline);
     let routerReference: ServiceRouterPort | undefined;
@@ -1606,6 +1729,7 @@ async function composeProductionServiceWithin(
       bridge: cachedBridge,
       runtimes: client,
       bindings,
+      pairing,
       workers,
       router,
       logger,

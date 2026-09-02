@@ -90,6 +90,29 @@ const settings: SettingsResponse = {
   effective: DEFAULT_CONFIG,
 };
 const status: ControlStatusResponse = { schemaVersion: 1, identity, state: 'ready' };
+const pairingWaiting = {
+  schemaVersion: 1 as const,
+  state: 'waiting' as const,
+  expiresAt: '2099-09-02T10:05:00.000Z',
+  qrContent: JSON.stringify({
+    type: 'clawmessenger_pairing',
+    version: 1,
+    server: 'https://configured.example',
+    ticket: 'p'.repeat(43),
+    expiresAt: Date.parse('2099-09-02T10:05:00.000Z'),
+  }),
+  candidates: [{
+    candidateId: 'cand-a',
+    provider: 'opencode' as const,
+    displayName: 'OpenCode',
+    version: '1.2.3',
+    readiness: 'ready' as const,
+    statusReason: null,
+    registrationState: 'unregistered' as const,
+  }],
+  results: [],
+};
+const pairingCancelled = { ...pairingWaiting, state: 'cancelled' as const, qrContent: null };
 
 class FakeApi implements LocalApiPort {
   readonly calls: string[] = [];
@@ -108,6 +131,18 @@ class FakeApi implements LocalApiPort {
   async diagnostics(): Promise<DiagnosticsResponse> { this.calls.push('diagnostics'); return diagnostics; }
   async settings(): Promise<SettingsResponse> { this.calls.push('settings'); return settings; }
   async saveSettings(): Promise<SettingsResponse> { this.calls.push('saveSettings'); return settings; }
+  async pairingStart(): Promise<typeof pairingWaiting> {
+    this.calls.push('pairingStart'); return pairingWaiting;
+  }
+  async pairingStatus(): Promise<typeof pairingWaiting> {
+    this.calls.push('pairingStatus'); return pairingWaiting;
+  }
+  async pairingCancel(): Promise<typeof pairingCancelled> {
+    this.calls.push('pairingCancel'); return pairingCancelled;
+  }
+  async pairingRetry(candidateIds: readonly string[]): Promise<typeof pairingWaiting> {
+    this.calls.push(`pairingRetry:${candidateIds.join(',')}`); return pairingWaiting;
+  }
 }
 
 class FakeControl implements LocalControlPort {
@@ -304,6 +339,143 @@ describe('LocalRoutes browser boundary', () => {
       `enable:${RUNTIME_ID}`, `disable:${RUNTIME_ID}`, `reregister:${RUNTIME_ID}`,
       'activity', 'diagnostics', 'settings', 'saveSettings',
     ]);
+  });
+
+  it('returns only local UI pairing fields with hardened headers for the full lifecycle', async () => {
+    const value = await harness();
+    const session = await browserSession(value);
+    const mutationHeaders = {
+      Cookie: session.cookie, Origin: value.origin, 'X-Quukk-CSRF': session.csrf,
+    };
+    const started = await value.send({
+      method: 'POST', path: '/api/pairing/session', headers: mutationHeaders,
+    });
+    expect(started.status).toBe(200);
+    expect(started.json).toEqual(pairingWaiting);
+    expect(started.headers['content-security-policy']).toBe(securityHeaders()['Content-Security-Policy']);
+    expect(started.headers['cache-control']).toBe('no-store');
+    expect(started.headers['access-control-allow-origin']).toBeUndefined();
+    expect(JSON.stringify(started.json)).not.toMatch(
+      /deviceSecret|candidateToRuntime|runtimePath|runtimeId|tokenRef|authorization|internalBody/,
+    );
+
+    const inspected = await value.send({
+      path: '/api/pairing/session', headers: { Cookie: session.cookie },
+    });
+    expect(inspected.status).toBe(200);
+    expect(inspected.json).toEqual(pairingWaiting);
+
+    const cancelled = await value.send({
+      method: 'DELETE', path: '/api/pairing/session', headers: mutationHeaders,
+    });
+    expect(cancelled.status).toBe(200);
+    expect(cancelled.json).toEqual(pairingCancelled);
+
+    const retried = await value.send({
+      method: 'POST', path: '/api/pairing/session/retry',
+      headers: { ...mutationHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ candidateIds: ['cand-a'] }),
+    });
+    expect(retried.status).toBe(200);
+    expect(retried.json).toEqual(pairingWaiting);
+    expect(value.api.calls).toEqual([
+      'pairingStart', 'pairingStatus', 'pairingCancel', 'pairingRetry:cand-a',
+    ]);
+  });
+
+  it('rejects unsafe pairing methods, authentication, framing, and retry bodies before effects', async () => {
+    const value = await harness();
+    const session = await browserSession(value);
+    const mutationHeaders = {
+      Cookie: session.cookie, Origin: value.origin, 'X-Quukk-CSRF': session.csrf,
+    };
+    const wrongStartMethod = await value.send({
+      method: 'PUT', path: '/api/pairing/session', headers: mutationHeaders,
+    });
+    expect(wrongStartMethod.status).toBe(405);
+    expect(wrongStartMethod.headers.allow).toBe('GET, POST, DELETE');
+    const wrongRetryMethod = await value.send({
+      method: 'GET', path: '/api/pairing/session/retry', headers: { Cookie: session.cookie },
+    });
+    expect(wrongRetryMethod.status).toBe(405);
+    expect(wrongRetryMethod.headers.allow).toBe('POST');
+
+    expect((await value.send({ method: 'POST', path: '/api/pairing/session' })).status).toBe(403);
+    expect((await value.send({
+      method: 'POST', path: '/api/pairing/session',
+      headers: { Cookie: session.cookie, Origin: value.origin },
+    })).status).toBe(403);
+    expect((await value.send({
+      method: 'POST', path: '/api/pairing/session',
+      headers: { ...mutationHeaders, 'Content-Type': 'application/json' }, body: '{}',
+    })).status).toBe(400);
+
+    const retry = (body: string) => value.send({
+      method: 'POST', path: '/api/pairing/session/retry',
+      headers: { ...mutationHeaders, 'Content-Type': 'application/json' }, body,
+    });
+    for (const body of [
+      'not-json',
+      JSON.stringify({ candidateIds: [] }),
+      JSON.stringify({ candidateIds: ['cand-a', 'cand-a'] }),
+      JSON.stringify({ candidateIds: Array.from({ length: 17 }, (_, index) => `cand-${index}`) }),
+      JSON.stringify({ candidateIds: ['cand-a'], extra: true }),
+      JSON.stringify({ candidateIds: ['candidate with spaces'] }),
+    ]) {
+      expect((await retry(body)).status).toBe(400);
+    }
+    expect((await value.send({
+      method: 'POST', path: '/api/pairing/session/retry', headers: mutationHeaders,
+      body: JSON.stringify({ candidateIds: ['cand-a'] }),
+    })).status).toBe(415);
+    expect(value.api.calls).toEqual([]);
+  });
+
+  it('aborts a timed-out pairing start and returns only the fixed timeout error', async () => {
+    let aborted = false;
+    const value = await harness({
+      setTimeout: ((callback: (...args: unknown[]) => void) => {
+        queueMicrotask(callback);
+        return 1 as never;
+      }) as unknown as typeof globalThis.setTimeout,
+      clearTimeout: (() => undefined) as typeof globalThis.clearTimeout,
+    });
+    const session = await browserSession(value);
+    value.api.pairingStart = ((signal: AbortSignal) => new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => {
+        aborted = true;
+        reject(new Error('SECRET_PAIRING_START_FAILURE'));
+      }, { once: true });
+    })) as never;
+    const response = await value.send({
+      method: 'POST', path: '/api/pairing/session',
+      headers: { Cookie: session.cookie, Origin: value.origin, 'X-Quukk-CSRF': session.csrf },
+    });
+    expect(response.status).toBe(504);
+    expect(response.json).toEqual({
+      error: { code: 'operation_timeout', category: 'transport', retryable: true },
+    });
+    expect(response.body).not.toContain('SECRET_PAIRING_START_FAILURE');
+    expect(aborted).toBe(true);
+  });
+
+  it('accepts the maximum bounded set of sixteen unique candidate IDs', async () => {
+    const value = await harness();
+    const session = await browserSession(value);
+    const candidateIds = Array.from({ length: 16 }, (_, index) =>
+      `${index.toString(16).padStart(2, '0')}${'a'.repeat(62)}`);
+    const response = await value.send({
+      method: 'POST', path: '/api/pairing/session/retry',
+      headers: {
+        Cookie: session.cookie,
+        Origin: value.origin,
+        'X-Quukk-CSRF': session.csrf,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ candidateIds }),
+    });
+    expect(response.status).toBe(200);
+    expect(value.api.calls).toEqual([`pairingRetry:${candidateIds.join(',')}`]);
   });
 
   it('rejects unknown input, empty-route bodies, raw aliases, and wrong methods before effects', async () => {

@@ -13,6 +13,12 @@ import {
 import { BridgeEventTypeSchema } from '../go/types.js';
 import type { LocalLogger } from '../logging/logger.js';
 import {
+  PAIRING_CANDIDATE_ID_PATTERN,
+  PAIRING_MAX_CANDIDATES,
+  pairingCandidateResultSchema,
+  pairingCandidateSchema,
+} from '../pairing/schema.js';
+import {
   BrowserSessionStore,
   constantTimeCredentialEqual,
   securityHeaders,
@@ -22,6 +28,7 @@ import { LaunchTicketStore } from './tickets.js';
 const RESPONSE_LIMIT = 1 << 20;
 const PUBLIC_BODY_LIMIT = 64 << 10;
 const SMALL_BODY_LIMIT = 1 << 10;
+const PAIRING_RETRY_BODY_LIMIT = 2 << 10;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const ERROR_CODE_PATTERN = /^[a-z0-9_]{1,64}$/;
 
@@ -172,6 +179,19 @@ export const SettingsResponseSchema = z.strictObject({
 });
 export type SettingsResponse = z.infer<typeof SettingsResponseSchema>;
 
+const PairingResultSchema = pairingCandidateResultSchema.safeExtend({ retryable: z.boolean() });
+export const PairingResponseSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  state: z.enum([
+    'idle', 'waiting', 'claimed', 'processing', 'completed', 'partial', 'cancelled', 'expired',
+  ]),
+  expiresAt: rfc3339.nullable(),
+  qrContent: z.string().min(1).max(8 << 10).nullable(),
+  candidates: z.array(pairingCandidateSchema).max(PAIRING_MAX_CANDIDATES),
+  results: z.array(PairingResultSchema).max(PAIRING_MAX_CANDIDATES),
+});
+export type PairingResponse = z.infer<typeof PairingResponseSchema>;
+
 export const ReadyDaemonIdentitySchema = z.strictObject({
   schema_version: z.literal(1),
   state: z.literal('ready'),
@@ -203,6 +223,10 @@ export interface LocalApiPort {
   diagnostics(signal: AbortSignal): Promise<DiagnosticsResponse>;
   settings(signal: AbortSignal): Promise<SettingsResponse>;
   saveSettings(value: StoredConfig, signal: AbortSignal): Promise<SettingsResponse>;
+  pairingStart(signal: AbortSignal): Promise<PairingResponse>;
+  pairingStatus(signal: AbortSignal): Promise<PairingResponse>;
+  pairingCancel(signal: AbortSignal): Promise<PairingResponse>;
+  pairingRetry(candidateIds: readonly string[], signal: AbortSignal): Promise<PairingResponse>;
 }
 
 export interface LocalControlPort {
@@ -402,6 +426,15 @@ const EnableInputSchema = z.strictObject({
   }
 });
 const SettingsInputSchema = z.strictObject({ settings: StoredConfigSchema });
+const PairingRetryInputSchema = z.strictObject({
+  candidateIds: z.array(z.string().regex(PAIRING_CANDIDATE_ID_PATTERN))
+    .min(1)
+    .max(PAIRING_MAX_CANDIDATES),
+}).superRefine((value, context) => {
+  if (new Set(value.candidateIds).size !== value.candidateIds.length) {
+    context.addIssue({ code: 'custom', path: ['candidateIds'], message: 'duplicate_candidate_id' });
+  }
+});
 const ControlInputSchema = z.discriminatedUnion('command', [
   z.strictObject({ command: z.literal('status') }),
   z.strictObject({ command: z.literal('launch_ticket') }),
@@ -417,13 +450,13 @@ const LaunchTicketResponseSchema = z.strictObject({
 const ShutdownResponseSchema = z.strictObject({ schemaVersion: z.literal(1), accepted: z.literal(true) });
 
 type BrowserRoute = {
-  method: 'GET' | 'POST' | 'PUT';
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE';
   allow: string;
-  kind: 'exchange' | 'runtimes' | 'rescan' | 'enable' | 'disable' | 'reregister' | 'activity' | 'diagnostics' | 'settings' | 'saveSettings';
+  kind: 'exchange' | 'runtimes' | 'rescan' | 'enable' | 'disable' | 'reregister' | 'activity' | 'diagnostics' | 'settings' | 'saveSettings' | 'pairingStart' | 'pairingStatus' | 'pairingCancel' | 'pairingRetry';
   runtimeId?: string;
 };
 
-function browserRoute(pathname: string): BrowserRoute | undefined {
+function browserRoute(pathname: string, method: string): BrowserRoute | undefined {
   const fixed: Record<string, BrowserRoute> = {
     '/api/session/exchange': { method: 'POST', allow: 'POST', kind: 'exchange' },
     '/api/runtimes': { method: 'GET', allow: 'GET', kind: 'runtimes' },
@@ -434,6 +467,18 @@ function browserRoute(pathname: string): BrowserRoute | undefined {
     '/api/settings': { method: 'GET', allow: 'GET, PUT', kind: 'settings' },
   };
   if (pathname === '/api/settings') return fixed[pathname];
+  if (pathname === '/api/pairing/session') {
+    if (method === 'GET') {
+      return { method: 'GET', allow: 'GET, POST, DELETE', kind: 'pairingStatus' };
+    }
+    if (method === 'DELETE') {
+      return { method: 'DELETE', allow: 'GET, POST, DELETE', kind: 'pairingCancel' };
+    }
+    return { method: 'POST', allow: 'GET, POST, DELETE', kind: 'pairingStart' };
+  }
+  if (pathname === '/api/pairing/session/retry') {
+    return { method: 'POST', allow: 'POST', kind: 'pairingRetry' };
+  }
   const exact = fixed[pathname];
   if (exact !== undefined) return exact;
   const match = /^\/api\/bindings\/(rt_[0-9a-f]{32})\/(disable|reregister)$/.exec(pathname);
@@ -494,7 +539,7 @@ export class LocalRoutes {
         return 'handled';
       }
       if (context.pathname.startsWith('/internal')) throw new HttpFailure('not_found');
-      const route = browserRoute(context.pathname);
+      const route = browserRoute(context.pathname, context.method);
       if (route === undefined) {
         if (context.pathname.startsWith('/api')) throw new HttpFailure('not_found');
         return 'static';
@@ -560,6 +605,17 @@ export class LocalRoutes {
       sendJson(request, response, 200, value, SettingsResponseSchema);
       return;
     }
+    if (route.kind === 'pairingRetry') {
+      const input = parseInput(PairingRetryInputSchema, await readJson(request, PAIRING_RETRY_BODY_LIMIT));
+      const value = await this.#operation(
+        request,
+        response,
+        45_000,
+        (signal) => this.#api.pairingRetry(input.candidateIds, signal),
+      );
+      sendJson(request, response, 200, value, PairingResponseSchema);
+      return;
+    }
 
     assertBodylessRequest(request);
     if (route.kind === 'runtimes') {
@@ -583,6 +639,15 @@ export class LocalRoutes {
     } else if (route.kind === 'settings') {
       const value = await this.#operation(request, response, 10_000, (signal) => this.#api.settings(signal));
       sendJson(request, response, 200, value, SettingsResponseSchema);
+    } else if (route.kind === 'pairingStart') {
+      const value = await this.#operation(request, response, 45_000, (signal) => this.#api.pairingStart(signal));
+      sendJson(request, response, 200, value, PairingResponseSchema);
+    } else if (route.kind === 'pairingStatus') {
+      const value = await this.#operation(request, response, 10_000, (signal) => this.#api.pairingStatus(signal));
+      sendJson(request, response, 200, value, PairingResponseSchema);
+    } else if (route.kind === 'pairingCancel') {
+      const value = await this.#operation(request, response, 10_000, (signal) => this.#api.pairingCancel(signal));
+      sendJson(request, response, 200, value, PairingResponseSchema);
     }
   }
 

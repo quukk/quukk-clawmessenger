@@ -4,7 +4,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { EnableResult } from './bindings/service.js';
+import type { EnableResult, PairingSelectionInput } from './bindings/service.js';
 import {
   DEFAULT_CONFIG,
   PROVIDERS,
@@ -24,6 +24,7 @@ import type {
   ReadyDaemonIdentity,
   StartingDaemonIdentity,
 } from './process/service-identity.js';
+import type { PairingServiceSnapshot } from './pairing/service.js';
 import type {
   SupervisorBinding,
   WorkerIdentity,
@@ -261,6 +262,11 @@ class FakeBindings implements ServiceBindingPort {
     return [];
   }
 
+  async enablePairingSelection(input: PairingSelectionInput): Promise<EnableResult> {
+    this.trace.push(`bindings.pairing:${input.runtimeId}`);
+    return { runtimeId: input.runtimeId, ok: false, errorCode: 'runtime_unavailable' };
+  }
+
   async disable(runtimeId: string): Promise<RuntimeBinding> {
     this.trace.push(`bindings.disable:${runtimeId}`);
     if (this.disableHook) return this.disableHook(runtimeId);
@@ -278,6 +284,28 @@ class FakeBindings implements ServiceBindingPort {
     return binding
       ? { runtimeId, ok: true, binding: { ...binding } }
       : { runtimeId, ok: false, errorCode: 'runtime_not_found' };
+  }
+}
+
+class FakePairing {
+  snapshotValue: PairingServiceSnapshot = {
+    state: 'waiting',
+    ticket: 'p'.repeat(43),
+    expiresAt: '2099-09-02T10:05:00.000Z',
+    candidates: [{
+      candidateId: 'cand-a', provider: 'opencode', displayName: 'OpenCode', version: '1.2.3',
+      readiness: 'ready', statusReason: null, registrationState: 'unregistered',
+    }],
+    results: [],
+  };
+  readonly calls: string[] = [];
+  startHook: () => Promise<PairingServiceSnapshot> = async () => this.snapshotValue;
+
+  snapshot(): PairingServiceSnapshot { this.calls.push('snapshot'); return this.snapshotValue; }
+  async start(): Promise<PairingServiceSnapshot> { this.calls.push('start'); return this.startHook(); }
+  async cancel(): Promise<PairingServiceSnapshot> { this.calls.push('cancel'); return this.snapshotValue; }
+  retryFailed(candidateIds: readonly string[]): PairingServiceSnapshot {
+    this.calls.push(`retry:${candidateIds.join(',')}`); return this.snapshotValue;
   }
 }
 
@@ -405,6 +433,7 @@ async function fixture(input: {
   bindings.values = input.bindings?.map((binding) => ({ ...binding })) ?? [];
   store.bindings = bindings.values;
   const workers = new FakeWorkers(trace);
+  const pairing = new FakePairing();
   const router = new FakeRouter(trace);
   const logger = new FakeLogger();
   const identityStore = new FakeIdentityStore(trace);
@@ -436,6 +465,7 @@ async function fixture(input: {
     bridge,
     runtimes: runtime,
     bindings,
+    pairing,
     workers,
     router,
     logger,
@@ -450,7 +480,7 @@ async function fixture(input: {
     },
   });
   return {
-    root, storageRoot, trace, store, runtime, bindings, workers, router, logger,
+    root, storageRoot, trace, store, runtime, bindings, pairing, workers, router, logger,
     identityStore, http, bridge, service,
     get controlCredential() { return capturedControlCredential; },
   };
@@ -820,6 +850,57 @@ describe('QuukkService lifecycle', () => {
 });
 
 describe('QuukkService mutations', () => {
+  it('deduplicates concurrent pairing starts inside the external mutation gate and projects a safe snapshot', async () => {
+    const f = await fixture();
+    await start(f);
+    let release!: () => void;
+    f.pairing.snapshotValue = {
+      ...f.pairing.snapshotValue,
+      candidates: [{
+        ...f.pairing.snapshotValue.candidates[0]!,
+        runtimeId: IDS.opencode,
+        runtimePath: join(f.root, 'SECRET_RUNTIME_PATH'),
+        tokenRef: 'SECRET_TOKEN',
+      } as never],
+      results: [{
+        candidateId: 'cand-a', status: 'failed', errorCode: 'registration_timeout',
+        nodeId: null, retryable: true, internalBody: 'SECRET_INTERNAL_BODY',
+      } as never],
+      deviceSecret: 'SECRET_DEVICE_SECRET',
+      candidateToRuntime: { 'cand-a': IDS.opencode },
+    } as never;
+    f.pairing.startHook = () => new Promise((resolvePromise) => {
+      release = () => resolvePromise(f.pairing.snapshotValue);
+    });
+    const first = f.service.pairingStart(new AbortController().signal);
+    const second = f.service.pairingStart(new AbortController().signal);
+    await vi.waitFor(() => expect(f.pairing.calls).toEqual(['start']));
+    release();
+    const [left, right] = await Promise.all([first, second]);
+    expect(left).toEqual(right);
+    expect(left).toEqual({
+      schemaVersion: 1,
+      state: 'waiting',
+      expiresAt: '2099-09-02T10:05:00.000Z',
+      qrContent: JSON.stringify({
+        type: 'clawmessenger_pairing', version: 1, server: DEFAULT_CONFIG.serverUrl,
+        ticket: 'p'.repeat(43), expiresAt: Date.parse('2099-09-02T10:05:00.000Z'),
+      }),
+      candidates: [{
+        candidateId: 'cand-a', provider: 'opencode', displayName: 'OpenCode', version: '1.2.3',
+        readiness: 'ready', statusReason: null, registrationState: 'unregistered',
+      }],
+      results: [{
+        candidateId: 'cand-a', status: 'failed', errorCode: 'registration_timeout',
+        nodeId: null, retryable: true,
+      }],
+    });
+    expect(JSON.stringify(left)).not.toMatch(
+      /ticket":"p{43}"|deviceSecret|candidateToRuntime|runtimeId|runtimePath|tokenRef|internalBody|SECRET/,
+    );
+    await f.service.stop();
+  });
+
   it('rejects structurally invalid enable requests before any binding, router, or worker side effect', async () => {
     const f = await fixture();
     await start(f);
