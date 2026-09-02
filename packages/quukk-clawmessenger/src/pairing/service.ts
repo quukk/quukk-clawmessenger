@@ -17,6 +17,7 @@ import type {
   PairingCandidate,
   PairingCandidateResult,
   PairingRegistrationAuthorization,
+  PairingRetryRequest,
 } from './schema.js';
 
 const POLL_DELAY_MS = 500;
@@ -35,7 +36,10 @@ const providerLabels = {
   hermes: 'Hermes',
 } as const satisfies Record<Provider, string>;
 
-type PairingClientPort = Pick<PairingClient, 'createSession' | 'pollSelection' | 'cancelSession'>;
+type PairingClientPort = Pick<
+  PairingClient,
+  'createSession' | 'pollSelection' | 'cancelSession' | 'pollRetry' | 'ackRetry'
+>;
 
 export type PairingSessionState =
   | 'idle'
@@ -178,6 +182,9 @@ export class PairingService {
   #controller: AbortController | undefined;
   #expiryTimer: ReturnType<typeof setTimeout> | undefined;
   #cycle: Promise<void> = Promise.resolve();
+  #retryWatch: Promise<void> | undefined;
+  #consumedRetryRequestIds = new Set<string>();
+  #retryAckKeys = new Map<string, string>();
   #startInFlight: Promise<PairingServiceSnapshot> | undefined;
   #generation = 0;
 
@@ -327,6 +334,8 @@ export class PairingService {
     this.#candidates = [];
     this.#selectedCandidates = [];
     this.#results.clear();
+    this.#consumedRetryRequestIds.clear();
+    this.#retryAckKeys.clear();
     const controller = new AbortController();
     const generation = ++this.#generation;
     this.#controller = controller;
@@ -491,6 +500,84 @@ export class PairingService {
       ? 'completed'
       : 'partial';
     if (this.#state === 'completed') this.#clearPrivateState();
+    else {
+      const signal = this.#controller?.signal;
+      if (signal !== undefined) this.#startRetryWatch(generation, signal);
+    }
+  }
+
+  #startRetryWatch(generation: number, signal: AbortSignal): void {
+    if (this.#retryWatch !== undefined) return;
+    const watch = this.#watchRetries(generation, signal);
+    this.#retryWatch = watch;
+    void watch.finally(() => {
+      if (this.#retryWatch === watch) this.#retryWatch = undefined;
+    }).catch((error) => this.#finishCycleError(error, generation));
+  }
+
+  async #watchRetries(generation: number, signal: AbortSignal): Promise<void> {
+    while (generation === this.#generation && !signal.aborted) {
+      if (this.#expired()) {
+        this.#state = 'expired';
+        this.#clearPrivateState();
+        return;
+      }
+      if (this.#state === 'completed' || this.#state === 'cancelled' || this.#state === 'expired') {
+        return;
+      }
+      if (this.#state !== 'partial') {
+        await this.#sleep(POLL_DELAY_MS, signal);
+        continue;
+      }
+      const session = this.#privateSession;
+      if (session === undefined) return;
+      let request: PairingRetryRequest | null;
+      try {
+        request = await this.#client.pollRetry(session.ticket, session.deviceSecret, signal);
+      } catch (error) {
+        if (generation !== this.#generation || signal.aborted) return;
+        if (error instanceof PairingClientError && error.code === 'pairing_expired') {
+          this.#state = 'expired';
+          this.#clearPrivateState();
+          return;
+        }
+        if (error instanceof PairingClientError && error.retryable) {
+          await this.#sleep(POLL_DELAY_MS, signal);
+          continue;
+        }
+        throw error;
+      }
+      if (request === null) {
+        await this.#sleep(POLL_DELAY_MS, signal);
+        continue;
+      }
+      const firstDelivery = !this.#consumedRetryRequestIds.has(request.requestId);
+      if (firstDelivery) {
+        this.#consumedRetryRequestIds.add(request.requestId);
+        const previousCycle = this.#cycle;
+        this.retryFailed(request.candidateIds);
+        if (this.#cycle !== previousCycle) await this.#cycle;
+      }
+      const ackKey = this.#retryAckKeys.get(request.requestId) ?? this.#newOpaqueId();
+      this.#retryAckKeys.set(request.requestId, ackKey);
+      try {
+        await this.#client.ackRetry(
+          session.ticket,
+          session.deviceSecret,
+          request.requestId,
+          ackKey,
+          signal,
+        );
+      } catch (error) {
+        if (generation !== this.#generation || signal.aborted) return;
+        if (error instanceof PairingClientError && error.retryable) {
+          await this.#sleep(POLL_DELAY_MS, signal);
+          continue;
+        }
+        throw error;
+      }
+      if (this.snapshot().state === 'completed') return;
+    }
   }
 
   #finishCycleError(error: unknown, generation: number): void {

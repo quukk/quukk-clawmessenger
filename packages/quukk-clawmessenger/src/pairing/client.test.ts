@@ -115,6 +115,81 @@ describe('PairingClient', () => {
     expect(init?.body).toBeUndefined();
   });
 
+  it('polls a strict retry request and treats an empty queue as no work', async () => {
+    const fetchSpy = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(200, {
+        code: 200,
+        data: { requestId: 'retry-request-0001', candidateIds: ['cand-opencode'] },
+      }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const client = new PairingClient({ serverUrl: SERVER, fetch: fetchSpy });
+
+    await expect(client.pollRetry(TICKET, DEVICE_SECRET)).resolves.toEqual({
+      requestId: 'retry-request-0001',
+      candidateIds: ['cand-opencode'],
+    });
+    await expect(client.pollRetry(TICKET, DEVICE_SECRET)).resolves.toBeNull();
+
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe(`${SERVER}/api/ai/pairing/sessions/${TICKET}/retry`);
+    expect(init).toMatchObject({ method: 'GET', redirect: 'manual' });
+    expect(new Headers(init?.headers).get('authorization')).toBe(`Pairing ${DEVICE_SECRET}`);
+  });
+
+  it('acknowledges retry through the device channel without putting credentials in the URL', async () => {
+    const fetchSpy = vi.fn(async () => jsonResponse(200, {
+      code: 200,
+      data: { requestId: 'retry-request-0001', candidateIds: ['cand-opencode'] },
+    }));
+    const client = new PairingClient({ serverUrl: SERVER, fetch: fetchSpy });
+
+    await expect(client.ackRetry(
+      TICKET,
+      DEVICE_SECRET,
+      'retry-request-0001',
+      'retry-ack-key-0001',
+    )).resolves.toMatchObject({ requestId: 'retry-request-0001' });
+
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe(`${SERVER}/api/ai/pairing/sessions/${TICKET}/retry/retry-request-0001/ack`);
+    expect(url).not.toContain(DEVICE_SECRET);
+    expect(init).toMatchObject({ method: 'POST', redirect: 'manual', body: '{}' });
+    const headers = new Headers(init?.headers);
+    expect(headers.get('authorization')).toBe(`Pairing ${DEVICE_SECRET}`);
+    expect(headers.get('idempotency-key')).toBe('retry-ack-key-0001');
+  });
+
+  it('rejects unsafe retry delivery fields, duplicates, and invalid request IDs', async () => {
+    const unsafe = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(200, {
+        code: 200,
+        data: {
+          requestId: 'retry-request-0001',
+          candidateIds: ['cand-opencode'],
+          runtimePath: 'C:\\private',
+        },
+      }))
+      .mockResolvedValueOnce(jsonResponse(200, {
+        code: 200,
+        data: {
+          requestId: 'retry-request-0001',
+          candidateIds: ['cand-opencode', 'cand-opencode'],
+        },
+      }));
+    const client = new PairingClient({ serverUrl: SERVER, fetch: unsafe });
+
+    await expect(client.pollRetry(TICKET, DEVICE_SECRET)).rejects.toMatchObject({
+      code: 'pairing_response_invalid',
+    });
+    await expect(client.pollRetry(TICKET, DEVICE_SECRET)).rejects.toMatchObject({
+      code: 'pairing_response_invalid',
+    });
+    await expect(client.ackRetry(TICKET, DEVICE_SECRET, 'short', 'retry-ack-key-0001'))
+      .rejects.toMatchObject({ code: 'pairing_rejected' });
+  });
+
   it('never puts pairing credentials in a URL or loggable error', async () => {
     const fetchSpy = vi.fn(async () => {
       throw new Error(`upstream leaked ${TICKET} ${DEVICE_SECRET}`);

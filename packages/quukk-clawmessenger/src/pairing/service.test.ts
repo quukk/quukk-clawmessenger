@@ -101,6 +101,17 @@ class FakePairingClient {
   }> = [];
   readonly selections: Array<ReturnType<typeof deferred<PairingSelection>>> = [];
   readonly createSignals: Array<AbortSignal | undefined> = [];
+  readonly retryPolls: Array<ReturnType<typeof deferred<{
+    requestId: string;
+    candidateIds: string[];
+  } | null>>> = [];
+  readonly retryPollCalls: Array<{ ticket: string; deviceSecret: string; signal?: AbortSignal }> = [];
+  readonly retryAckCalls: Array<{
+    ticket: string;
+    deviceSecret: string;
+    requestId: string;
+    idempotencyKey: string;
+  }> = [];
   createImplementation: ((
     input: CreatePairingSessionInput,
     signal?: AbortSignal,
@@ -145,6 +156,30 @@ class FakePairingClient {
     this.cancelCalls.push({ ticket, deviceSecret, idempotencyKey });
     const candidates = this.createCalls.at(-1)?.candidates ?? [];
     return { status: 'cancelled', selectedCandidateIds: [], candidates, expiresAt: EXPIRES_AT };
+  }
+
+  pollRetry(
+    ticket: string,
+    deviceSecret: string,
+    signal?: AbortSignal,
+  ): Promise<{ requestId: string; candidateIds: string[] } | null> {
+    this.retryPollCalls.push({ ticket, deviceSecret, signal });
+    const pending = deferred<{ requestId: string; candidateIds: string[] } | null>();
+    this.retryPolls.push(pending);
+    signal?.addEventListener('abort', () => {
+      pending.reject(new PairingClientError('pairing_cancelled', 'transport', false));
+    }, { once: true });
+    return pending.promise;
+  }
+
+  async ackRetry(
+    ticket: string,
+    deviceSecret: string,
+    requestId: string,
+    idempotencyKey: string,
+  ): Promise<{ requestId: string; candidateIds: string[] }> {
+    this.retryAckCalls.push({ ticket, deviceSecret, requestId, idempotencyKey });
+    return { requestId, candidateIds: [] };
   }
 }
 
@@ -498,6 +533,70 @@ describe('PairingService', () => {
         }),
       ]),
     });
+  });
+
+  it('stays alive after partial, consumes a server retry request once, and acknowledges it', async () => {
+    const codex = runtime('codex');
+    const fixture = harness([codex]);
+    fixture.bindings.outcomes.set(codex.id, [
+      { runtimeId: codex.id, ok: false, errorCode: 'registration_transport' },
+      { runtimeId: codex.id, ok: false, errorCode: 'registration_transport' },
+      { runtimeId: codex.id, ok: true, binding: binding(codex) },
+    ]);
+    await fixture.service.start();
+    const candidateId = fixture.client.createCalls[0]!.candidates[0]!.candidateId;
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [candidateId]));
+    await fixture.service.waitForTerminal();
+    await vi.waitFor(() => expect(fixture.client.retryPolls).toHaveLength(1));
+
+    fixture.client.retryPolls[0]!.resolve({
+      requestId: 'retry-request-0001',
+      candidateIds: [candidateId],
+    });
+    await vi.waitFor(() => expect(fixture.client.retryAckCalls).toHaveLength(1));
+    expect(fixture.service.snapshot().state).toBe('partial');
+    await vi.waitFor(() => expect(fixture.client.retryPolls).toHaveLength(2));
+
+    fixture.client.retryPolls[1]!.resolve({
+      requestId: 'retry-request-0001',
+      candidateIds: [candidateId],
+    });
+    await vi.waitFor(() => expect(fixture.client.retryAckCalls).toHaveLength(2));
+    expect(fixture.bindings.calls).toHaveLength(2);
+    await vi.waitFor(() => expect(fixture.client.retryPolls).toHaveLength(3));
+
+    fixture.client.retryPolls[2]!.resolve({
+      requestId: 'retry-request-0002',
+      candidateIds: [candidateId],
+    });
+    await vi.waitFor(() => expect(fixture.client.retryAckCalls).toHaveLength(3));
+    expect(fixture.bindings.calls).toHaveLength(3);
+    expect(fixture.service.snapshot().state).toBe('completed');
+    expect(new Set(fixture.client.retryAckCalls.map((call) => call.idempotencyKey)).size).toBe(2);
+  });
+
+  it('acknowledges unknown and non-retryable candidates without registering them', async () => {
+    const codex = runtime('codex');
+    const fixture = harness([codex]);
+    fixture.bindings.outcomes.set(codex.id, [
+      { runtimeId: codex.id, ok: false, errorCode: 'registration_rejected' },
+    ]);
+    await fixture.service.start();
+    const candidateId = fixture.client.createCalls[0]!.candidates[0]!.candidateId;
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [candidateId]));
+    await fixture.service.waitForTerminal();
+    await vi.waitFor(() => expect(fixture.client.retryPolls).toHaveLength(1));
+
+    fixture.client.retryPolls[0]!.resolve({
+      requestId: 'retry-request-invalid-0001',
+      candidateIds: [candidateId, 'unknown-candidate'],
+    });
+    await vi.waitFor(() => expect(fixture.client.retryAckCalls).toHaveLength(1));
+
+    expect(fixture.bindings.calls).toHaveLength(1);
+    expect(fixture.service.snapshot().state).toBe('partial');
+    await fixture.service.cancel();
+    expect(fixture.client.retryPollCalls.at(-1)!.signal?.aborted).toBe(true);
   });
 
   it('records a disappeared selected runtime as runtime_unavailable without registration transport', async () => {

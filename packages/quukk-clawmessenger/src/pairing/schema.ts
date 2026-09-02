@@ -38,6 +38,7 @@ const nullableBoundedTrimmedString = (maximum: number) =>
 
 const credentialSchema = z.string().regex(PAIRING_CREDENTIAL_PATTERN);
 const candidateIdSchema = z.string().regex(PAIRING_CANDIDATE_ID_PATTERN);
+const retryRequestIdSchema = z.string().regex(/^[A-Za-z0-9_-]{16,64}$/);
 
 type PairingClockOptions = { now?: () => number };
 
@@ -89,6 +90,11 @@ const selectedCandidateIdsSchema = z
       context.addIssue({ code: 'custom', message: 'duplicate_candidate_id' });
     }
   });
+
+export const pairingRetryRequestSchema = z.strictObject({
+  requestId: retryRequestIdSchema,
+  candidateIds: selectedCandidateIdsSchema.min(1),
+});
 
 export function pairingSessionSchemaFor(options: PairingClockOptions = {}) {
   return z.strictObject({
@@ -253,6 +259,7 @@ export type PairingSession = z.infer<typeof pairingSessionSchema>;
 export type PairingSelection = z.infer<typeof pairingSelectionSchema>;
 export type PairingProgress = z.infer<typeof pairingProgressSchema>;
 export type PairingCandidateResult = z.infer<typeof pairingCandidateResultSchema>;
+export type PairingRetryRequest = z.infer<typeof pairingRetryRequestSchema>;
 export type PairingQr = z.infer<typeof pairingQrSchema>;
 
 export type PairingRegistrationAuthorization = {

@@ -5,11 +5,13 @@ import {
   PAIRING_CREDENTIAL_PATTERN,
   PAIRING_IDEMPOTENCY_KEY_PATTERN,
   pairingCandidateSchema,
+  pairingRetryRequestSchema,
   pairingSelectionSchema,
   pairingSessionSchema,
   type PairingCandidate,
   type PairingSelection,
   type PairingSession,
+  type PairingRetryRequest,
 } from './schema.js';
 
 const RESPONSE_LIMIT = 65_536;
@@ -95,6 +97,10 @@ const createEnvelopeSchema = z.strictObject({ code: z.literal(201), data: pairin
 const selectionEnvelopeSchema = z.strictObject({
   code: z.literal(200),
   data: pairingSelectionSchema,
+});
+const retryEnvelopeSchema = z.strictObject({
+  code: z.literal(200),
+  data: pairingRetryRequestSchema,
 });
 
 function rejected(): PairingClientError {
@@ -183,6 +189,7 @@ export class PairingClient {
     init: RequestInit,
     expectedStatus: 200 | 201,
     callerSignal?: AbortSignal,
+    allowNoContent = false,
   ): Promise<unknown> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       if (callerSignal?.aborted) {
@@ -203,6 +210,10 @@ export class PairingClient {
           redirect: 'manual',
           signal: controller.signal,
         });
+        if (allowNoContent && response.status === 204) {
+          await response.body?.cancel().catch(() => undefined);
+          return null;
+        }
         if (response.status !== expectedStatus) {
           await response.body?.cancel().catch(() => undefined);
           if (TRANSIENT_STATUSES.has(response.status)) {
@@ -331,6 +342,58 @@ export class PairingClient {
       signal,
     );
     const envelope = selectionEnvelopeSchema.safeParse(response);
+    if (!envelope.success) throw invalidResponse();
+    return envelope.data.data;
+  }
+
+  async pollRetry(
+    ticket: string,
+    deviceSecret: string,
+    signal?: AbortSignal,
+  ): Promise<PairingRetryRequest | null> {
+    validateDeviceCredentials(ticket, deviceSecret);
+    const response = await this.#request(
+      `${this.#serverUrl}/api/ai/pairing/sessions/${ticket}/retry`,
+      {
+        method: 'GET',
+        headers: { Accept: 'application/json', Authorization: `Pairing ${deviceSecret}` },
+      },
+      200,
+      signal,
+      true,
+    );
+    if (response === null) return null;
+    const envelope = retryEnvelopeSchema.safeParse(response);
+    if (!envelope.success) throw invalidResponse();
+    return envelope.data.data;
+  }
+
+  async ackRetry(
+    ticket: string,
+    deviceSecret: string,
+    requestId: string,
+    idempotencyKey: string,
+    signal?: AbortSignal,
+  ): Promise<PairingRetryRequest> {
+    validateDeviceCredentials(ticket, deviceSecret);
+    if (!/^[A-Za-z0-9_-]{16,64}$/.test(requestId)) throw rejected();
+    validateIdempotencyKey(idempotencyKey);
+    const response = await this.#request(
+      `${this.#serverUrl}/api/ai/pairing/sessions/${ticket}/retry/${requestId}/ack`,
+      {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          Authorization: `Pairing ${deviceSecret}`,
+          'Idempotency-Key': idempotencyKey,
+        },
+        body: '{}',
+      },
+      200,
+      signal,
+    );
+    const envelope = retryEnvelopeSchema.safeParse(response);
     if (!envelope.success) throw invalidResponse();
     return envelope.data.data;
   }
