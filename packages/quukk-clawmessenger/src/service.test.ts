@@ -934,7 +934,13 @@ describe('QuukkService mutations', () => {
       state: 'waiting',
       qrContent: expect.any(String),
     });
-    expect(f.pairing.calls).toEqual(['start']);
+    f.pairing.startHook = async () => ({
+      ...f.pairing.snapshotValue,
+      ticket: 'q'.repeat(43),
+    });
+    const thirdResult = await f.service.pairingStart(new AbortController().signal);
+    expect(JSON.parse(thirdResult.qrContent!)).toMatchObject({ ticket: 'q'.repeat(43) });
+    expect(f.pairing.calls).toEqual(['start', 'start']);
     await f.service.stop();
   });
 
