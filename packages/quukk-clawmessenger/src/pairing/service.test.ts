@@ -112,6 +112,7 @@ class FakePairingClient {
     requestId: string;
     idempotencyKey: string;
   }> = [];
+  readonly retryAckFailures: PairingClientError[] = [];
   createImplementation: ((
     input: CreatePairingSessionInput,
     signal?: AbortSignal,
@@ -179,6 +180,8 @@ class FakePairingClient {
     idempotencyKey: string,
   ): Promise<{ requestId: string; candidateIds: string[] }> {
     this.retryAckCalls.push({ ticket, deviceSecret, requestId, idempotencyKey });
+    const failure = this.retryAckFailures.shift();
+    if (failure !== undefined) throw failure;
     return { requestId, candidateIds: [] };
   }
 }
@@ -199,7 +202,12 @@ function selected(
 
 function harness(
   runtimes: readonly TrustedRuntime[] = [runtime('opencode'), runtime('codex')],
-  options: { client?: FakePairingClient; bindings?: FakeBindings; randomStart?: number } = {},
+  options: {
+    client?: FakePairingClient;
+    bindings?: FakeBindings;
+    randomStart?: number;
+    sleep?: (milliseconds: number, signal: AbortSignal) => Promise<unknown>;
+  } = {},
 ) {
   const client = options.client ?? new FakePairingClient();
   const bindings = options.bindings ?? new FakeBindings();
@@ -213,9 +221,9 @@ function harness(
     installAbuseKey: INSTALL_ABUSE_KEY,
     now: () => NOW,
     randomBytes,
-    sleep: async (_milliseconds: number, signal: AbortSignal) => {
+    sleep: options.sleep ?? (async (_milliseconds: number, signal: AbortSignal) => {
       if (signal.aborted) throw new PairingClientError('pairing_cancelled', 'transport', false);
-    },
+    }),
   });
   return { service, client, bindings, source, randomBytes };
 }
@@ -573,6 +581,86 @@ describe('PairingService', () => {
     expect(fixture.bindings.calls).toHaveLength(3);
     expect(fixture.service.snapshot().state).toBe('completed');
     expect(new Set(fixture.client.retryAckCalls.map((call) => call.idempotencyKey)).size).toBe(2);
+  });
+
+  it('retries a transient ACK after registration completes without registering twice', async () => {
+    const codex = runtime('codex');
+    const sleep = vi.fn(async () => undefined);
+    const fixture = harness([codex], { sleep });
+    fixture.bindings.outcomes.set(codex.id, [
+      { runtimeId: codex.id, ok: false, errorCode: 'registration_transport' },
+      { runtimeId: codex.id, ok: true, binding: binding(codex) },
+    ]);
+    fixture.client.retryAckFailures.push(
+      new PairingClientError('pairing_transport', 'transport', true),
+    );
+    await fixture.service.start();
+    const candidateId = fixture.client.createCalls[0]!.candidates[0]!.candidateId;
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [candidateId]));
+    await fixture.service.waitForTerminal();
+    await vi.waitFor(() => expect(fixture.client.retryPolls).toHaveLength(1));
+
+    fixture.client.retryPolls[0]!.resolve({
+      requestId: 'retry-request-ack-0001',
+      candidateIds: [candidateId],
+    });
+
+    await vi.waitFor(() => expect(fixture.client.retryAckCalls).toHaveLength(2));
+    expect(fixture.service.snapshot().state).toBe('completed');
+    expect(fixture.bindings.calls).toHaveLength(2);
+    expect(fixture.client.retryAckCalls[1]).toEqual(fixture.client.retryAckCalls[0]);
+    expect(sleep).toHaveBeenCalledWith(5_000, expect.any(AbortSignal));
+  });
+
+  it('paces empty retry polls and exponentially backs off retryable poll failures', async () => {
+    const codex = runtime('codex');
+    const sleep = vi.fn(async () => undefined);
+    const fixture = harness([codex], { sleep });
+    fixture.bindings.outcomes.set(codex.id, [
+      { runtimeId: codex.id, ok: false, errorCode: 'registration_transport' },
+    ]);
+    await fixture.service.start();
+    const candidateId = fixture.client.createCalls[0]!.candidates[0]!.candidateId;
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [candidateId]));
+    await fixture.service.waitForTerminal();
+    await vi.waitFor(() => expect(fixture.client.retryPolls).toHaveLength(1));
+
+    fixture.client.retryPolls[0]!.resolve(null);
+    await vi.waitFor(() => expect(fixture.client.retryPolls).toHaveLength(2));
+    expect(sleep).toHaveBeenCalledWith(2_500, expect.any(AbortSignal));
+
+    fixture.client.retryPolls[1]!.reject(
+      new PairingClientError('pairing_rate_limited', 'transport', true),
+    );
+    await vi.waitFor(() => expect(fixture.client.retryPolls).toHaveLength(3));
+    expect(sleep).toHaveBeenCalledWith(5_000, expect.any(AbortSignal));
+
+    fixture.client.retryPolls[2]!.reject(
+      new PairingClientError('pairing_rate_limited', 'transport', true),
+    );
+    await vi.waitFor(() => expect(fixture.client.retryPolls).toHaveLength(4));
+    expect(sleep).toHaveBeenCalledWith(10_000, expect.any(AbortSignal));
+    await fixture.service.cancel();
+  });
+
+  it.each([
+    ['pairing_cancelled', 'cancelled'],
+    ['pairing_expired', 'expired'],
+  ] as const)('maps remote %s retry termination to %s state', async (code, state) => {
+    const codex = runtime('codex');
+    const fixture = harness([codex]);
+    fixture.bindings.outcomes.set(codex.id, [
+      { runtimeId: codex.id, ok: false, errorCode: 'registration_transport' },
+    ]);
+    await fixture.service.start();
+    const candidateId = fixture.client.createCalls[0]!.candidates[0]!.candidateId;
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [candidateId]));
+    await fixture.service.waitForTerminal();
+    await vi.waitFor(() => expect(fixture.client.retryPolls).toHaveLength(1));
+
+    fixture.client.retryPolls[0]!.reject(new PairingClientError(code, 'pairing', false));
+
+    await vi.waitFor(() => expect(fixture.service.snapshot().state).toBe(state));
   });
 
   it('acknowledges unknown and non-retryable candidates without registering them', async () => {

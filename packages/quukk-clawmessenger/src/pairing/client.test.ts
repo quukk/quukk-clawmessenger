@@ -229,7 +229,6 @@ describe('PairingClient', () => {
   it.each([
     [401, 'pairing_unauthorized', false],
     [409, 'pairing_conflict', false],
-    [410, 'pairing_expired', false],
     [429, 'pairing_rate_limited', true],
   ] as const)('normalizes HTTP %i without parsing the body', async (status, code, retryable) => {
     const fetchSpy = vi.fn(async () => new Response('PRIVATE_BODY', { status }));
@@ -239,6 +238,32 @@ describe('PairingClient', () => {
       code,
       retryable,
     });
+  });
+
+  it.each([
+    ['session_cancelled', 'pairing_cancelled'],
+    ['session_expired', 'pairing_expired'],
+  ] as const)('strictly distinguishes remote %s terminal errors', async (remoteError, code) => {
+    const fetchSpy = vi.fn(async () => jsonResponse(410, { code: 410, error: remoteError }));
+    const client = new PairingClient({ serverUrl: SERVER, fetch: fetchSpy });
+
+    await expect(client.pollRetry(TICKET, DEVICE_SECRET)).rejects.toMatchObject({
+      code,
+      retryable: false,
+    });
+  });
+
+  it('rejects malformed terminal error DTOs without retaining sensitive fields', async () => {
+    const fetchSpy = vi.fn(async () => jsonResponse(410, {
+      code: 410,
+      error: 'session_cancelled',
+      deviceSecret: 'private-device-secret',
+    }));
+    const client = new PairingClient({ serverUrl: SERVER, fetch: fetchSpy });
+
+    const error = await client.pollRetry(TICKET, DEVICE_SECRET).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: 'pairing_response_invalid', retryable: false });
+    expect(JSON.stringify(error)).not.toContain('private-device-secret');
   });
 
   it('rejects oversized and structurally invalid success responses', async () => {

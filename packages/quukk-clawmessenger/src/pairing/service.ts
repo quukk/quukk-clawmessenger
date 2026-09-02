@@ -21,6 +21,9 @@ import type {
 } from './schema.js';
 
 const POLL_DELAY_MS = 500;
+const RETRY_POLL_DELAY_MS = 2_500;
+const RETRY_ERROR_BASE_DELAY_MS = 5_000;
+const RETRY_ERROR_MAX_DELAY_MS = 30_000;
 const MAX_RANDOM_ATTEMPTS = 32;
 const SAFE_VERSION_TOKEN = /^v?(?:0|[1-9]\d{0,5})(?:\.(?:0|[1-9]\d{0,5})){0,3}$/;
 const RETRYABLE_REGISTRATION_ERRORS = new Set([
@@ -129,6 +132,13 @@ function safeVersion(version: string | null | undefined): string | null {
     && !RUNTIME_ID_PATTERN.test(version)
     ? version
     : null;
+}
+
+function retryErrorDelay(failureCount: number): number {
+  return Math.min(
+    RETRY_ERROR_BASE_DELAY_MS * (2 ** Math.max(0, failureCount - 1)),
+    RETRY_ERROR_MAX_DELAY_MS,
+  );
 }
 
 function completeBinding(binding: RuntimeBinding): boolean {
@@ -516,6 +526,7 @@ export class PairingService {
   }
 
   async #watchRetries(generation: number, signal: AbortSignal): Promise<void> {
+    let pollFailureCount = 0;
     while (generation === this.#generation && !signal.aborted) {
       if (this.#expired()) {
         this.#state = 'expired';
@@ -526,7 +537,7 @@ export class PairingService {
         return;
       }
       if (this.#state !== 'partial') {
-        await this.#sleep(POLL_DELAY_MS, signal);
+        await this.#sleep(RETRY_POLL_DELAY_MS, signal);
         continue;
       }
       const session = this.#privateSession;
@@ -542,13 +553,15 @@ export class PairingService {
           return;
         }
         if (error instanceof PairingClientError && error.retryable) {
-          await this.#sleep(POLL_DELAY_MS, signal);
+          pollFailureCount += 1;
+          await this.#sleep(retryErrorDelay(pollFailureCount), signal);
           continue;
         }
         throw error;
       }
+      pollFailureCount = 0;
       if (request === null) {
-        await this.#sleep(POLL_DELAY_MS, signal);
+        await this.#sleep(RETRY_POLL_DELAY_MS, signal);
         continue;
       }
       const firstDelivery = !this.#consumedRetryRequestIds.has(request.requestId);
@@ -560,21 +573,26 @@ export class PairingService {
       }
       const ackKey = this.#retryAckKeys.get(request.requestId) ?? this.#newOpaqueId();
       this.#retryAckKeys.set(request.requestId, ackKey);
-      try {
-        await this.#client.ackRetry(
-          session.ticket,
-          session.deviceSecret,
-          request.requestId,
-          ackKey,
-          signal,
-        );
-      } catch (error) {
-        if (generation !== this.#generation || signal.aborted) return;
-        if (error instanceof PairingClientError && error.retryable) {
-          await this.#sleep(POLL_DELAY_MS, signal);
-          continue;
+      let ackFailureCount = 0;
+      while (generation === this.#generation && !signal.aborted) {
+        try {
+          await this.#client.ackRetry(
+            session.ticket,
+            session.deviceSecret,
+            request.requestId,
+            ackKey,
+            signal,
+          );
+          break;
+        } catch (error) {
+          if (generation !== this.#generation || signal.aborted) return;
+          if (error instanceof PairingClientError && error.retryable) {
+            ackFailureCount += 1;
+            await this.#sleep(retryErrorDelay(ackFailureCount), signal);
+            continue;
+          }
+          throw error;
         }
-        throw error;
       }
       if (this.snapshot().state === 'completed') return;
     }

@@ -103,6 +103,11 @@ const retryEnvelopeSchema = z.strictObject({
   data: pairingRetryRequestSchema,
 });
 
+const terminalErrorEnvelopeSchema = z.discriminatedUnion('error', [
+  z.strictObject({ code: z.literal(410), error: z.literal('session_cancelled') }),
+  z.strictObject({ code: z.literal(410), error: z.literal('session_expired') }),
+]);
+
 function rejected(): PairingClientError {
   return new PairingClientError('pairing_rejected', 'validation', false);
 }
@@ -215,6 +220,18 @@ export class PairingClient {
           return null;
         }
         if (response.status !== expectedStatus) {
+          if (response.status === 410) {
+            let terminalError;
+            try {
+              terminalError = terminalErrorEnvelopeSchema.safeParse(await boundedJson(response));
+            } catch {
+              throw invalidResponse();
+            }
+            if (!terminalError.success) throw invalidResponse();
+            throw terminalError.data.error === 'session_cancelled'
+              ? new PairingClientError('pairing_cancelled', 'pairing', false)
+              : new PairingClientError('pairing_expired', 'pairing', false);
+          }
           await response.body?.cancel().catch(() => undefined);
           if (TRANSIENT_STATUSES.has(response.status)) {
             failure = new AttemptFailure('transport');
