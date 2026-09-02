@@ -643,6 +643,28 @@ jobs:
             '@quukk/clawmessenger-runtime-linux-x64'
             '@quukk/clawmessenger-runtime-linux-arm64'
           )
+          source_runtime_version="$(node --input-type=module -e '
+            const manifest = await import("./packages/quukk-clawmessenger/package.json", { with: { type: "json" } });
+            const expectedNames = process.argv.slice(1).sort();
+            const optionalDependencies = manifest.default.optionalDependencies;
+            const actualNames = optionalDependencies && typeof optionalDependencies === "object"
+              ? Object.keys(optionalDependencies).sort()
+              : [];
+            const versions = actualNames.map((name) => optionalDependencies[name]);
+            if (
+              JSON.stringify(actualNames) !== JSON.stringify(expectedNames) ||
+              versions.some((version) => typeof version !== "string") ||
+              new Set(versions).size !== 1
+            ) process.exit(2);
+            process.stdout.write(versions[0]);
+          ' "${runtime_names[@]}")" || {
+            echo "::error::source runtime optionalDependencies are invalid"
+            exit 1
+          }
+          if [ "$runtime_version" != "$source_runtime_version" ]; then
+            echo "::error::entry artifact runtime version does not match the source manifest"
+            exit 1
+          fi
           for runtime_name in "${runtime_names[@]}"; do
             published_version="$(npm view "$runtime_name@$runtime_version" version --json --registry=https://registry.npmjs.org | node -e 'let data=""; process.stdin.on("data", chunk => data += chunk); process.stdin.on("end", () => process.stdout.write(JSON.parse(data)));')"
             if [ "$published_version" != "$runtime_version" ]; then

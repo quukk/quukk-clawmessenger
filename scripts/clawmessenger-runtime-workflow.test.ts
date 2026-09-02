@@ -396,6 +396,8 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
     const verify = requiredStep(publish, 'Verify entry-only beta release');
     expect(credential.run).toContain('npm whoami');
     expect(validate.run).toContain('optionalDependencies');
+    expect(validate.run).toContain('source_runtime_version');
+    expect(validate.run).toContain('[ "$runtime_version" != "$source_runtime_version" ]');
     expect(validate.run).toContain('npm view');
     expect(validate.run).toContain('entry-release-set.tsv');
     expect(plan.run).toContain('--mode entry');
