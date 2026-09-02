@@ -47,6 +47,44 @@ async function records(filePath: string): Promise<Record<string, unknown>[]> {
 }
 
 describe('LocalLogger safe serialization', () => {
+  it('redacts pairing credentials and URLs while retaining safe route actions and error codes', async () => {
+    const filePath = await temporaryLog();
+    const logger = await LocalLogger.open({
+      filePath,
+      level: 'debug',
+      now: () => new Date(TIME),
+    });
+    const ticket = `ticket_${'t'.repeat(43)}`;
+    const deviceSecret = `device_${'s'.repeat(43)}`;
+
+    logger.warn({
+      event: 'pairing_poll_failed',
+      category: 'transport',
+      command: 'poll-selection',
+      errorCode: 'pairing_transport',
+      ticket,
+      deviceSecret,
+      authorization: `Pairing ${deviceSecret}`,
+      url: `https://configured.example/api/ai/pairing/sessions/${ticket}/selection`,
+    } as unknown as SafeLogEvent);
+    await logger.close();
+
+    const text = await readFile(filePath, 'utf8');
+    expect(text).not.toContain(ticket);
+    expect(text).not.toContain(deviceSecret);
+    expect(text).not.toContain('Authorization');
+    expect(await records(filePath)).toEqual([
+      {
+        time: TIME,
+        level: 'warn',
+        event: 'pairing_poll_failed',
+        category: 'transport',
+        errorCode: 'pairing_transport',
+        command: 'poll-selection',
+      },
+    ]);
+  });
+
   it('writes only the flat scalar allowlist and never serializes sensitive or user content', async () => {
     const filePath = await temporaryLog();
     const logger = await LocalLogger.open({
