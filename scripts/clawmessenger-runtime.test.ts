@@ -23,6 +23,7 @@ import {
 import { verifyRuntimePackage } from './verify-clawmessenger-runtime.mjs';
 
 const VERSION = '0.1.0-beta.5';
+const ENTRY_VERSION = '0.1.0-beta.6';
 const SOURCE_COMMIT = 'a'.repeat(40);
 const MODULES = [
   'github.com/example/common@v1.2.3',
@@ -785,7 +786,7 @@ describe('published runtime package metadata', () => {
     ));
   });
 
-  it('pins all six optional packages to the entry version with exact platform payloads', async () => {
+  it('pins the entry and all six optional platform packages to their release versions', async () => {
     const entryPackage = JSON.parse(
       await readFile(join(REPO_ROOT, 'packages', 'quukk-clawmessenger', 'package.json'), 'utf8'),
     );
@@ -797,7 +798,7 @@ describe('published runtime package metadata', () => {
       runtimeTarget('linux', 'x64'),
       runtimeTarget('linux', 'arm64'),
     ];
-    expect(entryPackage.version).toBe(VERSION);
+    expect(entryPackage.version).toBe(ENTRY_VERSION);
     expect(entryPackage.optionalDependencies).toEqual(
       Object.fromEntries(targets.map((target) => [target.packageName, VERSION])),
     );

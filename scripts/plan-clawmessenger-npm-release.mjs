@@ -14,7 +14,7 @@ const RUNTIME_PACKAGES = new Set([
   '@quukk/clawmessenger-runtime-linux-arm64',
 ]);
 const EXPECTED_PACKAGES = new Set([...RUNTIME_PACKAGES, ENTRY_PACKAGE]);
-const RELEASE_MODES = new Set(['preflight', 'runtimes', 'complete']);
+const RELEASE_MODES = new Set(['entry', 'preflight', 'runtimes', 'complete']);
 const SEMVER = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const SHA1 = /^[0-9a-f]{40}$/;
 const SHA512_INTEGRITY = /^sha512-[A-Za-z0-9+/]+={0,2}$/;
@@ -60,6 +60,18 @@ export function compareDistribution(local, remote) {
 export function classifyReleaseSet(packages, mode = 'preflight') {
   if (!Array.isArray(packages) || !RELEASE_MODES.has(mode)) {
     throw new Error('invalid_release_set');
+  }
+  if (mode === 'entry') {
+    if (
+      packages.length !== 1
+      || packages[0]?.name !== ENTRY_PACKAGE
+      || packages[0]?.role !== 'entry'
+      || !['missing', 'matching'].includes(packages[0]?.state)
+    ) throw new Error('invalid_release_set');
+    return [{
+      ...packages[0],
+      action: packages[0].state === 'matching' ? 'skip' : 'publish',
+    }];
   }
   const entry = packages.filter((item) => item?.role === 'entry');
   const runtimes = packages.filter((item) => item?.role === 'runtime');
@@ -156,7 +168,7 @@ async function hashArchive(path) {
   };
 }
 
-async function readReleaseInputs(manifestPath, versionPath) {
+async function readReleaseInputs(manifestPath, versionPath, mode) {
   let manifestText;
   let version;
   try {
@@ -172,7 +184,7 @@ async function readReleaseInputs(manifestPath, versionPath) {
     .filter((line) => line.length > 0)
     .map((line) => line.split('\t'));
   if (
-    rows.length !== 7 ||
+    rows.length !== (mode === 'entry' ? 1 : 7) ||
     rows.some((fields) => fields.length !== 2 || fields.some((field) => field.length === 0))
   ) {
     throw new Error('invalid_release_manifest');
@@ -183,6 +195,14 @@ async function readReleaseInputs(manifestPath, versionPath) {
     role: name === ENTRY_PACKAGE ? 'entry' : RUNTIME_PACKAGES.has(name) ? 'runtime' : 'invalid',
   }));
   const names = new Set(packages.map((item) => item.name));
+  if (mode === 'entry') {
+    if (
+      packages[0]?.name !== ENTRY_PACKAGE
+      || packages[0]?.role !== 'entry'
+      || names.size !== 1
+    ) throw new Error('invalid_release_set');
+    return { packages, version };
+  }
   if (
     names.size !== 7 ||
     [...EXPECTED_PACKAGES].some((name) => !names.has(name)) ||
@@ -208,7 +228,7 @@ export async function createReleasePlan({
   ) {
     throw new Error('invalid_arguments');
   }
-  const { packages, version } = await readReleaseInputs(manifestPath, versionPath);
+  const { packages, version } = await readReleaseInputs(manifestPath, versionPath, mode);
   const observed = [];
   for (const item of packages) {
     const local = await hashArchive(item.archive);

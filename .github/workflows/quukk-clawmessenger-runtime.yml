@@ -15,6 +15,11 @@ on:
         type: boolean
         required: true
         default: false
+      entry_only:
+        description: Publish only the entry package and reuse its existing runtime dependencies
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
@@ -122,6 +127,9 @@ jobs:
           retention-days: 14
 
   build-runtime:
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.entry_only != true
     needs: runtime-contracts
     runs-on: ubuntu-latest
     env:
@@ -231,6 +239,7 @@ jobs:
       github.repository == 'quukk/quukk-clawmessenger' &&
       github.event_name == 'workflow_dispatch' &&
       inputs.publish == true &&
+      inputs.entry_only != true &&
       github.ref_protected == true &&
       (github.ref == 'refs/heads/main' ||
       startsWith(github.ref, 'refs/tags/quukk-clawmessenger-v'))
@@ -514,3 +523,174 @@ jobs:
             --version-file .artifacts/release-version.txt \
             --output .artifacts/release-plan.tsv \
             --mode complete
+
+  publish-entry-package:
+    name: Publish entry-only beta package
+    if: >-
+      github.repository == 'quukk/quukk-clawmessenger' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.publish == true &&
+      inputs.entry_only == true &&
+      github.ref_protected == true &&
+      (github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/quukk-clawmessenger-v'))
+    needs: build-entry
+    runs-on: ubuntu-latest
+    environment: npm-runtime-prerelease
+    concurrency:
+      group: quukk-clawmessenger-beta-publish
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Require npm publish credential
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN is required for an explicit beta publication"
+            exit 1
+          fi
+          npm whoami --registry=https://registry.npmjs.org >/dev/null
+      - name: Download entry package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: quukk-entry-package
+          path: .artifacts/incoming/entry
+      - name: Validate entry-only release
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          artifact_directory='.artifacts/incoming/entry'
+          mapfile -d '' -t artifact_entries < <(
+            find "$artifact_directory" -mindepth 1 -maxdepth 1 -print0
+          )
+          if [ "${#artifact_entries[@]}" -ne 1 ]; then
+            echo "::error::entry artifact must contain exactly one entry"
+            exit 1
+          fi
+          entry_archive="${artifact_entries[0]}"
+          archive_name="$(basename "$entry_archive")"
+          if [ ! -f "$entry_archive" ] || [[ ! "$archive_name" =~ ^[A-Za-z0-9._-]+\.tgz$ ]]; then
+            echo "::error::entry artifact must be one regular npm tarball"
+            exit 1
+          fi
+
+          package_identity="$(
+            tar -xOf "$entry_archive" package/package.json |
+              node --input-type=module -e '
+                let data = "";
+                for await (const chunk of process.stdin) data += chunk;
+                const manifest = JSON.parse(data);
+                const runtimeNames = [
+                  "@quukk/clawmessenger-runtime-win32-x64",
+                  "@quukk/clawmessenger-runtime-win32-arm64",
+                  "@quukk/clawmessenger-runtime-darwin-x64",
+                  "@quukk/clawmessenger-runtime-darwin-arm64",
+                  "@quukk/clawmessenger-runtime-linux-x64",
+                  "@quukk/clawmessenger-runtime-linux-arm64",
+                ].sort();
+                const optionalDependencies = manifest.optionalDependencies;
+                const actualNames = optionalDependencies && typeof optionalDependencies === "object"
+                  ? Object.keys(optionalDependencies).sort()
+                  : [];
+                const versions = actualNames.map((name) => optionalDependencies[name]);
+                const semver = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+                if (
+                  manifest.name !== "quukk-clawmessenger" ||
+                  typeof manifest.version !== "string" ||
+                  !semver.test(manifest.version) ||
+                  JSON.stringify(actualNames) !== JSON.stringify(runtimeNames) ||
+                  versions.some((version) => typeof version !== "string") ||
+                  new Set(versions).size !== 1 ||
+                  !semver.test(versions[0])
+                ) {
+                  process.exit(2);
+                }
+                process.stdout.write(`${manifest.version}\t${versions[0]}`);
+              '
+          )" || {
+            echo "::error::entry package identity or optionalDependencies are invalid"
+            exit 1
+          }
+          IFS=$'\t' read -r entry_version runtime_version <<< "$package_identity"
+          expected_version="$(node -p "require('./packages/quukk-clawmessenger/package.json').version")"
+          if [ "$entry_version" != "$expected_version" ]; then
+            echo "::error::entry artifact version does not match the source manifest"
+            exit 1
+          fi
+          expected_tag="refs/tags/quukk-clawmessenger-v$entry_version"
+          if [[ "$GITHUB_REF" == refs/tags/* ]] && [ "$GITHUB_REF" != "$expected_tag" ]; then
+            echo "::error::release tag must be $expected_tag"
+            exit 1
+          fi
+
+          runtime_names=(
+            '@quukk/clawmessenger-runtime-win32-x64'
+            '@quukk/clawmessenger-runtime-win32-arm64'
+            '@quukk/clawmessenger-runtime-darwin-x64'
+            '@quukk/clawmessenger-runtime-darwin-arm64'
+            '@quukk/clawmessenger-runtime-linux-x64'
+            '@quukk/clawmessenger-runtime-linux-arm64'
+          )
+          for runtime_name in "${runtime_names[@]}"; do
+            published_version="$(npm view "$runtime_name@$runtime_version" version --json --registry=https://registry.npmjs.org | node -e 'let data=""; process.stdin.on("data", chunk => data += chunk); process.stdin.on("end", () => process.stdout.write(JSON.parse(data)));')"
+            if [ "$published_version" != "$runtime_version" ]; then
+              echo "::error::$runtime_name@$runtime_version is not available on npm"
+              exit 1
+            fi
+          done
+
+          release_manifest='.artifacts/entry-release-set.tsv'
+          version_file='.artifacts/entry-release-version.txt'
+          printf 'quukk-clawmessenger\t%s\n' "$entry_archive" > "$release_manifest"
+          printf '%s\n' "$entry_version" > "$version_file"
+      - name: Plan entry-only beta publication
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          node scripts/plan-clawmessenger-npm-release.mjs \
+            --manifest .artifacts/entry-release-set.tsv \
+            --version-file .artifacts/entry-release-version.txt \
+            --output .artifacts/entry-release-plan.tsv \
+            --mode entry
+      - name: Publish entry-only beta package
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          IFS=$'\t' read -r package_name entry_archive role action < .artifacts/entry-release-plan.tsv
+          if [ "$package_name" != 'quukk-clawmessenger' ] || [ "$role" != 'entry' ] || [ ! -f "$entry_archive" ]; then
+            echo "::error::entry-only release plan is invalid"
+            exit 1
+          fi
+          if [ "$action" = 'publish' ]; then
+            npm publish "$entry_archive" --access public --tag beta --provenance
+          elif [ "$action" != 'skip' ]; then
+            echo "::error::entry-only release action is invalid"
+            exit 1
+          fi
+      - name: Verify entry-only beta release
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          node scripts/plan-clawmessenger-npm-release.mjs \
+            --manifest .artifacts/entry-release-set.tsv \
+            --version-file .artifacts/entry-release-version.txt \
+            --output .artifacts/entry-release-plan.tsv \
+            --mode entry

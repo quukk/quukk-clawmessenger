@@ -87,6 +87,27 @@ describe('npm distribution comparison', () => {
 });
 
 describe('resumable npm release classification', () => {
+  it('supports a resumable entry-only release', () => {
+    expect(classifyReleaseSet([{
+      name: 'quukk-clawmessenger',
+      archive: 'quukk-clawmessenger.tgz',
+      role: 'entry',
+      state: 'missing',
+    }], 'entry')).toEqual([{
+      name: 'quukk-clawmessenger',
+      archive: 'quukk-clawmessenger.tgz',
+      role: 'entry',
+      state: 'missing',
+      action: 'publish',
+    }]);
+  });
+
+  it('rejects runtime packages in an entry-only release', () => {
+    expect(() => classifyReleaseSet([release('missing')[0]], 'entry')).toThrowError(
+      'invalid_release_set',
+    );
+  });
+
   it('publishes every package when all versions are missing', () => {
     expect(
       classifyReleaseSet(release('missing'), 'preflight').map(
@@ -179,6 +200,30 @@ describe('npm registry query boundary', () => {
 });
 
 describe('release plan file', () => {
+  it('writes a deterministic entry-only release plan', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'quukk-entry-release-plan-'));
+    temporaryDirectories.push(directory);
+    const manifest = join(directory, 'release-set.tsv');
+    const versionFile = join(directory, 'release-version.txt');
+    const output = join(directory, 'release-plan.tsv');
+    const archive = join(directory, 'entry.tgz');
+    await writeFile(archive, 'entry-archive');
+    await writeFile(manifest, `quukk-clawmessenger\t${archive}\n`);
+    await writeFile(versionFile, '0.1.0-beta.6\n');
+
+    await createReleasePlan({
+      manifestPath: manifest,
+      versionPath: versionFile,
+      outputPath: output,
+      mode: 'entry',
+      queryDistribution: () => ({ state: 'missing' as const }),
+    });
+
+    expect(await readFile(output, 'utf8')).toBe(
+      `quukk-clawmessenger\t${archive}\tentry\tpublish\n`,
+    );
+  });
+
   it('hashes real archives and writes deterministic publish and skip actions', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'quukk-release-plan-'));
     temporaryDirectories.push(directory);

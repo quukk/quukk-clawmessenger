@@ -1,5 +1,5 @@
 import { Button } from '@multica/ui/components/ui/button';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { RuntimeCard } from '../components/runtime-card';
 import type { BridgeApi, BridgeRuntime } from '../types';
@@ -11,10 +11,50 @@ type RuntimesPageProps = {
   onRuntimesChange(runtimes: readonly BridgeRuntime[]): void;
 };
 
+const AUTOMATIC_REFRESH_INTERVAL_MS = 250;
+const AUTOMATIC_REFRESH_ATTEMPTS = 20;
+
+function hasPendingWorker(runtimes: readonly BridgeRuntime[]): boolean {
+  return runtimes.some((runtime) => {
+    if (!runtime.binding?.enabled) return false;
+    if (runtime.worker !== undefined) return runtime.worker.state !== 'online';
+    return runtime.binding.registrationState === 'registering';
+  });
+}
+
+async function waitForAutomaticRefresh(): Promise<void> {
+  await new Promise<void>((resolve) => window.setTimeout(resolve, AUTOMATIC_REFRESH_INTERVAL_MS));
+}
+
 export function RuntimesPage({ api, runtimes, onRuntimesChange }: RuntimesPageProps) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const requestFence = useRequestFence();
+
+  useEffect(() => {
+    const generation = requestFence.begin();
+
+    void (async () => {
+      for (let attempt = 0; attempt < AUTOMATIC_REFRESH_ATTEMPTS; attempt += 1) {
+        if (attempt > 0) await waitForAutomaticRefresh();
+        if (!requestFence.isCurrent(generation)) return;
+        try {
+          const nextRuntimes = await api.getRuntimes();
+          if (!requestFence.isCurrent(generation)) return;
+          onRuntimesChange(nextRuntimes);
+          setError(null);
+          if (!hasPendingWorker(nextRuntimes)) return;
+        } catch {
+          if (
+            attempt === AUTOMATIC_REFRESH_ATTEMPTS - 1 &&
+            requestFence.isCurrent(generation)
+          ) {
+            setError('Unable to refresh local agents.');
+          }
+        }
+      }
+    })();
+  }, [api, onRuntimesChange, requestFence]);
 
   async function refresh() {
     const generation = requestFence.begin();

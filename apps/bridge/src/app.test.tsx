@@ -6,6 +6,7 @@ import { StrictMode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { App } from './app';
+import { RuntimesPage } from './pages/runtimes';
 import type { BridgeApi, BridgeRuntime, BridgeSettings, DiagnosticsSnapshot } from './types';
 
 const capabilities = {
@@ -22,14 +23,16 @@ const runtimes: BridgeRuntime[] = [
     provider: 'opencode',
     status: 'ready',
     capabilities,
-    binding: { enabled: true, registrationState: 'online' },
+    binding: { enabled: true, registrationState: 'offline' },
+    worker: { state: 'online', restartCount: 0 },
   },
   {
     id: 'rt_22222222222222222222222222222222',
     provider: 'openclaw',
     status: 'ready',
     capabilities,
-    binding: { enabled: true, registrationState: 'offline' },
+    binding: { enabled: false, registrationState: 'offline' },
+    worker: { state: 'offline', restartCount: 0 },
   },
   { provider: 'codex', status: 'not_found', capabilities },
   { provider: 'hermes', status: 'not_found', capabilities },
@@ -102,6 +105,7 @@ function deferred<T>() {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe('bridge app', () => {
@@ -134,6 +138,118 @@ describe('bridge app', () => {
     expect(api.reregisterBinding).toHaveBeenCalledWith(runtimes[0]!.id);
   });
 
+  it('shows an online worker as online even while the stored registration state is offline', async () => {
+    const user = userEvent.setup();
+    render(<App api={createApi()} />);
+    await screen.findByRole('heading', { name: /choose local agents/i });
+
+    await user.click(screen.getByRole('button', { name: /^runtimes$/i }));
+
+    expect(
+      await within(screen.getByTestId('runtime-opencode')).findByLabelText(/status: online/i),
+    ).toBeVisible();
+    expect(
+      within(screen.getByTestId('runtime-openclaw')).getByLabelText(/status: registered offline/i),
+    ).toBeVisible();
+  });
+
+  it('refreshes a starting worker on Runtimes mount until the worker is online', async () => {
+    const user = userEvent.setup();
+    const startingRuntimes: BridgeRuntime[] = [
+      {
+        ...runtimes[0]!,
+        binding: { enabled: true, registrationState: 'online' },
+        worker: { state: 'starting', restartCount: 0 },
+      },
+      ...runtimes.slice(1),
+    ];
+    const onlineRuntimes: BridgeRuntime[] = [
+      { ...startingRuntimes[0]!, worker: { state: 'online', restartCount: 0 } },
+      ...startingRuntimes.slice(1),
+    ];
+    const getRuntimes = vi
+      .fn<BridgeApi['getRuntimes']>()
+      .mockResolvedValueOnce(startingRuntimes)
+      .mockResolvedValueOnce(startingRuntimes)
+      .mockResolvedValueOnce(onlineRuntimes);
+
+    render(<App api={createApi({ getRuntimes })} />);
+    await screen.findByRole('heading', { name: /choose local agents/i });
+    await user.click(screen.getByRole('button', { name: /^runtimes$/i }));
+
+    expect(
+      within(screen.getByTestId('runtime-opencode')).getByLabelText(
+        /status: registered offline/i,
+      ),
+    ).toBeVisible();
+    await vi.waitFor(() => expect(getRuntimes).toHaveBeenCalledTimes(3));
+    expect(
+      await within(screen.getByTestId('runtime-opencode')).findByLabelText(/status: online/i),
+    ).toBeVisible();
+  });
+
+  it('stops automatic Runtimes refresh after the bounded attempt limit', async () => {
+    vi.useFakeTimers();
+    const startingRuntimes: BridgeRuntime[] = [
+      {
+        ...runtimes[0]!,
+        worker: { state: 'starting', restartCount: 0 },
+      },
+      ...runtimes.slice(1),
+    ];
+    const getRuntimes = vi
+      .fn<BridgeApi['getRuntimes']>()
+      .mockResolvedValue(startingRuntimes);
+
+    render(
+      <RuntimesPage
+        api={createApi({ getRuntimes })}
+        runtimes={startingRuntimes}
+        onRuntimesChange={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(getRuntimes).toHaveBeenCalledTimes(20);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(getRuntimes).toHaveBeenCalledTimes(20);
+  });
+
+  it('recovers when an automatic Runtimes refresh fails transiently', async () => {
+    const user = userEvent.setup();
+    const startingRuntimes: BridgeRuntime[] = [
+      {
+        ...runtimes[0]!,
+        worker: { state: 'starting', restartCount: 0 },
+      },
+      ...runtimes.slice(1),
+    ];
+    const onlineRuntimes: BridgeRuntime[] = [
+      { ...startingRuntimes[0]!, worker: { state: 'online', restartCount: 0 } },
+      ...startingRuntimes.slice(1),
+    ];
+    const getRuntimes = vi
+      .fn<BridgeApi['getRuntimes']>()
+      .mockResolvedValueOnce(startingRuntimes)
+      .mockRejectedValueOnce(new Error('temporary refresh failure'))
+      .mockResolvedValueOnce(onlineRuntimes);
+
+    render(<App api={createApi({ getRuntimes })} />);
+    await screen.findByRole('heading', { name: /choose local agents/i });
+    await user.click(screen.getByRole('button', { name: /^runtimes$/i }));
+
+    await vi.waitFor(() => expect(getRuntimes).toHaveBeenCalledTimes(3));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(
+      within(screen.getByTestId('runtime-opencode')).getByLabelText(/status: online/i),
+    ).toBeVisible();
+  });
+
   it('surfaces an explicit reregister failure without refreshing as if it succeeded', async () => {
     const user = userEvent.setup();
     const getRuntimes = vi.fn<BridgeApi['getRuntimes']>().mockResolvedValue(runtimes);
@@ -149,10 +265,11 @@ describe('bridge app', () => {
     await screen.findByRole('heading', { name: /choose local agents/i });
 
     await user.click(screen.getByRole('button', { name: /^runtimes$/i }));
+    await vi.waitFor(() => expect(getRuntimes).toHaveBeenCalledTimes(2));
     await user.click(screen.getByRole('button', { name: /reregister opencode/i }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/unable to reregister this agent/i);
-    expect(getRuntimes).toHaveBeenCalledTimes(1);
+    expect(getRuntimes).toHaveBeenCalledTimes(2);
   });
 
   it('labels activity by runtime and safely falls back for an unknown runtime', async () => {

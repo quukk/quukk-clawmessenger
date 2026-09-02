@@ -185,6 +185,7 @@ describe('local bridge API client', () => {
       id: runtimeId,
       provider: 'opencode',
       binding: { enabled: true, registrationState: 'online' },
+      worker: { state: 'online', restartCount: 0 },
     });
     await expect(api.getSettings()).resolves.toMatchObject({
       serverUrl: 'https://example.test/im',

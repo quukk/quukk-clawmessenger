@@ -215,6 +215,18 @@ function exactStringRecord(value, expected) {
     && expectedKeys.every((key) => value[key] === expected[key]);
 }
 
+function expectedRuntimeDependencies(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const versions = RUNTIME_PACKAGE_NAMES.map((name) => value[name]);
+  const runtimeVersion = versions[0];
+  if (
+    typeof runtimeVersion !== 'string'
+    || !SEMVER.test(runtimeVersion)
+    || versions.some((version) => version !== runtimeVersion)
+  ) return undefined;
+  return Object.fromEntries(RUNTIME_PACKAGE_NAMES.map((name) => [name, runtimeVersion]));
+}
+
 function exactScalarRecord(value, expected) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
   const keys = Object.keys(value).sort();
@@ -410,10 +422,12 @@ async function auditReport(value, packageDirectory, knownCheckoutRoots) {
       || packageJson.version !== record.version
     ) fail('manifest_invalid');
     if (entry) {
-      const expectedOptionalDependencies = Object.fromEntries(
-        RUNTIME_PACKAGE_NAMES.map((name) => [name, record.version]),
+      const expectedOptionalDependencies = expectedRuntimeDependencies(
+        packageJson.optionalDependencies,
       );
       if (
+        expectedOptionalDependencies === undefined
+        ||
         !exactStringArray(Object.keys(packageJson).sort(), [...ENTRY_PACKAGE_FIELDS].sort())
         || packageJson.description !== 'Connect local AI agents to ClawMessenger, built on Multica'
         || packageJson.type !== 'module'

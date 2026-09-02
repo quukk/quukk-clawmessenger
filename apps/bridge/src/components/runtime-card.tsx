@@ -88,6 +88,7 @@ export function RuntimeCard({
           <StatusPill
             runtimeStatus={runtime.status}
             registrationState={runtime.binding?.registrationState}
+            workerState={runtime.worker?.state}
             progress={progress}
           />
         </CardAction>

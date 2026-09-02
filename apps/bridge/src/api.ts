@@ -93,6 +93,7 @@ const runtimeSchema = z
                 : { lastErrorCode: value.binding.lastErrorCode }),
             },
           }),
+      ...(value.worker === null ? {} : { worker: value.worker }),
     }),
   );
 

@@ -280,6 +280,56 @@ describe('runtime setup', () => {
     expect(screen.getByRole('alert')).toHaveTextContent(/status could not be refreshed/i);
   });
 
+  it('refreshes on Runtimes after navigating while the Setup refresh is still pending', async () => {
+    const user = userEvent.setup();
+    const runtimeId = detectedRuntimes[0]!.id!;
+    const setupRefresh = deferred<readonly BridgeRuntime[]>();
+    const registeredStarting: BridgeRuntime[] = [
+      {
+        ...detectedRuntimes[0]!,
+        binding: { enabled: true, registrationState: 'offline' },
+        worker: { state: 'starting', restartCount: 0 },
+      },
+      ...detectedRuntimes.slice(1),
+    ];
+    const registeredOnline: BridgeRuntime[] = [
+      {
+        ...registeredStarting[0]!,
+        worker: { state: 'online', restartCount: 0 },
+      },
+      ...registeredStarting.slice(1),
+    ];
+    const getRuntimes = vi
+      .fn<BridgeApi['getRuntimes']>()
+      .mockResolvedValueOnce(detectedRuntimes)
+      .mockImplementationOnce(() => setupRefresh.promise)
+      .mockResolvedValueOnce(registeredOnline);
+    const api = createApi({
+      getRuntimes,
+      enableBindings: vi.fn().mockResolvedValue([{ runtimeId, ok: true }]),
+    });
+
+    await renderReady(api);
+    await user.click(screen.getByRole('checkbox', { name: /select openclaw/i }));
+    await completePolicyForm(user);
+    await user.click(screen.getByRole('button', { name: /register 1 agent/i }));
+
+    expect(
+      await within(screen.getByTestId('runtime-opencode')).findByText(/connected/i),
+    ).toBeVisible();
+    expect(getRuntimes).toHaveBeenCalledTimes(2);
+    await user.click(screen.getByRole('button', { name: /^runtimes$/i }));
+    await vi.waitFor(() => expect(getRuntimes).toHaveBeenCalledTimes(3));
+    expect(
+      within(screen.getByTestId('runtime-opencode')).getByLabelText(/status: online/i),
+    ).toBeVisible();
+
+    await act(async () => {
+      setupRefresh.resolve(registeredStarting);
+      await setupRefresh.promise;
+    });
+  });
+
   it('replaces only the edited first authorized root and removes duplicates', async () => {
     const user = userEvent.setup();
     const configuredSettings: BridgeSettings = {

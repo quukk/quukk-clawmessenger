@@ -30,6 +30,13 @@ export type RuntimeBindingSummary = {
   lastErrorCode?: string;
 };
 
+export type WorkerState = 'starting' | 'online' | 'offline' | 'backoff' | 'stopped';
+
+export type RuntimeWorkerSummary = {
+  state: WorkerState;
+  restartCount: number;
+};
+
 export type BridgeRuntime = {
   id?: string;
   provider: Provider;
@@ -38,6 +45,7 @@ export type BridgeRuntime = {
   status: RuntimeStatus;
   capabilities: RuntimeCapabilities;
   binding?: RuntimeBindingSummary;
+  worker?: RuntimeWorkerSummary;
 };
 
 export type BindingMutationResult =
@@ -87,7 +95,7 @@ export type DiagnosticsSnapshot = {
   }>;
   workers: Array<{
     runtimeId: string;
-    state: 'starting' | 'online' | 'offline' | 'backoff' | 'stopped';
+    state: WorkerState;
     restartCount: number;
   }>;
   warnings: string[];

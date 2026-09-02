@@ -340,7 +340,15 @@ type EntryFixture = {
   writeReport(extraPaths?: readonly string[]): Promise<void>;
 };
 
-async function entryFixture(): Promise<EntryFixture> {
+async function entryFixture(options: {
+  version?: string;
+  runtimeVersion?: string;
+} = {}): Promise<EntryFixture> {
+  const version = options.version ?? '0.1.0-beta.1';
+  const runtimeVersion = options.runtimeVersion ?? '0.1.0-beta.1';
+  const optionalDependencies = Object.fromEntries(
+    Object.keys(ENTRY_OPTIONAL_DEPENDENCIES).map((name) => [name, runtimeVersion]),
+  );
   const root = await temporaryDirectory();
   const entry = join(root, 'package');
   const report = join(root, 'npm-pack.json');
@@ -348,7 +356,7 @@ async function entryFixture(): Promise<EntryFixture> {
     const content = path === 'package.json'
       ? JSON.stringify({
           name: 'quukk-clawmessenger',
-          version: '0.1.0-beta.1',
+          version,
           description: 'Connect local AI agents to ClawMessenger, built on Multica',
           type: 'module',
           engines: { node: '>=22.13.0' },
@@ -365,7 +373,7 @@ async function entryFixture(): Promise<EntryFixture> {
           homepage: 'https://github.com/quukk/quukk-clawmessenger/tree/main/packages/quukk-clawmessenger#readme',
           publishConfig: { access: 'public', provenance: true, tag: 'beta' },
           dependencies: ENTRY_DEPENDENCIES,
-          optionalDependencies: ENTRY_OPTIONAL_DEPENDENCIES,
+          optionalDependencies,
           devDependencies: ENTRY_DEV_DEPENDENCIES,
         })
       : path.endsWith('.css')
@@ -383,10 +391,10 @@ async function entryFixture(): Promise<EntryFixture> {
       mode: 0o644,
     })));
     await write(report, JSON.stringify([{
-      id: 'quukk-clawmessenger@0.1.0-beta.1',
+      id: `quukk-clawmessenger@${version}`,
       name: 'quukk-clawmessenger',
-      version: '0.1.0-beta.1',
-      filename: 'quukk-clawmessenger-0.1.0-beta.1.tgz',
+      version,
+      filename: `quukk-clawmessenger-${version}.tgz`,
       files,
     }]));
   };
@@ -462,6 +470,18 @@ describe('audit-tarball', () => {
     })).resolves.toEqual({ packageCount: 1, fileCount: ENTRY_FILES.length });
   });
 
+  it('accepts an entry-only release that reuses one complete platform runtime version', async () => {
+    const fixture = await entryFixture({
+      version: '0.1.0-beta.2',
+      runtimeVersion: '0.1.0-beta.1',
+    });
+
+    await expect(auditTarball({
+      packJsonPath: fixture.report,
+      packageDirectory: fixture.entry,
+    })).resolves.toEqual({ packageCount: 1, fileCount: ENTRY_FILES.length });
+  });
+
   it.each([
     [
       'a pnpm catalog production dependency',
@@ -482,6 +502,19 @@ describe('audit-tarball', () => {
       { optionalDependencies: {
         ...ENTRY_OPTIONAL_DEPENDENCIES,
         '@quukk/clawmessenger-runtime-linux-x64': '0.1.0-beta.2',
+      } },
+    ],
+    [
+      'a uniform invalid platform runtime version',
+      { optionalDependencies: Object.fromEntries(
+        Object.keys(ENTRY_OPTIONAL_DEPENDENCIES).map((name) => [name, 'latest']),
+      ) },
+    ],
+    [
+      'an unexpected platform runtime package',
+      { optionalDependencies: {
+        ...ENTRY_OPTIONAL_DEPENDENCIES,
+        '@quukk/clawmessenger-runtime-unexpected': '0.1.0-beta.1',
       } },
     ],
     [

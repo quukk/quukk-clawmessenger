@@ -38,6 +38,7 @@ interface RuntimeWorkflow {
     workflow_dispatch: {
       inputs: {
         publish: Record<string, unknown>;
+        entry_only: Record<string, unknown>;
       };
     };
   };
@@ -220,6 +221,9 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
   it('keeps all six runtime builds reproducible, attested, and credential-free', async () => {
     const workflow = await loadWorkflow();
     const build = requiredJob(workflow, 'build-runtime');
+    expect(build.if?.replace(/\s+/g, ' ').trim()).toBe(
+      "github.event_name != 'workflow_dispatch' || inputs.entry_only != true",
+    );
     const reproducible = requiredStep(build, 'Verify reproducible rebuild');
     const notices = requiredStep(build, 'Verify Go third-party notices');
     const dryRun = requiredStep(build, 'Audit runtime tarball');
@@ -274,10 +278,15 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
       required: true,
       default: false,
     });
+    expect(workflow.on.workflow_dispatch.inputs.entry_only).toMatchObject({
+      type: 'boolean',
+      required: true,
+      default: false,
+    });
 
     const publish = requiredJob(workflow, 'publish-runtime-packages');
     expect(publish.if?.replace(/\s+/g, ' ').trim()).toBe(
-      "github.repository == 'quukk/quukk-clawmessenger' && github.event_name == 'workflow_dispatch' && inputs.publish == true && github.ref_protected == true && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/quukk-clawmessenger-v'))",
+      "github.repository == 'quukk/quukk-clawmessenger' && github.event_name == 'workflow_dispatch' && inputs.publish == true && inputs.entry_only != true && github.ref_protected == true && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/quukk-clawmessenger-v'))",
     );
     expect(publish.environment).toBe('npm-runtime-prerelease');
     expect(publish.needs).toEqual(['build-runtime', 'build-entry']);
@@ -356,6 +365,45 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
 
     const allPublishCommands = publish.steps.map((step) => step.run ?? '').join('\n');
     expect(allPublishCommands.match(/npm publish /g)).toHaveLength(2);
+  });
+
+  it('publishes one protected entry-only beta while reusing verified runtime versions', async () => {
+    const workflow = await loadWorkflow();
+    const publish = requiredJob(workflow, 'publish-entry-package');
+    expect(publish.if?.replace(/\s+/g, ' ').trim()).toBe(
+      "github.repository == 'quukk/quukk-clawmessenger' && github.event_name == 'workflow_dispatch' && inputs.publish == true && inputs.entry_only == true && github.ref_protected == true && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/quukk-clawmessenger-v'))",
+    );
+    expect(publish.needs).toBe('build-entry');
+    expect(publish.environment).toBe('npm-runtime-prerelease');
+    expect(publish.concurrency).toEqual({
+      group: 'quukk-clawmessenger-beta-publish',
+      'cancel-in-progress': false,
+    });
+
+    const downloads = publish.steps.filter(
+      (step) =>
+        step.uses ===
+        'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+    );
+    expect(downloads.map((step) => [step.with?.name, step.with?.path])).toEqual([
+      ['quukk-entry-package', '.artifacts/incoming/entry'],
+    ]);
+
+    const credential = requiredStep(publish, 'Require npm publish credential');
+    const validate = requiredStep(publish, 'Validate entry-only release');
+    const plan = requiredStep(publish, 'Plan entry-only beta publication');
+    const publishEntry = requiredStep(publish, 'Publish entry-only beta package');
+    const verify = requiredStep(publish, 'Verify entry-only beta release');
+    expect(credential.run).toContain('npm whoami');
+    expect(validate.run).toContain('optionalDependencies');
+    expect(validate.run).toContain('npm view');
+    expect(validate.run).toContain('entry-release-set.tsv');
+    expect(plan.run).toContain('--mode entry');
+    expect(publishEntry.run).toContain('npm publish "$entry_archive" --access public --tag beta --provenance');
+    expect(verify.run).toContain('--mode entry');
+    for (const step of [credential, validate, plan, publishEntry, verify]) {
+      expect(step.env?.NODE_AUTH_TOKEN).toBe('${{ secrets.NPM_TOKEN }}');
+    }
   });
 
   it('pins every third-party action to one reviewed commit', async () => {
