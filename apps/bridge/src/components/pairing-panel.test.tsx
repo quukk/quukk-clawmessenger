@@ -23,7 +23,6 @@ const waiting: PairingSnapshot = {
     {
       candidateId: 'cand-opencode',
       provider: 'opencode',
-      displayName: 'OpenCode',
       version: '1.2.3',
       readiness: 'ready',
       statusReason: null,
@@ -32,10 +31,9 @@ const waiting: PairingSnapshot = {
     {
       candidateId: 'cand-codex',
       provider: 'codex',
-      displayName: 'Codex',
       version: null,
       readiness: 'not_ready',
-      statusReason: 'C:\\private\\codex-token.txt',
+      statusReason: 'probe_failed',
       registrationState: 'unregistered',
     },
   ],
@@ -98,13 +96,63 @@ describe('pairing panel', () => {
     expect(screen.getByText(/expires/i)).toBeVisible();
     expect(within(screen.getByTestId('pairing-candidate-opencode')).getByText('OpenCode')).toBeVisible();
     expect(
-      within(screen.getByTestId('pairing-candidate-codex')).getByText(/local platform for details/i),
+      within(screen.getByTestId('pairing-candidate-codex')).getByText(/could not be checked/i),
     ).toBeVisible();
     expect(container).not.toHaveTextContent('cand-opencode');
     expect(container).not.toHaveTextContent('rt_11111111111111111111111111111111');
     expect(container).not.toHaveTextContent('C:\\tools\\opencode.exe');
-    expect(container).not.toHaveTextContent('C:\\private\\codex-token.txt');
     expect(container).not.toHaveTextContent('p'.repeat(43));
+  });
+
+  it('renders an expired waiting snapshot without a stale QR or polling at zero', async () => {
+    vi.useFakeTimers();
+    const getPairing = vi.fn<BridgeApi['getPairing']>().mockResolvedValue(waiting);
+    render(
+      <PairingPanel
+        api={createApi({ getPairing })}
+        initialSnapshot={waiting}
+        now={() => Date.parse(expiresAt)}
+      />,
+    );
+
+    expect(screen.getByText(/pairing code expired/i)).toBeVisible();
+    expect(screen.queryByLabelText(/pairing qr code/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/expires in 0:00/i)).not.toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(getPairing).not.toHaveBeenCalled();
+  });
+
+  it('uses fixed provider and reason copy instead of free-form local text', () => {
+    const hostile = {
+      ...waiting,
+      candidates: [
+        {
+          ...waiting.candidates[0],
+          displayName: 'API key: abc123',
+          version: 'token=secret',
+          statusReason: 'C:\\private\\runtime-id.txt',
+        },
+        {
+          ...waiting.candidates[1],
+          displayName: 'rt_deadbeef',
+          version: '1.2.3',
+          statusReason: 'needs_auth',
+        },
+      ],
+    } as unknown as PairingSnapshot;
+    const { container } = render(<PairingPanel api={createApi()} initialSnapshot={hostile} />);
+
+    expect(screen.getByText('OpenCode')).toBeVisible();
+    expect(screen.getByText('Codex')).toBeVisible();
+    expect(screen.getByText(/sign in to codex locally/i)).toBeVisible();
+    expect(container).not.toHaveTextContent('API key: abc123');
+    expect(container).not.toHaveTextContent('token=secret');
+    expect(container).not.toHaveTextContent('C:\\private\\runtime-id.txt');
+    expect(container).not.toHaveTextContent('rt_deadbeef');
+    expect(container).not.toHaveTextContent('needs_auth');
   });
 
   it('polls while active and stops after a terminal snapshot', async () => {

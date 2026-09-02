@@ -8,6 +8,7 @@ import type {
   PairingCandidateResult,
   PairingSnapshot,
   PairingState,
+  PairingStatusReason,
 } from '../types';
 
 const TERMINAL_STATES = new Set<PairingState>([
@@ -36,13 +37,32 @@ const RESULT_COPY: Record<PairingCandidateResult['status'], string> = {
   failed: 'Could not add this platform',
 };
 
-function safeDisplayText(value: string | null, fallback: string): string {
-  if (value === null) return fallback;
-  const unsafe =
-    /(?:^|\s)(?:[A-Za-z]:[\\/]|\\\\|\/[^\s])/u.test(value) ||
-    /rt_[0-9a-f]{32}/u.test(value) ||
-    /[A-Za-z0-9_-]{43,}/u.test(value);
-  return unsafe ? fallback : value;
+const PROVIDER_COPY: Record<PairingCandidate['provider'], string> = {
+  opencode: 'OpenCode',
+  openclaw: 'OpenClaw',
+  codex: 'Codex',
+  hermes: 'Hermes',
+};
+
+const STATUS_REASON_COPY: Omit<Record<PairingStatusReason, string>, 'needs_auth'> = {
+  found_not_runnable: 'This platform is not ready to run locally.',
+  not_found: 'This platform is not installed locally.',
+  probe_failed: 'This platform could not be checked locally.',
+  provider_conflict: 'Another local installation of this platform was detected.',
+};
+
+function statusReasonCopy(candidate: PairingCandidate): string | null {
+  if (candidate.statusReason === null) return null;
+  if (candidate.statusReason === 'needs_auth') {
+    return `Sign in to ${PROVIDER_COPY[candidate.provider]} locally.`;
+  }
+  return STATUS_REASON_COPY[candidate.statusReason];
+}
+
+function safeVersion(value: string | null): string | null {
+  return value !== null && /^v?(?:0|[1-9]\d{0,4})(?:\.(?:0|[1-9]\d{0,4})){0,3}$/u.test(value)
+    ? value
+    : null;
 }
 
 function readinessCopy(candidate: PairingCandidate): string {
@@ -60,26 +80,39 @@ function readinessCopy(candidate: PairingCandidate): string {
 
 function expiresCopy(expiresAt: string | null, now: number): string | null {
   if (expiresAt === null) return null;
-  const remainingSeconds = Math.max(0, Math.ceil((Date.parse(expiresAt) - now) / 1_000));
+  const remainingSeconds = Math.ceil((Date.parse(expiresAt) - now) / 1_000);
+  if (remainingSeconds <= 0) return null;
   const minutes = Math.floor(remainingSeconds / 60);
   const seconds = remainingSeconds % 60;
   return `Expires in ${minutes}:${seconds.toString().padStart(2, '0')}`;
 }
 
+function isExpiredWaiting(snapshot: PairingSnapshot, now: number): boolean {
+  return (
+    snapshot.state === 'waiting' &&
+    snapshot.expiresAt !== null &&
+    Date.parse(snapshot.expiresAt) <= now
+  );
+}
+
 type PairingPanelProps = {
   api: BridgeApi;
   initialSnapshot: PairingSnapshot;
+  now?: () => number;
 };
 
-export function PairingPanel({ api, initialSnapshot }: PairingPanelProps) {
+export function PairingPanel({ api, initialSnapshot, now: clock = Date.now }: PairingPanelProps) {
   const [snapshot, setSnapshot] = useState(initialSnapshot);
-  const [now, setNow] = useState(() => Date.now());
+  const [currentTime, setCurrentTime] = useState(() => clock());
   const [actionBusy, setActionBusy] = useState(false);
   const [requestFailed, setRequestFailed] = useState(false);
   const actionGeneration = useRef(0);
   const mounted = useRef(true);
   const actionController = useRef<AbortController | undefined>(undefined);
   const pollController = useRef<AbortController | undefined>(undefined);
+  const displayState: PairingState = isExpiredWaiting(snapshot, currentTime)
+    ? 'expired'
+    : snapshot.state;
 
   useEffect(
     () => () => {
@@ -92,11 +125,16 @@ export function PairingPanel({ api, initialSnapshot }: PairingPanelProps) {
   );
 
   useEffect(() => {
-    if (TERMINAL_STATES.has(snapshot.state) || snapshot.state === 'idle' || actionBusy) return;
+    if (TERMINAL_STATES.has(displayState) || displayState === 'idle' || actionBusy) return;
     const controller = new AbortController();
     pollController.current = controller;
     let active = true;
     const timer = window.setTimeout(() => {
+      const requestTime = clock();
+      if (isExpiredWaiting(snapshot, requestTime)) {
+        if (active && mounted.current) setCurrentTime(requestTime);
+        return;
+      }
       void api.getPairing(controller.signal).then(
         (next) => {
           if (active && mounted.current) {
@@ -118,13 +156,13 @@ export function PairingPanel({ api, initialSnapshot }: PairingPanelProps) {
       controller.abort();
       if (pollController.current === controller) pollController.current = undefined;
     };
-  }, [actionBusy, api, snapshot]);
+  }, [actionBusy, api, clock, displayState, snapshot]);
 
   useEffect(() => {
-    if (snapshot.expiresAt === null || TERMINAL_STATES.has(snapshot.state)) return;
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    if (snapshot.expiresAt === null || TERMINAL_STATES.has(displayState)) return;
+    const timer = window.setInterval(() => setCurrentTime(clock()), 1_000);
     return () => window.clearInterval(timer);
-  }, [snapshot.expiresAt, snapshot.state]);
+  }, [clock, displayState, snapshot.expiresAt]);
 
   const resultByCandidate = useMemo(
     () => new Map(snapshot.results.map((result) => [result.candidateId, result])),
@@ -137,8 +175,8 @@ export function PairingPanel({ api, initialSnapshot }: PairingPanelProps) {
     snapshot.state === 'partial' &&
     retryCandidateIds.length > 0 &&
     snapshot.expiresAt !== null &&
-    Date.parse(snapshot.expiresAt) > now;
-  const expires = expiresCopy(snapshot.expiresAt, now);
+    Date.parse(snapshot.expiresAt) > currentTime;
+  const expires = displayState === 'expired' ? null : expiresCopy(snapshot.expiresAt, currentTime);
 
   function beginAction(): { controller: AbortController; generation: number } {
     pollController.current?.abort();
@@ -205,12 +243,12 @@ export function PairingPanel({ api, initialSnapshot }: PairingPanelProps) {
           Pair with ClawMessenger
         </h2>
         <p role="status" aria-live="polite" className="text-body text-muted-foreground">
-          {STATE_COPY[snapshot.state]}
+          {STATE_COPY[displayState]}
           {expires === null ? null : ` · ${expires}`}
         </p>
       </div>
 
-      {snapshot.state === 'waiting' && snapshot.qrContent !== null ? (
+      {displayState === 'waiting' && snapshot.qrContent !== null ? (
         <div className="grid justify-items-center gap-3 rounded-lg bg-white p-4 sm:justify-self-start">
           <div role="img" aria-label="Pairing QR code" className="size-56 max-w-full">
             <QRCode value={snapshot.qrContent} size={224} className="size-full" />
@@ -224,13 +262,9 @@ export function PairingPanel({ api, initialSnapshot }: PairingPanelProps) {
       <ul className="grid gap-2" aria-label="Detected pairing platforms">
         {snapshot.candidates.map((candidate) => {
           const result = resultByCandidate.get(candidate.candidateId);
-          const label = safeDisplayText(candidate.displayName, 'Detected platform');
-          const version = candidate.version === null
-            ? null
-            : safeDisplayText(candidate.version, '');
-          const reason = candidate.statusReason === null
-            ? null
-            : safeDisplayText(candidate.statusReason, 'See the local platform for details.');
+          const label = PROVIDER_COPY[candidate.provider];
+          const version = safeVersion(candidate.version);
+          const reason = statusReasonCopy(candidate);
           return (
             <li
               key={candidate.candidateId}
@@ -262,7 +296,7 @@ export function PairingPanel({ api, initialSnapshot }: PairingPanelProps) {
       ) : null}
 
       <div className="flex flex-wrap justify-end gap-2">
-        {!TERMINAL_STATES.has(snapshot.state) && snapshot.state !== 'idle' ? (
+        {!TERMINAL_STATES.has(displayState) && displayState !== 'idle' ? (
           <Button type="button" variant="outline" disabled={actionBusy} onClick={() => void cancel()}>
             Cancel pairing
           </Button>

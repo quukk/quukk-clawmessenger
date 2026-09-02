@@ -58,7 +58,6 @@ const pairing: PairingSnapshot = {
     {
       candidateId: 'cand-opencode',
       provider: 'opencode',
-      displayName: 'OpenCode',
       version: '1.2.3',
       readiness: 'ready',
       statusReason: null,

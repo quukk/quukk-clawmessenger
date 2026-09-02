@@ -7,6 +7,7 @@ import type {
   BridgeRuntime,
   BridgeSettings,
   DiagnosticsSnapshot,
+  PairingCandidate,
   PairingSnapshot,
 } from './types';
 
@@ -186,7 +187,10 @@ const settingsEnvelopeSchema = z
     effective: storedConfigSchema,
   })
   .strict()
-  .transform((value) => ({ settings: viewSettings(value.stored) }));
+  .transform((value) => ({
+    settings: viewSettings(value.stored),
+    effectiveServerUrl: value.effective.serverUrl,
+  }));
 
 const activitySchema = z
   .object({
@@ -302,6 +306,17 @@ const diagnosticsSchema = z
 const pairingCandidateIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
 const pairingTextSchema = (maximum: number) =>
   z.string().min(1).max(maximum).refine((value) => value === value.trim());
+const pairingVersionSchema = z
+  .string()
+  .max(24)
+  .regex(/^v?(?:0|[1-9]\d{0,4})(?:\.(?:0|[1-9]\d{0,4})){0,3}$/);
+const pairingStatusReasonSchema = z.enum([
+  'needs_auth',
+  'found_not_runnable',
+  'not_found',
+  'probe_failed',
+  'provider_conflict',
+]);
 const pairingCandidateSchema = z
   .object({
     candidateId: pairingCandidateIdSchema,
@@ -312,7 +327,23 @@ const pairingCandidateSchema = z
     statusReason: pairingTextSchema(80).nullable(),
     registrationState: z.enum(['unregistered', 'registered']),
   })
-  .strict();
+  .strict()
+  .transform(
+    (value): PairingCandidate => ({
+      candidateId: value.candidateId,
+      provider: value.provider,
+      version:
+        value.version !== null && pairingVersionSchema.safeParse(value.version).success
+          ? value.version
+          : null,
+      readiness: value.readiness,
+      statusReason:
+        value.statusReason === null
+          ? null
+          : (pairingStatusReasonSchema.safeParse(value.statusReason).data ?? null),
+      registrationState: value.registrationState,
+    }),
+  );
 const pairingResultSchema = z
   .object({
     candidateId: pairingCandidateIdSchema,
@@ -333,27 +364,62 @@ const pairingResultSchema = z
       context.addIssue({ code: 'custom', path: ['nodeId'] });
     }
   });
+function isLoopback(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[(.*)\]$/, '$1');
+  if (host === 'localhost' || host === '::1') return true;
+  const octets = host.split('.');
+  return (
+    octets.length === 4 &&
+    octets.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255) &&
+    octets[0] === '127'
+  );
+}
+
+function normalizePairingServer(value: string): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return undefined;
+  }
+  const protocolAllowed =
+    url.protocol === 'https:' || (url.protocol === 'http:' && isLoopback(url.hostname));
+  if (
+    !protocolAllowed ||
+    value !== value.trim() ||
+    url.username !== '' ||
+    url.password !== '' ||
+    url.search !== '' ||
+    url.hash !== ''
+  ) {
+    return undefined;
+  }
+  return url.toString().replace(/\/+$/, '');
+}
+
+const pairingServerSchema = z
+  .string()
+  .min(1)
+  .max(4096)
+  .transform((value, context) => {
+    const normalized = normalizePairingServer(value);
+    if (normalized === undefined) {
+      context.addIssue({ code: 'custom' });
+      return z.NEVER;
+    }
+    return normalized;
+  });
+
 const pairingQrSchema = z
   .object({
     type: z.literal('clawmessenger_pairing'),
     version: z.literal(1),
-    server: z.string().min(1).max(4096).url().refine((value) => {
-      const url = new URL(value);
-      const loopback =
-        url.hostname === 'localhost' ||
-        url.hostname === '::1' ||
-        /^127(?:\.\d{1,3}){3}$/.test(url.hostname);
-      const safeAuthority =
-        url.username === '' && url.password === '' && url.search === '' && url.hash === '';
-      return (
-        safeAuthority &&
-        (url.protocol === 'https:' || (url.protocol === 'http:' && loopback))
-      );
-    }),
+    server: pairingServerSchema,
     ticket: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
     expiresAt: z.number().int().positive().finite(),
   })
   .strict();
+
 const pairingEnvelopeSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -429,6 +495,25 @@ const pairingEnvelopeSchema = z
     }),
   );
 
+function parsePairingEnvelope(
+  data: unknown,
+  expectedServerUrl: string | undefined,
+  now: () => number,
+): PairingSnapshot | undefined {
+  const parsed = pairingEnvelopeSchema.safeParse(data);
+  if (!parsed.success) return undefined;
+  if (parsed.data.state !== 'waiting') return parsed.data;
+  const qr = pairingQrSchema.safeParse(JSON.parse(parsed.data.qrContent!));
+  if (
+    !qr.success ||
+    qr.data.server !== expectedServerUrl ||
+    qr.data.expiresAt <= now()
+  ) {
+    return undefined;
+  }
+  return parsed.data;
+}
+
 const base64UrlTokenSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const exchangeSchema = z
   .object({
@@ -447,6 +532,10 @@ type BrowserPorts = {
   fetch: typeof globalThis.fetch;
   href: string;
   replaceUrl(url: string): void;
+};
+
+type BridgeApiOptions = {
+  now?: () => number;
 };
 
 export class BridgeApiError extends Error {
@@ -487,9 +576,14 @@ function wireSettings(settings: BridgeSettings) {
   };
 }
 
-export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi {
+export function createBridgeApi(
+  ports: BrowserPorts = browserPorts(),
+  options: BridgeApiOptions = {},
+): BridgeApi {
   const ticket = scrubTicket(ports);
+  const now = options.now ?? Date.now;
   let csrfToken = '';
+  let configuredPairingServer: string | undefined;
 
   const sessionReady = ticket
     ? ports
@@ -633,19 +727,18 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
     },
     async getSettings() {
       const data = await request('/api/settings');
-      return parseSafely(
-        data,
-        settingsEnvelopeSchema,
-        {
-          settings: {
-            serverUrl: '',
-            defaultWorkdir: null,
-            authorizedWorkRoots: [],
-            providerPathOverrides: {},
-            logLevel: 'info',
-          } satisfies BridgeSettings,
-        },
-      ).settings;
+      const parsed = settingsEnvelopeSchema.safeParse(data);
+      if (!parsed.success) {
+        return {
+          serverUrl: '',
+          defaultWorkdir: null,
+          authorizedWorkRoots: [],
+          providerPathOverrides: {},
+          logLevel: 'info',
+        } satisfies BridgeSettings;
+      }
+      configuredPairingServer = normalizePairingServer(parsed.data.effectiveServerUrl);
+      return parsed.data.settings;
     },
     async updateSettings(settings) {
       const data = await request('/api/settings', {
@@ -654,25 +747,27 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
       });
       const parsed = settingsEnvelopeSchema.safeParse(data);
       if (!parsed.success) throw new BridgeApiError('invalid_response');
+      configuredPairingServer = normalizePairingServer(parsed.data.effectiveServerUrl);
+      if (configuredPairingServer === undefined) throw new BridgeApiError('invalid_response');
       return parsed.data.settings;
     },
     async startPairing(signal) {
       const data = await request('/api/pairing/session', { method: 'POST', signal });
-      const parsed = pairingEnvelopeSchema.safeParse(data);
-      if (!parsed.success) throw new BridgeApiError('invalid_response');
-      return parsed.data;
+      const parsed = parsePairingEnvelope(data, configuredPairingServer, now);
+      if (parsed === undefined) throw new BridgeApiError('invalid_response');
+      return parsed;
     },
     async getPairing(signal) {
       const data = await request('/api/pairing/session', { signal });
-      const parsed = pairingEnvelopeSchema.safeParse(data);
-      if (!parsed.success) throw new BridgeApiError('invalid_response');
-      return parsed.data;
+      const parsed = parsePairingEnvelope(data, configuredPairingServer, now);
+      if (parsed === undefined) throw new BridgeApiError('invalid_response');
+      return parsed;
     },
     async cancelPairing(signal) {
       const data = await request('/api/pairing/session', { method: 'DELETE', signal });
-      const parsed = pairingEnvelopeSchema.safeParse(data);
-      if (!parsed.success) throw new BridgeApiError('invalid_response');
-      return parsed.data;
+      const parsed = parsePairingEnvelope(data, configuredPairingServer, now);
+      if (parsed === undefined) throw new BridgeApiError('invalid_response');
+      return parsed;
     },
     async retryPairing(candidateIds, signal) {
       const data = await request('/api/pairing/session/retry', {
@@ -680,9 +775,9 @@ export function createBridgeApi(ports: BrowserPorts = browserPorts()): BridgeApi
         signal,
         body: JSON.stringify({ candidateIds }),
       });
-      const parsed = pairingEnvelopeSchema.safeParse(data);
-      if (!parsed.success) throw new BridgeApiError('invalid_response');
-      return parsed.data;
+      const parsed = parsePairingEnvelope(data, configuredPairingServer, now);
+      if (parsed === undefined) throw new BridgeApiError('invalid_response');
+      return parsed;
     },
   };
 }

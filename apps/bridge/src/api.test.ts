@@ -38,6 +38,22 @@ function response(body: unknown, status = 200): Response {
   });
 }
 
+function settingsResponse(effectiveServerUrl: string) {
+  const stored = {
+    schemaVersion: 1 as const,
+    serverUrl: 'https://stored.example/im',
+    defaultWorkdir: null,
+    authorizedWorkRoots: ['C:\\work'],
+    providerPathOverrides: {},
+    logLevel: 'info' as const,
+  };
+  return {
+    schemaVersion: 1 as const,
+    stored,
+    effective: { ...stored, serverUrl: effectiveServerUrl },
+  };
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
@@ -51,6 +67,7 @@ describe('local bridge API client', () => {
       .mockResolvedValueOnce(
         response({ schemaVersion: 1, csrfToken, expiresInMs: 28_800_000 }),
       )
+      .mockResolvedValueOnce(response(settingsResponse('https://configured.example')))
       .mockResolvedValueOnce(response(pairingResponse))
       .mockResolvedValueOnce(response({ ...pairingResponse, state: 'claimed', qrContent: null }))
       .mockResolvedValueOnce(response({ ...pairingResponse, state: 'cancelled', qrContent: null }))
@@ -61,29 +78,29 @@ describe('local bridge API client', () => {
       replaceUrl: vi.fn(),
     });
 
-    const { schemaVersion: _schemaVersion, ...expectedPairing } = pairingResponse;
-    await expect(api.startPairing()).resolves.toEqual(expectedPairing);
+    await api.getSettings();
+    await expect(api.startPairing()).resolves.toMatchObject({ state: 'waiting' });
     await expect(api.getPairing()).resolves.toMatchObject({ state: 'claimed' });
     await expect(api.cancelPairing()).resolves.toMatchObject({ state: 'cancelled' });
     await expect(api.retryPairing(['cand-a'])).resolves.toMatchObject({ state: 'processing' });
 
     expect(fetch).toHaveBeenNthCalledWith(
-      2,
+      3,
       '/api/pairing/session',
       expect.objectContaining({ method: 'POST' }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      3,
+      4,
       '/api/pairing/session',
       expect.objectContaining({ credentials: 'same-origin' }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      4,
+      5,
       '/api/pairing/session',
       expect.objectContaining({ method: 'DELETE' }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      5,
+      6,
       '/api/pairing/session/retry',
       expect.objectContaining({
         method: 'POST',
@@ -125,14 +142,145 @@ describe('local bridge API client', () => {
     ];
 
     for (const body of invalidResponses) {
-      const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValueOnce(response(body));
+      const fetch = vi
+        .fn<typeof globalThis.fetch>()
+        .mockResolvedValueOnce(response(settingsResponse('https://configured.example')))
+        .mockResolvedValueOnce(response(body));
       const api = createBridgeApi({
         fetch,
         href: 'http://127.0.0.1:48321/',
         replaceUrl: vi.fn(),
       });
+      await api.getSettings();
       await expect(api.getPairing()).rejects.toMatchObject({ code: 'invalid_response' });
     }
+  });
+
+  it('accepts only the normalized configured pairing server base', async () => {
+    const cases = [
+      { server: 'https://configured.example/im', accepted: true },
+      { server: 'https://attacker.example/im', accepted: false },
+      { server: 'https://configured.example/attacker', accepted: false },
+      { server: 'https://configured.example:444/im', accepted: false },
+    ];
+
+    for (const testCase of cases) {
+      const qrContent = JSON.stringify({
+        ...JSON.parse(pairingResponse.qrContent),
+        server: testCase.server,
+      });
+      const fetch = vi
+        .fn<typeof globalThis.fetch>()
+        .mockResolvedValueOnce(response(settingsResponse('https://configured.example/im/')))
+        .mockResolvedValueOnce(response({ ...pairingResponse, qrContent }));
+      const api = createBridgeApi(
+        {
+          fetch,
+          href: 'http://127.0.0.1:48321/',
+          replaceUrl: vi.fn(),
+        },
+        { now: () => Date.parse('2026-09-02T10:00:00.000Z') },
+      );
+
+      await api.getSettings();
+      const result = api.getPairing();
+      if (testCase.accepted) {
+        await expect(result).resolves.toMatchObject({ state: 'waiting' });
+      } else {
+        await expect(result).rejects.toMatchObject({ code: 'invalid_response' });
+      }
+    }
+  });
+
+  it('rejects a waiting snapshot whose QR has reached its deadline', async () => {
+    const expiry = '2026-09-02T10:05:00.000Z';
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(response(settingsResponse('https://configured.example/im')))
+      .mockResolvedValueOnce(
+        response({
+          ...pairingResponse,
+          expiresAt: expiry,
+          qrContent: JSON.stringify({
+            ...JSON.parse(pairingResponse.qrContent),
+            expiresAt: Date.parse(expiry),
+          }),
+        }),
+      );
+    const api = createBridgeApi(
+      {
+        fetch,
+        href: 'http://127.0.0.1:48321/',
+        replaceUrl: vi.fn(),
+      },
+      { now: () => Date.parse(expiry) },
+    );
+
+    await api.getSettings();
+    await expect(api.getPairing()).rejects.toMatchObject({ code: 'invalid_response' });
+  });
+
+  it('projects pairing candidates without free-form local display data', async () => {
+    const candidates = [
+      {
+        ...pairingResponse.candidates[0],
+        displayName: 'API key: abc123',
+        version: 'token=secret',
+        statusReason: 'C:\\private\\runtime-id.txt',
+      },
+      {
+        ...pairingResponse.candidates[0],
+        candidateId: 'cand-b',
+        provider: 'codex' as const,
+        displayName: 'rt_deadbeef',
+        version: '1.2.3',
+        statusReason: 'needs_auth',
+        readiness: 'not_ready' as const,
+      },
+    ];
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(response(settingsResponse('https://configured.example/im')))
+      .mockResolvedValueOnce(
+        response({
+          ...pairingResponse,
+          qrContent: JSON.stringify({
+            ...JSON.parse(pairingResponse.qrContent),
+            server: 'https://configured.example/im',
+          }),
+          candidates,
+        }),
+      );
+    const api = createBridgeApi(
+      {
+        fetch,
+        href: 'http://127.0.0.1:48321/',
+        replaceUrl: vi.fn(),
+      },
+      { now: () => Date.parse('2026-09-02T10:00:00.000Z') },
+    );
+
+    await api.getSettings();
+    const snapshot = await api.getPairing();
+    expect(snapshot.candidates).toEqual([
+      {
+        candidateId: 'cand-a',
+        provider: 'opencode',
+        version: null,
+        readiness: 'ready',
+        statusReason: null,
+        registrationState: 'unregistered',
+      },
+      {
+        candidateId: 'cand-b',
+        provider: 'codex',
+        version: '1.2.3',
+        readiness: 'not_ready',
+        statusReason: 'needs_auth',
+        registrationState: 'unregistered',
+      },
+    ]);
+    expect(JSON.stringify(snapshot)).not.toMatch(/API key|abc123|token=secret|runtime-id|rt_deadbeef/u);
   });
 
   it('creates one browser API instance when React probes a render twice', () => {

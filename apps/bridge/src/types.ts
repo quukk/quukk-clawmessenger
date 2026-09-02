@@ -70,13 +70,19 @@ export type PairingState =
   | 'cancelled'
   | 'expired';
 
+export type PairingStatusReason =
+  | 'needs_auth'
+  | 'found_not_runnable'
+  | 'not_found'
+  | 'probe_failed'
+  | 'provider_conflict';
+
 export type PairingCandidate = {
   candidateId: string;
   provider: Provider;
-  displayName: string;
   version: string | null;
   readiness: 'ready' | 'not_ready' | 'already_registered';
-  statusReason: string | null;
+  statusReason: PairingStatusReason | null;
   registrationState: 'unregistered' | 'registered';
 };
 
