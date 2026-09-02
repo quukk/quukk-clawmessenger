@@ -100,9 +100,19 @@ class FakePairingClient {
     idempotencyKey: string;
   }> = [];
   readonly selections: Array<ReturnType<typeof deferred<PairingSelection>>> = [];
+  readonly createSignals: Array<AbortSignal | undefined> = [];
+  createImplementation: ((
+    input: CreatePairingSessionInput,
+    signal?: AbortSignal,
+  ) => Promise<PairingSession>) | undefined;
 
-  async createSession(input: CreatePairingSessionInput): Promise<PairingSession> {
+  async createSession(
+    input: CreatePairingSessionInput,
+    signal?: AbortSignal,
+  ): Promise<PairingSession> {
     this.createCalls.push({ ...input, candidates: input.candidates.map((candidate) => ({ ...candidate })) });
+    this.createSignals.push(signal);
+    if (this.createImplementation !== undefined) return this.createImplementation(input, signal);
     const marker = String.fromCharCode(84 + this.createCalls.length - 1);
     return {
       ticket: marker.repeat(43),
@@ -207,6 +217,21 @@ describe('PairingService', () => {
     await fixture.service.cancel();
   });
 
+  it.each([
+    ['Windows path', 'C:\\Users\\alice\\.codex\\auth.json'],
+    ['Unix path', '/home/alice/.codex/auth.json'],
+    ['runtime identifier', `rt_${'f'.repeat(32)}`],
+    ['sensitive marker', 'v1.2.3-token-secret'],
+  ])('omits an unsafe detected version containing a %s', async (_name, version) => {
+    const fixture = harness([runtime('codex', { version })]);
+
+    const snapshot = await fixture.service.start();
+
+    expect(snapshot.candidates[0]!.version).toBeNull();
+    expect(JSON.stringify(fixture.client.createCalls[0]!.candidates)).not.toContain(version);
+    await fixture.service.cancel();
+  });
+
   it('registers exactly the selected ready runtimes', async () => {
     const opencode = runtime('opencode');
     const codex = runtime('codex');
@@ -262,6 +287,90 @@ describe('PairingService', () => {
     ]);
     expect(second.ticket).not.toBe(first.ticket);
     await fixture.service.cancel();
+  });
+
+  it('cancels an in-flight creation generation and fences its late response', async () => {
+    const pending = deferred<PairingSession>();
+    const client = new FakePairingClient();
+    client.createImplementation = async () => pending.promise;
+    const fixture = harness([runtime('codex')], { client });
+
+    const starting = fixture.service.start();
+    await vi.waitFor(() => expect(client.createSignals).toHaveLength(1));
+    const creationSignal = client.createSignals[0]!;
+    const cancelled = await fixture.service.cancel();
+
+    expect(creationSignal.aborted).toBe(true);
+    expect(cancelled.state).toBe('cancelled');
+    const request = client.createCalls[0]!;
+    pending.resolve({
+      ticket: 'T'.repeat(43),
+      deviceSecret: 't'.repeat(43),
+      expiresAt: EXPIRES_AT,
+      status: 'waiting',
+      candidates: request.candidates,
+    });
+    await expect(starting).rejects.toMatchObject({ code: 'pairing_cancelled' });
+    expect(client.pollCalls).toEqual([]);
+    expect(fixture.service.snapshot()).toMatchObject({
+      state: 'cancelled',
+      ticket: null,
+      candidates: [],
+      results: [],
+    });
+  });
+
+  it('deduplicates selected candidate IDs before assigning one stable registration attempt', async () => {
+    const fixture = harness([runtime('codex')]);
+    await fixture.service.start();
+    const candidateId = fixture.client.createCalls[0]!.candidates[0]!.candidateId;
+
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [candidateId, candidateId]));
+    await fixture.service.waitForTerminal();
+
+    expect(fixture.bindings.calls).toHaveLength(1);
+    expect(fixture.bindings.calls[0]!.authorization).toMatchObject({
+      candidateId,
+      idempotencyKey: expect.any(String),
+    });
+    expect(fixture.service.snapshot()).toMatchObject({
+      state: 'completed',
+      results: [{ candidateId, status: 'bound' }],
+    });
+  });
+
+  it('rejects unknown selected candidate IDs locally without leaking or registering them', async () => {
+    const codex = runtime('codex');
+    const fixture = harness([codex]);
+    await fixture.service.start();
+    const candidateId = fixture.client.createCalls[0]!.candidates[0]!.candidateId;
+    const unknownCandidateId = 'unknown-candidate';
+
+    fixture.client.selections[0]!.resolve(selected(
+      fixture.client,
+      [candidateId, unknownCandidateId],
+    ));
+    await fixture.service.waitForTerminal();
+
+    expect(fixture.bindings.calls).toHaveLength(1);
+    expect(fixture.bindings.calls[0]).toMatchObject({ runtimeId: codex.id });
+    expect(fixture.service.snapshot()).toMatchObject({
+      state: 'partial',
+      results: [
+        expect.objectContaining({ candidateId, status: 'bound' }),
+        {
+          candidateId: unknownCandidateId,
+          status: 'failed',
+          errorCode: 'runtime_unavailable',
+          nodeId: null,
+          retryable: false,
+        },
+      ],
+    });
+    const serialized = JSON.stringify(fixture.service.snapshot());
+    expect(serialized).not.toContain(codex.id);
+    expect(serialized).not.toContain(codex.path);
+    expect(serialized).not.toContain('t'.repeat(43));
   });
 
   it('invalidates in-memory session credentials on restart and creates a fresh session', async () => {

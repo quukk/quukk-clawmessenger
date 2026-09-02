@@ -21,6 +21,9 @@ import type {
 
 const POLL_DELAY_MS = 500;
 const MAX_RANDOM_ATTEMPTS = 32;
+const SAFE_VERSION_TOKEN = /^(?=.{1,64}$)(?:[A-Za-z][A-Za-z0-9]*-)*v?\d+(?:\.\d+){0,3}(?:[-+][A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?$/;
+const SENSITIVE_VERSION_MARKER =
+  /(?:^|[._+-])(?:api[_-]?key|authorization|bearer|credential|password|secret|token)(?:$|[._+-])/i;
 const RETRYABLE_REGISTRATION_ERRORS = new Set([
   'registration_timeout',
   'registration_transport',
@@ -119,9 +122,10 @@ function validRuntime(runtime: PairingRuntime): boolean {
 
 function safeVersion(version: string | null | undefined): string | null {
   return typeof version === 'string'
-    && version.length > 0
-    && version.length <= 64
     && version === version.trim()
+    && SAFE_VERSION_TOKEN.test(version)
+    && !RUNTIME_ID_PATTERN.test(version)
+    && !SENSITIVE_VERSION_MARKER.test(version)
     ? version
     : null;
 }
@@ -223,7 +227,15 @@ export class PairingService {
 
   async cancel(): Promise<PairingServiceSnapshot> {
     const privateSession = this.#privateSession;
-    if (privateSession === undefined) return this.snapshot();
+    if (privateSession === undefined) {
+      if (this.#controller === undefined) return this.snapshot();
+      this.#state = 'cancelled';
+      this.#controller.abort();
+      this.#generation += 1;
+      this.#clearPrivateState();
+      await this.#cycle.catch(() => undefined);
+      return this.snapshot();
+    }
     this.#state = 'cancelled';
     this.#controller?.abort();
     const generation = ++this.#generation;
@@ -311,10 +323,27 @@ export class PairingService {
       idempotencyKey: this.#newOpaqueId(),
       candidates,
     };
+    this.#ticket = null;
+    this.#expiresAt = null;
+    this.#candidates = [];
+    this.#selectedCandidates = [];
+    this.#results.clear();
     const controller = new AbortController();
-    const session = await this.#client.createSession(input, controller.signal);
     const generation = ++this.#generation;
     this.#controller = controller;
+    let session;
+    try {
+      session = await this.#client.createSession(input, controller.signal);
+    } catch (error) {
+      if (generation === this.#generation) {
+        this.#controller = undefined;
+        if (this.#state !== 'cancelled') this.#state = 'idle';
+      }
+      throw error;
+    }
+    if (generation !== this.#generation || controller.signal.aborted) {
+      throw new PairingClientError('pairing_cancelled', 'transport', false);
+    }
     this.#privateSession = {
       ticket: session.ticket,
       deviceSecret: session.deviceSecret,
@@ -385,7 +414,7 @@ export class PairingService {
         await this.#sleep(POLL_DELAY_MS, signal);
         continue;
       }
-      this.#selectedCandidates = [...selection.selectedCandidateIds];
+      this.#selectedCandidates = [...new Set(selection.selectedCandidateIds)];
       this.#state = 'processing';
       await this.#registerCandidates(this.#selectedCandidates, generation, signal);
       this.#finishRegistration(generation);
