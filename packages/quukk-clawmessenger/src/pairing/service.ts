@@ -613,6 +613,10 @@ export class PairingService {
   #finishCycleError(error: unknown, generation: number): void {
     if (generation !== this.#generation) return;
     if (this.#state === 'cancelled' || this.#state === 'expired') return;
+    if (this.#state === 'completed') {
+      this.#clearPrivateState();
+      return;
+    }
     if (error instanceof PairingClientError && error.code === 'pairing_expired') {
       this.#state = 'expired';
     } else {

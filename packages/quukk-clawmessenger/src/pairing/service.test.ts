@@ -721,6 +721,45 @@ describe('PairingService', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it.each([
+    ['pairing_expired', 'pairing'],
+    ['pairing_cancelled', 'pairing'],
+    ['pairing_response_invalid', 'validation'],
+    ['pairing_unauthorized', 'authentication'],
+  ] as const)('keeps completed results after non-retryable ACK error %s', async (code, category) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const codex = runtime('codex');
+    const fixture = harness([codex], { now: () => Date.now() });
+    fixture.bindings.outcomes.set(codex.id, [
+      { runtimeId: codex.id, ok: false, errorCode: 'registration_transport' },
+      { runtimeId: codex.id, ok: true, binding: binding(codex) },
+    ]);
+    fixture.client.retryAckFailures.push(new PairingClientError(code, category, false));
+    await fixture.service.start();
+    const candidateId = fixture.client.createCalls[0]!.candidates[0]!.candidateId;
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [candidateId]));
+    await fixture.service.waitForTerminal();
+    expect(fixture.client.retryPolls).toHaveLength(1);
+
+    fixture.client.retryPolls[0]!.resolve({
+      requestId: 'retry-request-terminal-0001',
+      candidateIds: [candidateId],
+    });
+    await fixture.service.waitForTerminal();
+    await flushAsyncWork();
+
+    expect(fixture.service.snapshot()).toMatchObject({
+      state: 'completed',
+      results: [{ candidateId, status: 'bound', retryable: false }],
+    });
+    expect(fixture.bindings.calls).toHaveLength(2);
+    expect(fixture.client.retryAckCalls).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+    await fixture.service.cancel();
+    expect(fixture.client.cancelCalls).toHaveLength(0);
+  });
+
   it('paces empty retry polls and exponentially backs off retryable poll failures', async () => {
     const codex = runtime('codex');
     const sleep = vi.fn(async () => undefined);
