@@ -21,9 +21,7 @@ import type {
 
 const POLL_DELAY_MS = 500;
 const MAX_RANDOM_ATTEMPTS = 32;
-const SAFE_VERSION_TOKEN = /^(?=.{1,64}$)(?:[A-Za-z][A-Za-z0-9]*-)*v?\d+(?:\.\d+){0,3}(?:[-+][A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?$/;
-const SENSITIVE_VERSION_MARKER =
-  /(?:^|[._+-])(?:api[_-]?key|authorization|bearer|credential|password|secret|token)(?:$|[._+-])/i;
+const SAFE_VERSION_TOKEN = /^v?(?:0|[1-9]\d{0,5})(?:\.(?:0|[1-9]\d{0,5})){0,3}$/;
 const RETRYABLE_REGISTRATION_ERRORS = new Set([
   'registration_timeout',
   'registration_transport',
@@ -125,7 +123,6 @@ function safeVersion(version: string | null | undefined): string | null {
     && version === version.trim()
     && SAFE_VERSION_TOKEN.test(version)
     && !RUNTIME_ID_PATTERN.test(version)
-    && !SENSITIVE_VERSION_MARKER.test(version)
     ? version
     : null;
 }
@@ -229,10 +226,12 @@ export class PairingService {
     const privateSession = this.#privateSession;
     if (privateSession === undefined) {
       if (this.#controller === undefined) return this.snapshot();
+      const cancelledStart = this.#startInFlight;
       this.#state = 'cancelled';
       this.#controller.abort();
       this.#generation += 1;
       this.#clearPrivateState();
+      if (this.#startInFlight === cancelledStart) this.#startInFlight = undefined;
       await this.#cycle.catch(() => undefined);
       return this.snapshot();
     }

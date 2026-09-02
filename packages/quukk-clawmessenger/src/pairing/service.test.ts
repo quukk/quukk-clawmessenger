@@ -222,6 +222,8 @@ describe('PairingService', () => {
     ['Unix path', '/home/alice/.codex/auth.json'],
     ['runtime identifier', `rt_${'f'.repeat(32)}`],
     ['sensitive marker', 'v1.2.3-token-secret'],
+    ['build metadata payload', 'v1.2.3+tokenABC'],
+    ['prerelease payload', 'v1.2.3-password123'],
   ])('omits an unsafe detected version containing a %s', async (_name, version) => {
     const fixture = harness([runtime('codex', { version })]);
 
@@ -318,6 +320,59 @@ describe('PairingService', () => {
       candidates: [],
       results: [],
     });
+  });
+
+  it('starts a replacement before an abort-ignoring cancelled creation settles', async () => {
+    const firstCreation = deferred<PairingSession>();
+    const secondCreation = deferred<PairingSession>();
+    const client = new FakePairingClient();
+    client.createImplementation = async () => (
+      client.createCalls.length === 1 ? firstCreation.promise : secondCreation.promise
+    );
+    const fixture = harness([runtime('codex')], { client });
+
+    const cancelledStart = fixture.service.start();
+    await vi.waitFor(() => expect(client.createCalls).toHaveLength(1));
+    await fixture.service.cancel();
+
+    const replacementStart = fixture.service.start();
+    expect(replacementStart).not.toBe(cancelledStart);
+    await vi.waitFor(() => expect(client.createCalls).toHaveLength(2));
+    const replacementRequest = client.createCalls[1]!;
+    secondCreation.resolve({
+      ticket: 'U'.repeat(43),
+      deviceSecret: 'u'.repeat(43),
+      expiresAt: EXPIRES_AT,
+      status: 'waiting',
+      candidates: replacementRequest.candidates,
+    });
+
+    await expect(replacementStart).resolves.toMatchObject({
+      state: 'waiting',
+      ticket: 'U'.repeat(43),
+    });
+    expect(client.pollCalls).toEqual([
+      expect.objectContaining({ ticket: 'U'.repeat(43), deviceSecret: 'u'.repeat(43) }),
+    ]);
+
+    const cancelledRequest = client.createCalls[0]!;
+    firstCreation.resolve({
+      ticket: 'T'.repeat(43),
+      deviceSecret: 't'.repeat(43),
+      expiresAt: EXPIRES_AT,
+      status: 'waiting',
+      candidates: cancelledRequest.candidates,
+    });
+    await expect(cancelledStart).rejects.toMatchObject({ code: 'pairing_cancelled' });
+    expect(fixture.service.snapshot()).toMatchObject({
+      state: 'waiting',
+      ticket: 'U'.repeat(43),
+    });
+    expect(client.pollCalls).toEqual([
+      expect.objectContaining({ ticket: 'U'.repeat(43), deviceSecret: 'u'.repeat(43) }),
+    ]);
+
+    await fixture.service.cancel();
   });
 
   it('deduplicates selected candidate IDs before assigning one stable registration attempt', async () => {
