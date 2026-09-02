@@ -145,3 +145,21 @@ TDD and verification evidence:
 - Type check: `corepack pnpm --filter quukk-clawmessenger typecheck` -> **passed**.
 - Fix commit: `1530e6184 fix(clawmessenger): bound completed retry acknowledgements`.
 - This report and the Task 9 ledger report are committed separately. `progress.md` was not edited.
+
+## Independent review fix round 3
+
+Non-retryable ACK errors can no longer overwrite an already-completed registration result:
+
+- `pairing_expired`, `pairing_cancelled`, `pairing_response_invalid`, and `pairing_unauthorized` ACK failures all leave the public state/result at `completed`/`bound`.
+- The completed ACK watcher still finalizes its private lifecycle, clears the exact-expiry timer, and does not repeat registration or issue a server cancellation afterward.
+- `#finishCycleError` applies this preserve-and-clean behavior only when the state is already `completed`; errors before registration completion retain the existing expired/cancelled behavior.
+
+TDD and verification evidence:
+
+- Red: `corepack pnpm exec vitest run src/pairing/service.test.ts -t "non-retryable ACK error" --reporter=verbose` -> **4 failed, 28 skipped**. `pairing_expired` produced `expired`; the other three produced `cancelled` despite a persisted bound result.
+- Green focused: the same command -> **4 passed, 28 skipped**.
+- First full run: `corepack pnpm --filter quukk-clawmessenger test` -> **1 unrelated timeout, 1004 passed**. The timed-out recovery-garbage filesystem test was then run alone and passed in 524 ms.
+- Fresh full rerun: `corepack pnpm --filter quukk-clawmessenger test` -> **35 test files, 1005 passed**.
+- Type check: `corepack pnpm --filter quukk-clawmessenger typecheck` -> **passed**.
+- Fix commit: `f18dc65db fix(clawmessenger): preserve completed retry results`.
+- This report update is committed separately; `progress.md` was not edited.
