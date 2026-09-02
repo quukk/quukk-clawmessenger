@@ -252,6 +252,14 @@ export class PairingService {
       await this.#cycle.catch(() => undefined);
       return this.snapshot();
     }
+    if (this.#state === 'completed') {
+      const retryWatch = this.#retryWatch;
+      this.#controller?.abort();
+      this.#generation += 1;
+      this.#clearPrivateState();
+      await retryWatch?.catch(() => undefined);
+      return this.snapshot();
+    }
     this.#state = 'cancelled';
     this.#controller?.abort();
     const generation = ++this.#generation;
@@ -509,8 +517,9 @@ export class PairingService {
       result?.status === 'bound' || result?.status === 'already_bound')
       ? 'completed'
       : 'partial';
-    if (this.#state === 'completed') this.#clearPrivateState();
-    else {
+    if (this.#state === 'completed') {
+      if (this.#retryWatch === undefined) this.#clearPrivateState();
+    } else {
       const signal = this.#controller?.signal;
       if (signal !== undefined) this.#startRetryWatch(generation, signal);
     }
@@ -521,7 +530,10 @@ export class PairingService {
     const watch = this.#watchRetries(generation, signal);
     this.#retryWatch = watch;
     void watch.finally(() => {
-      if (this.#retryWatch === watch) this.#retryWatch = undefined;
+      if (this.#retryWatch === watch) {
+        this.#retryWatch = undefined;
+        if (this.#state === 'completed') this.#clearPrivateState();
+      }
     }).catch((error) => this.#finishCycleError(error, generation));
   }
 
@@ -627,7 +639,7 @@ export class PairingService {
     const delay = Math.max(0, Date.parse(expiresAt) - this.#now());
     const timer = setTimeout(() => {
       if (generation !== this.#generation || this.#privateSession === undefined) return;
-      this.#state = 'expired';
+      if (this.#state !== 'completed') this.#state = 'expired';
       this.#generation += 1;
       controller.abort();
       this.#clearPrivateState();

@@ -54,6 +54,10 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+async function flushAsyncWork(): Promise<void> {
+  for (let step = 0; step < 12; step += 1) await Promise.resolve();
+}
+
 class FakeRuntimeSource {
   constructor(public snapshot: readonly TrustedRuntime[]) {}
 
@@ -113,6 +117,13 @@ class FakePairingClient {
     idempotencyKey: string;
   }> = [];
   readonly retryAckFailures: PairingClientError[] = [];
+  retryAckImplementation: ((
+    ticket: string,
+    deviceSecret: string,
+    requestId: string,
+    idempotencyKey: string,
+    signal?: AbortSignal,
+  ) => Promise<{ requestId: string; candidateIds: string[] }>) | undefined;
   createImplementation: ((
     input: CreatePairingSessionInput,
     signal?: AbortSignal,
@@ -180,6 +191,9 @@ class FakePairingClient {
     idempotencyKey: string,
   ): Promise<{ requestId: string; candidateIds: string[] }> {
     this.retryAckCalls.push({ ticket, deviceSecret, requestId, idempotencyKey });
+    if (this.retryAckImplementation !== undefined) {
+      return this.retryAckImplementation(ticket, deviceSecret, requestId, idempotencyKey);
+    }
     const failure = this.retryAckFailures.shift();
     if (failure !== undefined) throw failure;
     return { requestId, candidateIds: [] };
@@ -206,6 +220,7 @@ function harness(
     client?: FakePairingClient;
     bindings?: FakeBindings;
     randomStart?: number;
+    now?: () => number;
     sleep?: (milliseconds: number, signal: AbortSignal) => Promise<unknown>;
   } = {},
 ) {
@@ -219,7 +234,7 @@ function harness(
     bindings,
     runtimeSource: source,
     installAbuseKey: INSTALL_ABUSE_KEY,
-    now: () => NOW,
+    now: options.now ?? (() => NOW),
     randomBytes,
     sleep: options.sleep ?? (async (_milliseconds: number, signal: AbortSignal) => {
       if (signal.aborted) throw new PairingClientError('pairing_cancelled', 'transport', false);
@@ -610,6 +625,100 @@ describe('PairingService', () => {
     expect(fixture.bindings.calls).toHaveLength(2);
     expect(fixture.client.retryAckCalls[1]).toEqual(fixture.client.retryAckCalls[0]);
     expect(sleep).toHaveBeenCalledWith(5_000, expect.any(AbortSignal));
+  });
+
+  it('stops a permanently retryable completed ACK at exact expiry without leaking timers', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const codex = runtime('codex');
+    const client = new FakePairingClient();
+    const ackSleeps: AbortSignal[] = [];
+    client.retryAckImplementation = async () => {
+      throw new PairingClientError('pairing_transport', 'transport', true);
+    };
+    const fixture = harness([codex], {
+      client,
+      now: () => Date.now(),
+      sleep: async (_milliseconds, signal) => new Promise<void>((_resolve, reject) => {
+        ackSleeps.push(signal);
+        signal.addEventListener('abort', () => {
+          reject(new PairingClientError('pairing_cancelled', 'transport', false));
+        }, { once: true });
+      }),
+    });
+    fixture.bindings.outcomes.set(codex.id, [
+      { runtimeId: codex.id, ok: false, errorCode: 'registration_transport' },
+      { runtimeId: codex.id, ok: true, binding: binding(codex) },
+    ]);
+    await fixture.service.start();
+    const candidateId = fixture.client.createCalls[0]!.candidates[0]!.candidateId;
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [candidateId]));
+    await fixture.service.waitForTerminal();
+    expect(fixture.client.retryPolls).toHaveLength(1);
+    fixture.client.retryPolls[0]!.resolve({
+      requestId: 'retry-request-expiry-0001',
+      candidateIds: [candidateId],
+    });
+    await flushAsyncWork();
+    expect(fixture.client.retryAckCalls).toHaveLength(1);
+    expect(ackSleeps).toHaveLength(1);
+    await fixture.service.waitForTerminal();
+
+    await vi.advanceTimersByTimeAsync(Date.parse(EXPIRES_AT) - NOW);
+    await flushAsyncWork();
+    expect(vi.getTimerCount()).toBe(0);
+
+    expect(fixture.service.snapshot().state).toBe('completed');
+    expect(ackSleeps[0]!.aborted).toBe(true);
+    expect(fixture.client.retryAckCalls).toHaveLength(1);
+    expect(fixture.bindings.calls).toHaveLength(2);
+    expect(new Set(fixture.client.retryAckCalls.map((call) => call.idempotencyKey)).size).toBe(1);
+  });
+
+  it('locally cancels a completed ACK lifecycle without reverting completed registration', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const codex = runtime('codex');
+    const client = new FakePairingClient();
+    const ackSleeps: AbortSignal[] = [];
+    client.retryAckImplementation = async () => {
+      throw new PairingClientError('pairing_transport', 'transport', true);
+    };
+    const fixture = harness([codex], {
+      client,
+      now: () => Date.now(),
+      sleep: async (_milliseconds, signal) => new Promise<void>((_resolve, reject) => {
+        ackSleeps.push(signal);
+        signal.addEventListener('abort', () => {
+          reject(new PairingClientError('pairing_cancelled', 'transport', false));
+        }, { once: true });
+      }),
+    });
+    fixture.bindings.outcomes.set(codex.id, [
+      { runtimeId: codex.id, ok: false, errorCode: 'registration_transport' },
+      { runtimeId: codex.id, ok: true, binding: binding(codex) },
+    ]);
+    await fixture.service.start();
+    const candidateId = fixture.client.createCalls[0]!.candidates[0]!.candidateId;
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [candidateId]));
+    await fixture.service.waitForTerminal();
+    expect(fixture.client.retryPolls).toHaveLength(1);
+    fixture.client.retryPolls[0]!.resolve({
+      requestId: 'retry-request-cancel-0001',
+      candidateIds: [candidateId],
+    });
+    await flushAsyncWork();
+    expect(fixture.client.retryAckCalls).toHaveLength(1);
+    expect(ackSleeps).toHaveLength(1);
+
+    await fixture.service.cancel();
+
+    expect(fixture.service.snapshot().state).toBe('completed');
+    expect(ackSleeps[0]!.aborted).toBe(true);
+    expect(fixture.client.retryAckCalls).toHaveLength(1);
+    expect(fixture.client.cancelCalls).toHaveLength(0);
+    expect(fixture.bindings.calls).toHaveLength(2);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('paces empty retry polls and exponentially backs off retryable poll failures', async () => {
