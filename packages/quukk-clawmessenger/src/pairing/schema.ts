@@ -38,7 +38,20 @@ const nullableBoundedTrimmedString = (maximum: number) =>
 
 const credentialSchema = z.string().regex(PAIRING_CREDENTIAL_PATTERN);
 const candidateIdSchema = z.string().regex(PAIRING_CANDIDATE_ID_PATTERN);
-const expiresAtSchema = z.iso.datetime({ offset: true });
+
+type PairingClockOptions = { now?: () => number };
+
+function clock(options: PairingClockOptions): () => number {
+  return options.now ?? (() => Date.now());
+}
+
+function expiresAtSchema(now: () => number) {
+  return z.iso.datetime({ offset: true }).superRefine((value, context) => {
+    if (Date.parse(value) <= now()) {
+      context.addIssue({ code: 'custom', message: 'pairing_expired' });
+    }
+  });
+}
 
 export const pairingCandidateSchema = z.strictObject({
   candidateId: candidateIdSchema,
@@ -77,33 +90,41 @@ const selectedCandidateIdsSchema = z
     }
   });
 
-export const pairingSessionSchema = z.strictObject({
-  ticket: credentialSchema,
-  deviceSecret: credentialSchema,
-  expiresAt: expiresAtSchema,
-  status: z.enum(PAIRING_SESSION_STATES),
-  candidates: candidatesSchema,
-});
-
-export const pairingSelectionSchema = z
-  .strictObject({
+export function pairingSessionSchemaFor(options: PairingClockOptions = {}) {
+  return z.strictObject({
+    ticket: credentialSchema,
+    deviceSecret: credentialSchema,
+    expiresAt: expiresAtSchema(clock(options)),
     status: z.enum(PAIRING_SESSION_STATES),
-    selectedCandidateIds: selectedCandidateIdsSchema,
     candidates: candidatesSchema,
-    expiresAt: expiresAtSchema,
-  })
-  .superRefine((selection, context) => {
-    const candidates = new Set(selection.candidates.map((candidate) => candidate.candidateId));
-    for (const [index, candidateId] of selection.selectedCandidateIds.entries()) {
-      if (!candidates.has(candidateId)) {
-        context.addIssue({
-          code: 'custom',
-          path: ['selectedCandidateIds', index],
-          message: 'unknown_candidate_id',
-        });
-      }
-    }
   });
+}
+
+export const pairingSessionSchema = pairingSessionSchemaFor();
+
+function pairingSelectionSchemaFor(options: PairingClockOptions = {}) {
+  return z
+    .strictObject({
+      status: z.enum(PAIRING_SESSION_STATES),
+      selectedCandidateIds: selectedCandidateIdsSchema,
+      candidates: candidatesSchema,
+      expiresAt: expiresAtSchema(clock(options)),
+    })
+    .superRefine((selection, context) => {
+      const candidates = new Set(selection.candidates.map((candidate) => candidate.candidateId));
+      for (const [index, candidateId] of selection.selectedCandidateIds.entries()) {
+        if (!candidates.has(candidateId)) {
+          context.addIssue({
+            code: 'custom',
+            path: ['selectedCandidateIds', index],
+            message: 'unknown_candidate_id',
+          });
+        }
+      }
+    });
+}
+
+export const pairingSelectionSchema = pairingSelectionSchemaFor();
 
 export const pairingCandidateResultSchema = z
   .strictObject({
@@ -124,31 +145,35 @@ export const pairingCandidateResultSchema = z
     }
   });
 
-export const pairingProgressSchema = pairingSelectionSchema
-  .safeExtend({
-    results: z.array(pairingCandidateResultSchema).max(PAIRING_MAX_CANDIDATES),
-  })
-  .superRefine((progress, context) => {
-    const selected = new Set(progress.selectedCandidateIds);
-    const seen = new Set<string>();
-    for (const [index, result] of progress.results.entries()) {
-      if (!selected.has(result.candidateId)) {
-        context.addIssue({
-          code: 'custom',
-          path: ['results', index, 'candidateId'],
-          message: 'unselected_candidate_result',
-        });
+function pairingProgressSchemaFor(options: PairingClockOptions = {}) {
+  return pairingSelectionSchemaFor(options)
+    .safeExtend({
+      results: z.array(pairingCandidateResultSchema).max(PAIRING_MAX_CANDIDATES),
+    })
+    .superRefine((progress, context) => {
+      const selected = new Set(progress.selectedCandidateIds);
+      const seen = new Set<string>();
+      for (const [index, result] of progress.results.entries()) {
+        if (!selected.has(result.candidateId)) {
+          context.addIssue({
+            code: 'custom',
+            path: ['results', index, 'candidateId'],
+            message: 'unselected_candidate_result',
+          });
+        }
+        if (seen.has(result.candidateId)) {
+          context.addIssue({
+            code: 'custom',
+            path: ['results', index, 'candidateId'],
+            message: 'duplicate_candidate_result',
+          });
+        }
+        seen.add(result.candidateId);
       }
-      if (seen.has(result.candidateId)) {
-        context.addIssue({
-          code: 'custom',
-          path: ['results', index, 'candidateId'],
-          message: 'duplicate_candidate_result',
-        });
-      }
-      seen.add(result.candidateId);
-    }
-  });
+    });
+}
+
+export const pairingProgressSchema = pairingProgressSchemaFor();
 
 function isLoopback(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[(.*)\]$/, '$1');
@@ -199,13 +224,25 @@ function qrServerSchema(allowLoopbackHttp: boolean) {
     });
 }
 
-export function pairingQrSchemaFor(options: { allowLoopbackHttp?: boolean } = {}) {
+export function pairingQrSchemaFor(
+  options: PairingClockOptions & { allowLoopbackHttp?: boolean } = {},
+) {
+  const now = clock(options);
   return z.strictObject({
     type: z.literal('clawmessenger_pairing'),
     version: z.literal(1),
     server: qrServerSchema(options.allowLoopbackHttp === true),
     ticket: credentialSchema,
-    expiresAt: z.number().int().positive().finite(),
+    expiresAt: z
+      .number()
+      .int()
+      .positive()
+      .finite()
+      .superRefine((value, context) => {
+        if (value <= now()) {
+          context.addIssue({ code: 'custom', message: 'pairing_expired' });
+        }
+      }),
   });
 }
 
@@ -228,9 +265,9 @@ export type PairingRegistrationAuthorization = {
 export function pairingQrContent(
   session: PairingSession,
   serverUrl: string,
-  options: { allowLoopbackHttp?: boolean } = {},
+  options: PairingClockOptions & { allowLoopbackHttp?: boolean } = {},
 ): string {
-  const parsedSession = pairingSessionSchema.parse(session);
+  const parsedSession = pairingSessionSchemaFor(options).parse(session);
   const qr = pairingQrSchemaFor(options).parse({
     type: 'clawmessenger_pairing',
     version: 1,

@@ -10,7 +10,7 @@ const TICKET = 't'.repeat(43);
 const DEVICE_SECRET = 's'.repeat(43);
 const ABUSE_KEY = 'a'.repeat(64);
 const IDEMPOTENCY_KEY = 'pairing-create-session-0001';
-const EXPIRES_AT = '2026-09-02T12:05:00.000Z';
+const EXPIRES_AT = '2099-09-02T12:05:00.000Z';
 const candidate: PairingCandidate = {
   candidateId: 'cand-opencode',
   provider: 'opencode',
@@ -186,6 +186,32 @@ describe('PairingClient', () => {
     await expect(
       new PairingClient({ serverUrl: SERVER, fetch: invalid }).pollSelection(TICKET, DEVICE_SECRET),
     ).rejects.toMatchObject({ code: 'pairing_response_invalid' });
+  });
+
+  it('rejects an expired success response using the current clock', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-02T12:00:00.000Z'));
+    try {
+      const fetchSpy = vi.fn(async () =>
+        jsonResponse(201, {
+          code: 201,
+          data: {
+            ...(sessionEnvelope() as { data: Record<string, unknown> }).data,
+            expiresAt: '2026-09-02T11:59:59.999Z',
+          },
+        }),
+      );
+
+      await expect(
+        new PairingClient({ serverUrl: SERVER, fetch: fetchSpy }).createSession({
+          installAbuseKey: ABUSE_KEY,
+          idempotencyKey: IDEMPOTENCY_KEY,
+          candidates: [candidate],
+        }),
+      ).rejects.toMatchObject({ code: 'pairing_response_invalid' });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('times out, retries once, and supports caller cancellation', async () => {

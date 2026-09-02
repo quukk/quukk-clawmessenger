@@ -9,6 +9,7 @@ import {
   pairingQrSchema,
   pairingQrSchemaFor,
   pairingSelectionSchema,
+  pairingSessionSchemaFor,
   pairingSessionSchema,
 } from './schema.js';
 
@@ -28,7 +29,7 @@ const candidate = {
 const validSession = {
   ticket: TICKET,
   deviceSecret: DEVICE_SECRET,
-  expiresAt: '2026-09-02T12:05:00.000Z',
+  expiresAt: '2099-09-02T12:05:00.000Z',
   status: 'waiting',
   candidates: [candidate],
 } as const;
@@ -86,6 +87,27 @@ describe('pairing schemas', () => {
       }),
     ).toThrow();
   });
+
+  it('rejects expired session and QR timestamps using an injected clock', () => {
+    const now = Date.parse('2026-09-02T12:00:00.000Z');
+    const expiredAt = '2026-09-02T11:59:59.999Z';
+
+    expect(() =>
+      pairingSessionSchemaFor({ now: () => now }).parse({
+        ...validSession,
+        expiresAt: expiredAt,
+      }),
+    ).toThrow('pairing_expired');
+    expect(() =>
+      pairingQrSchemaFor({ now: () => now }).parse({
+        type: 'clawmessenger_pairing',
+        version: 1,
+        server: 'https://configured.example',
+        ticket: TICKET,
+        expiresAt: Date.parse(expiredAt),
+      }),
+    ).toThrow('pairing_expired');
+  });
 });
 
 describe('pairingQrContent', () => {
@@ -121,5 +143,17 @@ describe('pairingQrContent', () => {
     expect(() =>
       pairingQrContent(validSession, 'http://example.com', { allowLoopbackHttp: true }),
     ).toThrow('pairing_server_invalid');
+  });
+
+  it('refuses to emit an expired session using the same injected clock', () => {
+    const now = Date.parse('2026-09-02T12:00:00.000Z');
+
+    expect(() =>
+      pairingQrContent(
+        { ...validSession, expiresAt: '2026-09-02T12:00:00.000Z' },
+        'https://configured.example',
+        { now: () => now },
+      ),
+    ).toThrow('pairing_expired');
   });
 });
