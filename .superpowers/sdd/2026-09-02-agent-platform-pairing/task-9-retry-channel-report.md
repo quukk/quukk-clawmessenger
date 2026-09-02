@@ -126,3 +126,22 @@ All three Important findings and the Minor polling finding were addressed with t
 - Server: `461d874 fix: validate retry tickets at command boundary`
 - npm package: `bec6932a0 fix(clawmessenger): harden retry delivery lifecycle`
 - This report update is committed separately in the npm package repository.
+
+## Independent review fix round 2
+
+The completed-registration ACK lifecycle is now bounded independently from the public registration result:
+
+- When a server-delivered retry finishes registration successfully, the public state remains `completed`, while the private session, controller, and exact-expiry timer stay alive only until the ACK settles.
+- A retryable ACK keeps the same request ID and ACK idempotency key and never repeats registration.
+- Exact expiry aborts the ACK sleep/request, clears private credentials and timers, and leaves the already-completed registration result as `completed`.
+- Calling local `cancel()` while a completed ACK is pending aborts and awaits that private lifecycle without sending a server cancellation and without changing `completed` to `cancelled`.
+- Successful ACK completion clears the retained private session through the watcher finalizer.
+
+TDD and verification evidence:
+
+- Red: `corepack pnpm exec vitest run src/pairing/service.test.ts -t "completed ACK" --reporter=verbose` -> **2 failed, 26 skipped**. Both exact-expiry and local-cancel cases showed the retry sleep signal remained un-aborted.
+- Green focused: the same command -> **2 passed, 26 skipped**.
+- Full package suite: `corepack pnpm --filter quukk-clawmessenger test` -> **35 test files, 1001 passed**.
+- Type check: `corepack pnpm --filter quukk-clawmessenger typecheck` -> **passed**.
+- Fix commit: `1530e6184 fix(clawmessenger): bound completed retry acknowledgements`.
+- This report and the Task 9 ledger report are committed separately. `progress.md` was not edited.
