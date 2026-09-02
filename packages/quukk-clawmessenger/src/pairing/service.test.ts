@@ -1,0 +1,427 @@
+// @vitest-environment node
+
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import type { RuntimeBinding, TrustedRuntime } from '../config/schema.js';
+import type { EnableResult } from '../bindings/service.js';
+import { PairingClientError, type CreatePairingSessionInput } from './client.js';
+import { PairingService } from './service.js';
+import type { PairingRegistrationAuthorization, PairingSelection, PairingSession } from './schema.js';
+
+const NOW = Date.parse('2026-09-02T00:00:00.000Z');
+const EXPIRES_AT = '2026-09-02T00:05:00.000Z';
+const INSTALL_ABUSE_KEY = 'a'.repeat(64);
+const providerMarker = { opencode: 'a', openclaw: 'b', codex: 'c', hermes: 'd' } as const;
+
+function runtime(
+  provider: keyof typeof providerMarker,
+  overrides: Partial<TrustedRuntime & { version?: string | null }> = {},
+): TrustedRuntime & { version?: string | null } {
+  return {
+    id: `rt_${providerMarker[provider].repeat(32)}`,
+    provider,
+    path: process.platform === 'win32' ? `C:\\tools\\${provider}.exe` : `/tools/${provider}`,
+    status: 'ready',
+    ...overrides,
+  };
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+function binding(selected: TrustedRuntime): RuntimeBinding {
+  return {
+    runtimeId: selected.id,
+    runtimePath: selected.path,
+    provider: selected.provider,
+    enabled: true,
+    nodeId: `${selected.provider}_paired`,
+    nodeName: `fixture · ${selected.provider}`,
+    tokenRef: `rc_${providerMarker[selected.provider].repeat(32)}`,
+    registrationState: 'offline',
+    updatedAt: '2026-09-02T00:00:01.000Z',
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+class FakeRuntimeSource {
+  constructor(public snapshot: readonly TrustedRuntime[]) {}
+
+  async runtimes(): Promise<readonly TrustedRuntime[]> {
+    return this.snapshot.map((entry) => ({ ...entry }));
+  }
+}
+
+class FakeBindings {
+  readonly calls: Array<{
+    runtimeId: string;
+    authorization: PairingRegistrationAuthorization;
+  }> = [];
+  currentBindings: RuntimeBinding[] = [];
+  outcomes = new Map<string, EnableResult[]>();
+
+  list(): readonly RuntimeBinding[] {
+    return this.currentBindings.map((entry) => ({ ...entry }));
+  }
+
+  async enablePairingSelection(input: {
+    runtimeId: string;
+    authorization: PairingRegistrationAuthorization;
+  }): Promise<EnableResult> {
+    this.calls.push({ ...input, authorization: { ...input.authorization } });
+    const queued = this.outcomes.get(input.runtimeId);
+    const outcome = queued?.shift();
+    if (outcome !== undefined) return outcome;
+    const selected = runtime(
+      (Object.entries(providerMarker).find(([, marker]) => input.runtimeId.endsWith(marker.repeat(32)))?.[0]
+        ?? 'codex') as keyof typeof providerMarker,
+      { id: input.runtimeId },
+    );
+    return { runtimeId: input.runtimeId, ok: true, binding: binding(selected) };
+  }
+}
+
+class FakePairingClient {
+  readonly createCalls: CreatePairingSessionInput[] = [];
+  readonly pollCalls: Array<{ ticket: string; deviceSecret: string; signal?: AbortSignal }> = [];
+  readonly cancelCalls: Array<{
+    ticket: string;
+    deviceSecret: string;
+    idempotencyKey: string;
+  }> = [];
+  readonly selections: Array<ReturnType<typeof deferred<PairingSelection>>> = [];
+
+  async createSession(input: CreatePairingSessionInput): Promise<PairingSession> {
+    this.createCalls.push({ ...input, candidates: input.candidates.map((candidate) => ({ ...candidate })) });
+    const marker = String.fromCharCode(84 + this.createCalls.length - 1);
+    return {
+      ticket: marker.repeat(43),
+      deviceSecret: marker.toLowerCase().repeat(43),
+      expiresAt: EXPIRES_AT,
+      status: 'waiting',
+      candidates: input.candidates.map((candidate) => ({ ...candidate })),
+    };
+  }
+
+  pollSelection(
+    ticket: string,
+    deviceSecret: string,
+    signal?: AbortSignal,
+  ): Promise<PairingSelection> {
+    this.pollCalls.push({ ticket, deviceSecret, signal });
+    const selection = deferred<PairingSelection>();
+    this.selections.push(selection);
+    signal?.addEventListener('abort', () => {
+      selection.reject(new PairingClientError('pairing_cancelled', 'transport', false));
+    }, { once: true });
+    return selection.promise;
+  }
+
+  async cancelSession(
+    ticket: string,
+    deviceSecret: string,
+    idempotencyKey: string,
+  ): Promise<PairingSelection> {
+    this.cancelCalls.push({ ticket, deviceSecret, idempotencyKey });
+    const candidates = this.createCalls.at(-1)?.candidates ?? [];
+    return { status: 'cancelled', selectedCandidateIds: [], candidates, expiresAt: EXPIRES_AT };
+  }
+}
+
+function selected(
+  client: FakePairingClient,
+  candidateIds: string[],
+  overrides: Partial<PairingSelection> = {},
+): PairingSelection {
+  return {
+    status: 'processing',
+    selectedCandidateIds: candidateIds,
+    candidates: client.createCalls.at(-1)!.candidates.map((candidate) => ({ ...candidate })),
+    expiresAt: EXPIRES_AT,
+    ...overrides,
+  };
+}
+
+function harness(
+  runtimes: readonly TrustedRuntime[] = [runtime('opencode'), runtime('codex')],
+  options: { client?: FakePairingClient; bindings?: FakeBindings; randomStart?: number } = {},
+) {
+  const client = options.client ?? new FakePairingClient();
+  const bindings = options.bindings ?? new FakeBindings();
+  const source = new FakeRuntimeSource(runtimes);
+  let randomValue = options.randomStart ?? 1;
+  const randomBytes = vi.fn((size: number) => Buffer.alloc(size, randomValue++));
+  const service = new PairingService({
+    client,
+    bindings,
+    runtimeSource: source,
+    installAbuseKey: INSTALL_ABUSE_KEY,
+    now: () => NOW,
+    randomBytes,
+    sleep: async (_milliseconds: number, signal: AbortSignal) => {
+      if (signal.aborted) throw new PairingClientError('pairing_cancelled', 'transport', false);
+    },
+  });
+  return { service, client, bindings, source, randomBytes };
+}
+
+describe('PairingService', () => {
+  it('creates sanitized candidates with random 128-bit session-scoped IDs and no default selection', async () => {
+    const notReady = runtime('hermes', { status: 'needs_auth' });
+    const conflicting = runtime('codex');
+    const fixture = harness([runtime('opencode', { version: '1.2.3' }), notReady, conflicting]);
+    fixture.bindings.currentBindings = [binding(runtime('codex', {
+      id: `rt_${'e'.repeat(32)}`,
+      path: process.platform === 'win32' ? 'C:\\tools\\codex-other.exe' : '/tools/codex-other',
+    }))];
+
+    const snapshot = await fixture.service.start();
+    const request = fixture.client.createCalls[0]!;
+
+    expect(fixture.randomBytes.mock.calls.every(([size]) => size === 16)).toBe(true);
+    expect(new Set(request.candidates.map((candidate) => candidate.candidateId)).size).toBe(3);
+    expect(request.candidates.every((candidate) => candidate.candidateId.length === 22)).toBe(true);
+    expect(request.candidates).toEqual([
+      expect.objectContaining({
+        provider: 'opencode',
+        version: '1.2.3',
+        readiness: 'ready',
+        registrationState: 'unregistered',
+      }),
+      expect.objectContaining({ provider: 'hermes', readiness: 'not_ready', statusReason: 'needs_auth' }),
+      expect.objectContaining({ provider: 'codex', readiness: 'not_ready', statusReason: 'provider_conflict' }),
+    ]);
+    expect(snapshot.results).toEqual([]);
+    expect(fixture.bindings.calls).toEqual([]);
+    expect(JSON.stringify(request.candidates)).not.toMatch(/runtimeId|runtimePath|\\tools\\|\/tools\//);
+    await fixture.service.cancel();
+  });
+
+  it('registers exactly the selected ready runtimes', async () => {
+    const opencode = runtime('opencode');
+    const codex = runtime('codex');
+    const fixture = harness([opencode, codex]);
+
+    await fixture.service.start();
+    const opencodeCandidate = fixture.client.createCalls[0]!.candidates.find(
+      (candidate) => candidate.provider === 'opencode',
+    )!;
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [opencodeCandidate.candidateId]));
+    await fixture.service.waitForTerminal();
+
+    expect(fixture.bindings.calls).toHaveLength(1);
+    expect(fixture.bindings.calls[0]).toMatchObject({
+      runtimeId: opencode.id,
+      authorization: {
+        ticket: 'T'.repeat(43),
+        deviceSecret: 't'.repeat(43),
+        candidateId: opencodeCandidate.candidateId,
+      },
+    });
+    expect(fixture.bindings.calls).not.toContainEqual(expect.objectContaining({ runtimeId: codex.id }));
+    expect(fixture.service.snapshot()).toMatchObject({
+      state: 'completed',
+      results: [{ candidateId: opencodeCandidate.candidateId, status: 'bound', retryable: false }],
+    });
+  });
+
+  it('keeps polling without a default selection and registers only after confirmation', async () => {
+    const fixture = harness([runtime('codex')]);
+    await fixture.service.start();
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [], { status: 'waiting' }));
+
+    await vi.waitFor(() => expect(fixture.client.selections).toHaveLength(2));
+    expect(fixture.bindings.calls).toEqual([]);
+    const candidateId = fixture.client.createCalls[0]!.candidates[0]!.candidateId;
+    fixture.client.selections[1]!.resolve(selected(fixture.client, [candidateId]));
+    await fixture.service.waitForTerminal();
+
+    expect(fixture.bindings.calls).toHaveLength(1);
+    expect(fixture.bindings.calls[0]!.authorization.candidateId).toBe(candidateId);
+  });
+
+  it('cancels the previous active session before generating a replacement', async () => {
+    const fixture = harness([runtime('codex')]);
+    const first = await fixture.service.start();
+
+    const second = await fixture.service.start();
+
+    expect(fixture.client.createCalls).toHaveLength(2);
+    expect(fixture.client.cancelCalls).toEqual([
+      expect.objectContaining({ ticket: first.ticket, deviceSecret: 't'.repeat(43) }),
+    ]);
+    expect(second.ticket).not.toBe(first.ticket);
+    await fixture.service.cancel();
+  });
+
+  it('invalidates in-memory session credentials on restart and creates a fresh session', async () => {
+    const client = new FakePairingClient();
+    const first = harness([runtime('codex')], { client, randomStart: 10 });
+    const initial = await first.service.start();
+    const restarted = harness([runtime('codex')], { client, randomStart: 20 });
+
+    await restarted.service.recover();
+    const recovered = restarted.service.snapshot();
+
+    expect(client.createCalls).toHaveLength(2);
+    expect(recovered.state).toBe('waiting');
+    expect(recovered.ticket).not.toBe(initial.ticket);
+    expect(client.createCalls[1]!.candidates[0]!.candidateId)
+      .not.toBe(client.createCalls[0]!.candidates[0]!.candidateId);
+    await first.service.cancel();
+    await restarted.service.cancel();
+  });
+
+  it('keeps partial results and retries only retryable failed selected candidates', async () => {
+    const opencode = runtime('opencode');
+    const codex = runtime('codex');
+    const hermes = runtime('hermes');
+    const fixture = harness([opencode, codex, hermes]);
+    fixture.bindings.outcomes.set(opencode.id, [
+      { runtimeId: opencode.id, ok: true, binding: binding(opencode) },
+    ]);
+    fixture.bindings.outcomes.set(codex.id, [
+      { runtimeId: codex.id, ok: false, errorCode: 'registration_transport' },
+      { runtimeId: codex.id, ok: true, binding: binding(codex) },
+    ]);
+    fixture.bindings.outcomes.set(hermes.id, [
+      { runtimeId: hermes.id, ok: false, errorCode: 'registration_rejected' },
+    ]);
+
+    await fixture.service.start();
+    const candidates = fixture.client.createCalls[0]!.candidates;
+    const byProvider = new Map(candidates.map((candidate) => [candidate.provider, candidate]));
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [
+      byProvider.get('opencode')!.candidateId,
+      byProvider.get('codex')!.candidateId,
+      byProvider.get('hermes')!.candidateId,
+    ]));
+    await fixture.service.waitForTerminal();
+
+    expect(fixture.service.snapshot().state).toBe('partial');
+    await fixture.service.retryFailed([
+      byProvider.get('codex')!.candidateId,
+      byProvider.get('hermes')!.candidateId,
+      'unselected-candidate',
+      byProvider.get('codex')!.candidateId,
+    ]);
+    await fixture.service.waitForTerminal();
+
+    expect(fixture.bindings.calls.filter((call) => call.runtimeId === codex.id)).toHaveLength(2);
+    expect(fixture.bindings.calls.filter((call) => call.runtimeId === hermes.id)).toHaveLength(1);
+    expect(fixture.bindings.calls.filter((call) => call.runtimeId === opencode.id)).toHaveLength(1);
+    expect(fixture.bindings.calls[3]!.authorization.idempotencyKey)
+      .not.toBe(fixture.bindings.calls[1]!.authorization.idempotencyKey);
+    expect(fixture.service.snapshot()).toMatchObject({
+      state: 'partial',
+      results: expect.arrayContaining([
+        expect.objectContaining({ candidateId: byProvider.get('codex')!.candidateId, status: 'bound' }),
+        expect.objectContaining({
+          candidateId: byProvider.get('hermes')!.candidateId,
+          status: 'failed',
+          errorCode: 'registration_rejected',
+          retryable: false,
+        }),
+      ]),
+    });
+  });
+
+  it('records a disappeared selected runtime as runtime_unavailable without registration transport', async () => {
+    const codex = runtime('codex');
+    const fixture = harness([codex]);
+    fixture.bindings.outcomes.set(codex.id, [
+      { runtimeId: codex.id, ok: false, errorCode: 'runtime_unavailable' },
+      { runtimeId: codex.id, ok: true, binding: binding(codex) },
+    ]);
+    await fixture.service.start();
+    const candidateId = fixture.client.createCalls[0]!.candidates[0]!.candidateId;
+
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [candidateId]));
+    await fixture.service.waitForTerminal();
+
+    expect(fixture.service.snapshot()).toMatchObject({
+      state: 'partial',
+      results: [{ candidateId, status: 'failed', errorCode: 'runtime_unavailable', retryable: true }],
+    });
+
+    await fixture.service.retryFailed([candidateId]);
+    await fixture.service.waitForTerminal();
+    expect(fixture.bindings.calls).toHaveLength(2);
+    expect(fixture.service.snapshot()).toMatchObject({
+      state: 'completed',
+      results: [{ candidateId, status: 'bound', retryable: false }],
+    });
+  });
+
+  it('aborts polling and prevents registration after cancellation', async () => {
+    const fixture = harness([runtime('codex')]);
+    await fixture.service.start();
+    const pollSignal = fixture.client.pollCalls[0]!.signal!;
+
+    await fixture.service.cancel();
+    await fixture.service.waitForTerminal();
+
+    expect(pollSignal.aborted).toBe(true);
+    expect(fixture.client.cancelCalls).toHaveLength(1);
+    expect(fixture.bindings.calls).toEqual([]);
+    expect(fixture.service.snapshot().state).toBe('cancelled');
+  });
+
+  it('expires locally before registering a late selection', async () => {
+    let now = NOW;
+    const client = new FakePairingClient();
+    const bindings = new FakeBindings();
+    const source = new FakeRuntimeSource([runtime('codex')]);
+    const service = new PairingService({
+      client,
+      bindings,
+      runtimeSource: source,
+      installAbuseKey: INSTALL_ABUSE_KEY,
+      now: () => now,
+      randomBytes: (size: number) => Buffer.alloc(size, 7),
+      sleep: async () => undefined,
+    });
+    await service.start();
+    const candidateId = client.createCalls[0]!.candidates[0]!.candidateId;
+    now = Date.parse(EXPIRES_AT);
+
+    client.selections[0]!.resolve(selected(client, [candidateId]));
+    await service.waitForTerminal();
+
+    expect(bindings.calls).toEqual([]);
+    expect(service.snapshot().state).toBe('expired');
+  });
+
+  it('aborts an unanswered poll when the session deadline elapses', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const client = new FakePairingClient();
+    const bindings = new FakeBindings();
+    const service = new PairingService({
+      client,
+      bindings,
+      runtimeSource: new FakeRuntimeSource([runtime('codex')]),
+      installAbuseKey: INSTALL_ABUSE_KEY,
+      randomBytes: (size: number) => Buffer.alloc(size, 8),
+    });
+    await service.start();
+    const pollSignal = client.pollCalls[0]!.signal!;
+
+    await vi.advanceTimersByTimeAsync(Date.parse(EXPIRES_AT) - NOW);
+    await service.waitForTerminal();
+
+    expect(pollSignal.aborted).toBe(true);
+    expect(bindings.calls).toEqual([]);
+    expect(service.snapshot().state).toBe('expired');
+  });
+});

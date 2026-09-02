@@ -20,6 +20,7 @@ import {
   type RegistrationInput,
   type RegistrationResult,
 } from '../registration/client.js';
+import type { PairingRegistrationAuthorization } from '../pairing/schema.js';
 
 const TIME_0 = '2026-08-27T00:00:00.000Z';
 const TIME_1 = '2026-08-27T00:01:00.000Z';
@@ -58,6 +59,18 @@ function deferred<T>() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function pairingAuthorization(
+  overrides: Partial<PairingRegistrationAuthorization> = {},
+): PairingRegistrationAuthorization {
+  return {
+    ticket: 'T'.repeat(43),
+    deviceSecret: 'S'.repeat(43),
+    candidateId: 'candidate_codex',
+    idempotencyKey: 'pairing-candidate-attempt-1',
+    ...overrides,
+  };
 }
 
 class FakeRegistrationClient {
@@ -206,6 +219,47 @@ describe('BindingService', () => {
       runtimeId: selected.id,
       provider: 'codex',
     });
+  });
+
+  it('registers a selected pairing candidate through the existing persistence flow', async () => {
+    const selected = runtime('codex');
+    const fixture = await harness([selected]);
+    const authorization = pairingAuthorization();
+
+    const result = await fixture.service.enablePairingSelection({
+      runtimeId: selected.id,
+      authorization,
+    });
+
+    expect(result).toMatchObject({ ok: true, runtimeId: selected.id });
+    expect(fixture.registration.registerCalls).toEqual([
+      expect.objectContaining({ runtimeId: selected.id, authorization }),
+    ]);
+    expect(fixture.service.list()).toEqual([
+      expect.objectContaining({
+        runtimeId: selected.id,
+        enabled: true,
+        registrationState: 'offline',
+      }),
+    ]);
+    expect((await fixture.store.snapshot()).bindings).toHaveLength(1);
+  });
+
+  it.each([
+    [undefined, 'runtime_unavailable'],
+    [runtime('codex', { status: 'needs_auth' }), 'runtime_not_ready'],
+  ] as const)('revalidates a selected pairing runtime before registration', async (current, errorCode) => {
+    const selected = runtime('codex');
+    const fixture = await harness(current === undefined ? [] : [current]);
+
+    await expect(fixture.service.enablePairingSelection({
+      runtimeId: selected.id,
+      authorization: pairingAuthorization(),
+    })).resolves.toEqual({ runtimeId: selected.id, ok: false, errorCode });
+
+    expect(fixture.registration.appKeyCalls).toEqual([]);
+    expect(fixture.registration.registerCalls).toEqual([]);
+    expect(fixture.service.list()).toEqual([]);
   });
 
   it.each(['needs_auth', 'found_not_runnable', 'not_found', 'probe_failed'] as const)(

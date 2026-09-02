@@ -16,6 +16,7 @@ import {
   type RegistrationInput,
   type RefreshInput,
 } from '../registration/client.js';
+import type { PairingRegistrationAuthorization } from '../pairing/schema.js';
 
 export type EnableResult =
   | { runtimeId: string; ok: true; binding: RuntimeBinding }
@@ -23,6 +24,11 @@ export type EnableResult =
 
 export type TrustedRuntimeSource = {
   runtimes(): Promise<readonly TrustedRuntime[]>;
+};
+
+export type PairingSelectionInput = {
+  runtimeId: string;
+  authorization: PairingRegistrationAuthorization;
 };
 
 type RegistrationPort = Pick<RegistrationClient, 'getAppKey' | 'register' | 'refreshToken'>;
@@ -244,6 +250,39 @@ export class BindingService {
     );
   }
 
+  async enablePairingSelection(
+    input: PairingSelectionInput,
+    signal?: AbortSignal,
+  ): Promise<EnableResult> {
+    try {
+      this.#store.assertExternalMutationAllowed();
+    } catch (error) {
+      return failure(input.runtimeId, stableErrorCode(error));
+    }
+    return this.#enqueueExclusive(input.runtimeId, async () => {
+      let catalog: readonly TrustedRuntime[];
+      let config: Awaited<ReturnType<LocalStore['snapshot']>>['config'];
+      try {
+        [catalog, { config }] = await Promise.all([
+          this.#runtimeSource.runtimes(),
+          this.#configSnapshot(),
+        ]);
+      } catch {
+        return failure(input.runtimeId, 'runtime_unavailable');
+      }
+      const runtime = catalog.find((candidate) => candidate.id === input.runtimeId);
+      if (runtime === undefined) return failure(input.runtimeId, 'runtime_unavailable');
+      const runtimeError = trustedRuntimeError(runtime);
+      if (runtimeError !== undefined) return failure(input.runtimeId, runtimeError);
+      return this.#enablePairingRuntime(
+        runtime,
+        config.serverUrl,
+        input.authorization,
+        signal,
+      );
+    });
+  }
+
   async #enableRuntime(
     runtime: TrustedRuntime,
     serverUrl: string,
@@ -301,6 +340,46 @@ export class BindingService {
     }
   }
 
+  async #enablePairingRuntime(
+    runtime: TrustedRuntime,
+    serverUrl: string,
+    authorization: PairingRegistrationAuthorization,
+    signal?: AbortSignal,
+  ): Promise<EnableResult> {
+    const existing = this.#bindings.get(runtime.id);
+    if (
+      existing !== undefined
+      && (existing.provider !== runtime.provider || existing.runtimePath !== runtime.path)
+    ) {
+      return failure(runtime.id, 'runtime_identity_changed');
+    }
+    const providerOwner = [...this.#bindings.values()].find(
+      (binding) => binding.provider === runtime.provider && binding.runtimeId !== runtime.id,
+    );
+    if (providerOwner !== undefined) return failure(runtime.id, 'provider_conflict');
+    const claimant = this.#providerClaims.get(runtime.provider);
+    if (claimant !== undefined && claimant !== runtime.id) {
+      return failure(runtime.id, 'provider_conflict');
+    }
+    this.#providerClaims.set(runtime.provider, runtime.id);
+    try {
+      return await this.#register(
+        runtime,
+        existing,
+        false,
+        serverUrl,
+        () => this.#registrationClient.getAppKey(serverUrl, signal),
+        true,
+        authorization,
+        signal,
+      );
+    } finally {
+      if (this.#providerClaims.get(runtime.provider) === runtime.id) {
+        this.#providerClaims.delete(runtime.provider);
+      }
+    }
+  }
+
   async #register(
     runtime: TrustedRuntime,
     previous: RuntimeBinding | undefined,
@@ -308,6 +387,8 @@ export class BindingService {
     serverUrl: string,
     appKey: () => Promise<string>,
     enabledOnSuccess: boolean,
+    authorization?: PairingRegistrationAuthorization,
+    signal?: AbortSignal,
   ): Promise<EnableResult> {
     const pending: RuntimeBinding = {
       runtimeId: runtime.id,
@@ -332,11 +413,12 @@ export class BindingService {
         bridgeSecret: identity.secret,
         provider: runtime.provider,
         nodeName: pending.nodeName,
+        ...(authorization === undefined ? {} : { authorization }),
         ...(sameServerIdentity && previous?.nodeId !== undefined
           ? { existingNodeId: previous.nodeId }
           : {}),
       };
-      const registered = await this.#registrationClient.register(input);
+      const registered = await this.#registrationClient.register(input, signal);
       const committed = await this.#store.commitRegistration(
         {
           ...pending,

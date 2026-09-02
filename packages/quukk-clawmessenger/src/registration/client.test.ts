@@ -9,6 +9,7 @@ import {
   type RefreshInput,
   type RegistrationInput,
 } from './client.js';
+import type { PairingRegistrationAuthorization } from '../pairing/schema.js';
 
 const INSTALL_A = '123e4567-e89b-42d3-a456-426614174000';
 const INSTALL_B = '123e4567-e89b-42d3-b456-426614174001';
@@ -104,6 +105,18 @@ function registrationInput(overrides: Partial<RegistrationInput> = {}): Registra
     bridgeSecret: BRIDGE_SECRET,
     provider: 'codex',
     nodeName: 'fixture-host · Codex',
+    ...overrides,
+  };
+}
+
+function pairingAuthorization(
+  overrides: Partial<PairingRegistrationAuthorization> = {},
+): PairingRegistrationAuthorization {
+  return {
+    ticket: 'T'.repeat(43),
+    deviceSecret: 'S'.repeat(43),
+    candidateId: 'candidate_codex',
+    idempotencyKey: 'pairing-candidate-attempt-1',
     ...overrides,
   };
 }
@@ -205,6 +218,36 @@ describe('RegistrationClient', () => {
       nodeName: 'fixture-host · Codex',
       token: 'rongcloud-token',
     });
+  });
+
+  it('uses only pairing authorization for credential-bearing selected candidate registration', async () => {
+    const transport = fakeFetch(jsonResponse(successEnvelope('codex')));
+    const client = new RegistrationClient({ fetch: transport.fetch, networkInterfaces: () => ({}) });
+    const authorization = pairingAuthorization();
+
+    await client.register(registrationInput({ authorization }));
+
+    expect(transport.calls[0]?.url).toBe(
+      `https://example.test/im/api/ai/pairing/sessions/${authorization.ticket}`
+      + `/candidates/${authorization.candidateId}/register`,
+    );
+    expect(headers(transport.calls[0]!)).toMatchObject({
+      authorization: `Pairing ${authorization.deviceSecret}`,
+      'idempotency-key': authorization.idempotencyKey,
+    });
+    expect(headers(transport.calls[0]!)).not.toHaveProperty('x-node-enrollment-token');
+    expect(JSON.stringify(body(transport.calls[0]!))).not.toContain(authorization.ticket);
+    expect(JSON.stringify(body(transport.calls[0]!))).not.toContain(authorization.deviceSecret);
+  });
+
+  it('rejects malformed pairing registration context before transport', async () => {
+    const transport = fakeFetch(jsonResponse(successEnvelope('codex')));
+    const client = new RegistrationClient({ fetch: transport.fetch, networkInterfaces: () => ({}) });
+
+    await expect(client.register(registrationInput({
+      authorization: pairingAuthorization({ deviceSecret: 'short' }),
+    }))).rejects.toMatchObject({ code: 'registration_rejected', retryable: false });
+    expect(transport.calls).toEqual([]);
   });
 
   it('normalizes, filters, deduplicates, and globally prefers hardware MAC addresses', async () => {

@@ -11,6 +11,12 @@ import {
   type Provider,
   type RegistrationErrorCode,
 } from '../config/schema.js';
+import {
+  PAIRING_CANDIDATE_ID_PATTERN,
+  PAIRING_CREDENTIAL_PATTERN,
+  PAIRING_IDEMPOTENCY_KEY_PATTERN,
+  type PairingRegistrationAuthorization,
+} from '../pairing/schema.js';
 import { CLAWMESSENGER_NODE_CAPABILITIES } from './capabilities.js';
 
 const RESPONSE_LIMIT = 65_536;
@@ -26,6 +32,7 @@ export type RegistrationInput = {
   nodeName: string;
   existingNodeId?: string;
   existingNodeToken?: string;
+  authorization?: PairingRegistrationAuthorization;
 };
 
 export type RefreshInput = {
@@ -163,6 +170,19 @@ function validateCredentialToken(token: string | undefined): void {
   if (
     token !== undefined &&
     (token.length === 0 || token.length > 16_384 || token !== token.trim())
+  ) {
+    throw new RegistrationError('registration_rejected', 'validation', false);
+  }
+}
+
+function validatePairingAuthorization(
+  authorization: PairingRegistrationAuthorization,
+): void {
+  if (
+    !PAIRING_CREDENTIAL_PATTERN.test(authorization.ticket)
+    || !PAIRING_CREDENTIAL_PATTERN.test(authorization.deviceSecret)
+    || !PAIRING_CANDIDATE_ID_PATTERN.test(authorization.candidateId)
+    || !PAIRING_IDEMPOTENCY_KEY_PATTERN.test(authorization.idempotencyKey)
   ) {
     throw new RegistrationError('registration_rejected', 'validation', false);
   }
@@ -411,6 +431,12 @@ export class RegistrationClient {
       throw new RegistrationError('registration_node_mismatch', 'validation', false);
     }
     validateCredentialToken(input.existingNodeToken);
+    if (input.authorization !== undefined) {
+      validatePairingAuthorization(input.authorization);
+      if (input.existingNodeId !== undefined || input.existingNodeToken !== undefined) {
+        throw new RegistrationError('registration_rejected', 'validation', false);
+      }
+    }
     const requestBody: Record<string, unknown> = {
       name: input.nodeName,
       mac_address: stableMac(input.installId, this.#networkInterfaces),
@@ -422,14 +448,22 @@ export class RegistrationClient {
     const headers: Record<string, string> = {
       Accept: 'application/json',
       'Content-Type': 'application/json',
-      'X-Node-Enrollment-Token': enrollmentToken(secret, server, input.runtimeId),
     };
-    if (input.existingNodeToken !== undefined) {
+    let url = `${server}/api/ai/register`;
+    if (input.authorization !== undefined) {
+      headers.Authorization = `Pairing ${input.authorization.deviceSecret}`;
+      headers['Idempotency-Key'] = input.authorization.idempotencyKey;
+      url = `${server}/api/ai/pairing/sessions/${encodeURIComponent(input.authorization.ticket)}`
+        + `/candidates/${encodeURIComponent(input.authorization.candidateId)}/register`;
+    } else {
+      headers['X-Node-Enrollment-Token'] = enrollmentToken(secret, server, input.runtimeId);
+    }
+    if (input.authorization === undefined && input.existingNodeToken !== undefined) {
       headers.Authorization = `Bearer ${input.existingNodeToken}`;
     }
     const response = await this.#request(
       'register',
-      `${server}/api/ai/register`,
+      url,
       { method: 'POST', headers, body: JSON.stringify(requestBody) },
       signal,
     );
