@@ -43,6 +43,20 @@
       "licenseSha256": "b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57"
     },
     {
+      "name": "prop-types",
+      "version": "15.8.1",
+      "license": "MIT",
+      "licenseFile": "LICENSE",
+      "licenseSha256": "f657f99d3fb9647db92628e96007aabb46e5f04f33e49999075aab8e250ca7ce"
+    },
+    {
+      "name": "qr.js",
+      "version": "0.0.0",
+      "license": "MIT",
+      "licenseFile": "LICENSE",
+      "licenseSha256": "708c307e215ec79b4db6dadf52e2a5dd15cb6913797031143f6b095cc2fc304a"
+    },
+    {
       "name": "react",
       "version": "19.2.3",
       "license": "MIT",
@@ -55,6 +69,13 @@
       "license": "MIT",
       "licenseFile": "LICENSE",
       "licenseSha256": "da6d3703ed11cbe42bd212c725957c98da23cbff1998c05fa4b3d976d1a58e93"
+    },
+    {
+      "name": "react-qr-code",
+      "version": "2.0.18",
+      "license": "MIT",
+      "licenseFile": "LICENSE",
+      "licenseSha256": "59ed3467c4626a81f5408114cff30346c9d82dca67b0b60805747eabc70490ff"
     },
     {
       "name": "reselect",

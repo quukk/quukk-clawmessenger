@@ -99,14 +99,81 @@ the embedded package license files by `scripts/audit-bridge-ui-licenses.mjs`.
 | `class-variance-authority@0.7.1` | Apache-2.0 | https://www.npmjs.com/package/class-variance-authority/v/0.7.1 | `0ccbf956cffc8dcf515809433cb5242ee67c94513d46e48c261d68d0880de406` |
 | `clsx@2.1.1` | MIT | https://www.npmjs.com/package/clsx/v/2.1.1 | `9a9edad7baae52622bddf3c15b2ef8a33d2c89f2d25408ad13e8a7481c6b0c97` |
 | `lucide-react@1.0.1` | ISC and Feather MIT notice | https://www.npmjs.com/package/lucide-react/v/1.0.1 | `b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57` |
+| `prop-types@15.8.1` | MIT | https://www.npmjs.com/package/prop-types/v/15.8.1 | `f657f99d3fb9647db92628e96007aabb46e5f04f33e49999075aab8e250ca7ce` |
+| `qr.js@0.0.0` | MIT | https://www.npmjs.com/package/qr.js/v/0.0.0 | `708c307e215ec79b4db6dadf52e2a5dd15cb6913797031143f6b095cc2fc304a` |
 | `react@19.2.3` | MIT | https://www.npmjs.com/package/react/v/19.2.3 | `da6d3703ed11cbe42bd212c725957c98da23cbff1998c05fa4b3d976d1a58e93` |
 | `react-dom@19.2.3` | MIT | https://www.npmjs.com/package/react-dom/v/19.2.3 | `da6d3703ed11cbe42bd212c725957c98da23cbff1998c05fa4b3d976d1a58e93` |
+| `react-qr-code@2.0.18` | MIT | https://www.npmjs.com/package/react-qr-code/v/2.0.18 | `59ed3467c4626a81f5408114cff30346c9d82dca67b0b60805747eabc70490ff` |
 | `reselect@5.1.1` | MIT | https://www.npmjs.com/package/reselect/v/5.1.1 | `0bb5035e49bf9b5661655b402bab3c3efccb8eab2a50e37392100139fe3280f2` |
 | `scheduler@0.27.0` | MIT | https://www.npmjs.com/package/scheduler/v/0.27.0 | `da6d3703ed11cbe42bd212c725957c98da23cbff1998c05fa4b3d976d1a58e93` |
 | `tabbable@6.4.0` | MIT | https://www.npmjs.com/package/tabbable/v/6.4.0 | `8e714750725e75c8b31172ef84c0805f94873f86e3b5cfca8a948553f0778fa1` |
 | `tailwind-merge@3.5.0` | MIT | https://www.npmjs.com/package/tailwind-merge/v/3.5.0 | `d4c70c7ce38cea8778f0aed3fc0bef0a9dbd27f13bd8b6773cbd6d37941971e5` |
 | `use-sync-external-store@1.6.0` | MIT | https://www.npmjs.com/package/use-sync-external-store/v/1.6.0 | `da6d3703ed11cbe42bd212c725957c98da23cbff1998c05fa4b3d976d1a58e93` |
 | `zod@4.3.6` | MIT | https://www.npmjs.com/package/zod/v/4.3.6 | `3f1189b28e3866e0d979968d466b78f813f76827cfdca1fbb124cc0a5c8841f8` |
+
+### Prop Types
+
+```text
+MIT License
+
+Copyright (c) 2013-present, Facebook, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### qr.js
+
+```text
+Copyright (c) 2013 Roman Shtylman
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+### React QR Code
+
+```text
+MIT License
+
+Copyright (c) 2017 Ross Khanas
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
 ### Base UI (`@base-ui/react`, `@base-ui/utils`)
 
