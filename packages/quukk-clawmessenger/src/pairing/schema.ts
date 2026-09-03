@@ -64,11 +64,12 @@ export const pairingCandidateSchema = z.strictObject({
   registrationState: z.enum(PAIRING_REGISTRATION_STATES),
 });
 
-const candidatesSchema = z
-  .array(pairingCandidateSchema)
-  .min(1)
-  .max(PAIRING_MAX_CANDIDATES)
-  .superRefine((candidates, context) => {
+function candidatesSchemaFor(minimum: number) {
+  return z
+    .array(pairingCandidateSchema)
+    .min(minimum)
+    .max(PAIRING_MAX_CANDIDATES)
+    .superRefine((candidates, context) => {
     const seen = new Set<string>();
     for (const [index, candidate] of candidates.entries()) {
       if (seen.has(candidate.candidateId)) {
@@ -81,6 +82,29 @@ const candidatesSchema = z
       seen.add(candidate.candidateId);
     }
   });
+}
+
+const candidatesSchema = candidatesSchemaFor(1);
+const candidatesV2Schema = candidatesSchemaFor(0);
+
+export function pairingSessionV2SchemaFor(options: PairingClockOptions = {}) {
+  const now = clock(options);
+  return z.strictObject({
+    ticket: credentialSchema,
+    deviceSecret: credentialSchema,
+    pairingCode: z.string().regex(/^[ABCDEFGHJKMNPQRSTVWXYZ23456789]{8}$/),
+    expiresAt: z.iso.datetime({ offset: true }).superRefine((value, context) => {
+      const remaining = Date.parse(value) - now();
+      if (remaining <= 0 || remaining > 600_000) {
+        context.addIssue({ code: 'custom', message: 'pairing_response_invalid' });
+      }
+    }),
+    status: z.literal('waiting'),
+    candidates: candidatesV2Schema,
+  });
+}
+
+export const pairingSessionV2Schema = pairingSessionV2SchemaFor();
 
 const selectedCandidateIdsSchema = z
   .array(candidateIdSchema)
@@ -289,6 +313,7 @@ export const pairingQrSchema = pairingQrSchemaFor();
 
 export type PairingCandidate = z.infer<typeof pairingCandidateSchema>;
 export type PairingSession = z.infer<typeof pairingSessionSchema>;
+export type PairingSessionV2 = z.infer<typeof pairingSessionV2Schema>;
 export type PairingSelection = z.infer<typeof pairingSelectionSchema>;
 export type PairingProgress = z.infer<typeof pairingProgressSchema>;
 export type PairingCandidateResult = z.infer<typeof pairingCandidateResultSchema>;
@@ -303,11 +328,13 @@ export type PairingRegistrationAuthorization = {
 };
 
 export function pairingQrContent(
-  session: PairingSession,
+  session: PairingSession | PairingSessionV2,
   serverUrl: string,
   options: PairingClockOptions & { allowLoopbackHttp?: boolean } = {},
 ): string {
-  const parsedSession = pairingSessionSchemaFor(options).parse(session);
+  const parsedSession = 'pairingCode' in session
+    ? pairingSessionV2SchemaFor(options).parse(session)
+    : pairingSessionSchemaFor(options).parse(session);
   const qr = pairingQrSchemaFor(options).parse({
     type: 'clawmessenger_pairing',
     version: 1,

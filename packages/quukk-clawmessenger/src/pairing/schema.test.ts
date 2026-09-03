@@ -14,6 +14,7 @@ import {
   pairingSelectionSchema,
   pairingSessionSchemaFor,
   pairingSessionSchema,
+  pairingSessionV2SchemaFor,
 } from './schema.js';
 
 type ContractVector = {
@@ -64,6 +65,30 @@ const validSession = {
 } as const;
 
 describe('pairing schemas', () => {
+  it('parses a strict v2 creation response with a compact code', () => {
+    const parsed = pairingSessionV2SchemaFor({
+      now: () => Date.parse('2026-09-03T08:30:00.000Z'),
+    }).parse({
+      ticket: TICKET,
+      deviceSecret: DEVICE_SECRET,
+      pairingCode: 'ABCDEF23',
+      expiresAt: '2026-09-03T08:40:00.000Z',
+      status: 'waiting',
+      candidates: [],
+    });
+    expect(parsed.pairingCode).toBe('ABCDEF23');
+    for (const pairingCode of ['abcdef23', 'ABCD-EF23', 'ABCD EF23']) {
+      expect(() => pairingSessionV2SchemaFor({ now: () => 0 }).parse({
+        ...parsed,
+        pairingCode,
+        expiresAt: '1970-01-01T00:10:00.000Z',
+      })).toThrow();
+    }
+    expect(() => pairingSessionV2SchemaFor({ now: () => 0 }).parse({
+      ...parsed,
+      expiresAt: '1970-01-01T00:10:00.001Z',
+    })).toThrow('pairing_response_invalid');
+  });
   it('accepts the bounded package/server contract', () => {
     expect(pairingCandidateSchema.parse(candidate)).toEqual(candidate);
     expect(pairingSessionSchema.parse(validSession)).toEqual(validSession);

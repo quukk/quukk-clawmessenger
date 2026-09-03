@@ -8,9 +8,11 @@ import {
   pairingRetryRequestSchema,
   pairingSelectionSchema,
   pairingSessionSchema,
+  pairingSessionV2Schema,
   type PairingCandidate,
   type PairingSelection,
   type PairingSession,
+  type PairingSessionV2,
   type PairingRetryRequest,
 } from './schema.js';
 
@@ -28,6 +30,7 @@ export const PAIRING_CLIENT_ERROR_CODES = [
   'pairing_timeout',
   'pairing_transport',
   'pairing_unauthorized',
+  'pairing_unavailable',
 ] as const;
 
 export type PairingClientErrorCode = (typeof PAIRING_CLIENT_ERROR_CODES)[number];
@@ -94,6 +97,10 @@ class BodyFailure {
 }
 
 const createEnvelopeSchema = z.strictObject({ code: z.literal(201), data: pairingSessionSchema });
+const createV2EnvelopeSchema = z.strictObject({
+  code: z.literal(201),
+  data: pairingSessionV2Schema,
+});
 const selectionEnvelopeSchema = z.strictObject({
   code: z.literal(200),
   data: pairingSelectionSchema,
@@ -125,6 +132,11 @@ function statusError(status: number): PairingClientError {
   if (status === 429) return new PairingClientError('pairing_rate_limited', 'transport', true);
   return new PairingClientError('pairing_rejected', 'pairing', false);
 }
+
+const unavailableEnvelopeSchema = z.strictObject({
+  code: z.literal(503),
+  error: z.literal('pairing_unavailable'),
+});
 
 function validCredential(value: string): boolean {
   return PAIRING_CREDENTIAL_PATTERN.test(value);
@@ -220,6 +232,18 @@ export class PairingClient {
           return null;
         }
         if (response.status !== expectedStatus) {
+          if (response.status === 503) {
+            try {
+              const unavailable = unavailableEnvelopeSchema.safeParse(
+                await boundedJson(response.clone()),
+              );
+              if (unavailable.success) {
+                throw new PairingClientError('pairing_unavailable', 'transport', true);
+              }
+            } catch (error) {
+              if (error instanceof PairingClientError) throw error;
+            }
+          }
           if (response.status === 410) {
             let terminalError;
             try {
@@ -313,6 +337,42 @@ export class PairingClient {
       signal,
     );
     const envelope = createEnvelopeSchema.safeParse(response);
+    if (!envelope.success) throw invalidResponse();
+    return envelope.data.data;
+  }
+
+  async createSessionV2(
+    input: CreatePairingSessionInput,
+    signal?: AbortSignal,
+  ): Promise<PairingSessionV2> {
+    if (!/^[0-9a-f]{64}$/.test(input.installAbuseKey)) throw rejected();
+    validateIdempotencyKey(input.idempotencyKey);
+    const candidates = z
+      .array(pairingCandidateSchema)
+      .max(16)
+      .superRefine((values, context) => {
+        if (new Set(values.map((candidate) => candidate.candidateId)).size !== values.length) {
+          context.addIssue({ code: 'custom', message: 'duplicate_candidate_id' });
+        }
+      })
+      .safeParse(input.candidates);
+    if (!candidates.success) throw rejected();
+    const response = await this.#request(
+      `${this.#serverUrl}/api/ai/pairing/v2/sessions`,
+      {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          'X-Install-Abuse-Key': input.installAbuseKey,
+          'Idempotency-Key': input.idempotencyKey,
+        },
+        body: JSON.stringify({ candidates: candidates.data }),
+      },
+      201,
+      signal,
+    );
+    const envelope = createV2EnvelopeSchema.safeParse(response);
     if (!envelope.success) throw invalidResponse();
     return envelope.data.data;
   }

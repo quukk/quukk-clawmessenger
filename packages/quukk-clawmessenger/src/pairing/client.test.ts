@@ -55,7 +55,50 @@ function sessionEnvelope(): unknown {
   };
 }
 
+function sessionV2Envelope(): unknown {
+  return {
+    code: 201,
+    data: {
+      ticket: TICKET,
+      deviceSecret: DEVICE_SECRET,
+      pairingCode: 'ABCDEF23',
+      expiresAt: new Date(Date.now() + 599_000).toISOString(),
+      status: 'waiting',
+      candidates: [],
+    },
+  };
+}
+
 describe('PairingClient', () => {
+  it('creates a v2 session through the exact endpoint and headers', async () => {
+    const fetchSpy = vi.fn(async () => jsonResponse(201, sessionV2Envelope()));
+    const client = new PairingClient({ serverUrl: SERVER, fetch: fetchSpy });
+    const session = await client.createSessionV2({
+      installAbuseKey: ABUSE_KEY,
+      idempotencyKey: IDEMPOTENCY_KEY,
+      candidates: [],
+    });
+    expect(session.pairingCode).toBe('ABCDEF23');
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe(`${SERVER}/api/ai/pairing/v2/sessions`);
+    expect(JSON.parse(String(init?.body))).toEqual({ candidates: [] });
+    const headers = new Headers(init?.headers);
+    expect(headers.get('x-install-abuse-key')).toBe(ABUSE_KEY);
+    expect(headers.get('idempotency-key')).toBe(IDEMPOTENCY_KEY);
+  });
+
+  it('preserves the server pairing-unavailable error', async () => {
+    const fetchSpy = vi.fn(async () => jsonResponse(503, {
+      code: 503,
+      error: 'pairing_unavailable',
+    }));
+    const client = new PairingClient({ serverUrl: SERVER, fetch: fetchSpy });
+    await expect(client.createSessionV2({
+      installAbuseKey: ABUSE_KEY,
+      idempotencyKey: IDEMPOTENCY_KEY,
+      candidates: [],
+    })).rejects.toMatchObject({ code: 'pairing_unavailable', retryable: true });
+  });
   it('creates a session through a fixed route with bounded sanitized input headers', async () => {
     const fetchSpy = vi.fn(async () => jsonResponse(201, sessionEnvelope()));
     const client = new PairingClient({ serverUrl: SERVER, fetch: fetchSpy });
