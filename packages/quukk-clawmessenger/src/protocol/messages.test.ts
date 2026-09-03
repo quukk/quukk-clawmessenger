@@ -98,6 +98,33 @@ describe('normalizeRongCloudMessage', () => {
     });
   });
 
+  it('preserves an outer command envelope when its payload is a JSON object string', () => {
+    const result = normalizeRongCloudMessage({
+      ...baseMessage,
+      content: {
+        msg_type: 'device_status_request',
+        source_im_id: 'user-1',
+        destination_im_id: 'node-1',
+        request_id: 'request-status-1',
+        content: '{}',
+        timestamp: 1_788_406_800,
+      },
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        rawContent: {
+          msg_type: 'device_status_request',
+          source_im_id: 'user-1',
+          destination_im_id: 'node-1',
+          request_id: 'request-status-1',
+          content: '{}',
+        },
+      },
+    });
+  });
+
   it('rejects missing identities, control characters, and conflicting aliases', () => {
     expect(normalizeRongCloudMessage({ ...baseMessage, messageUId: undefined, content: 'x' }))
       .toEqual({ ok: false, code: 'missing_message_uid' });
@@ -105,9 +132,20 @@ describe('normalizeRongCloudMessage', () => {
       .toEqual({ ok: false, code: 'invalid_identifier' });
     expect(normalizeRongCloudMessage({
       ...baseMessage,
-      messageId: 'different-message',
+      messageUID: 'different-message',
       content: 'x',
     })).toEqual({ ok: false, code: 'conflicting_alias' });
+  });
+
+  it('prefers the global message UId when the SDK also includes a different local messageId', () => {
+    expect(normalizeRongCloudMessage({
+      ...baseMessage,
+      messageId: 37,
+      content: 'x',
+    })).toMatchObject({
+      ok: true,
+      value: { messageUid: 'message-1' },
+    });
   });
 
   it('accepts only numeric RongCloud conversation types 1, 3 and 4', () => {
@@ -251,6 +289,28 @@ describe('parseProtocolContent', () => {
       .toEqual({ kind: 'invalid', code: 'invalid_content' });
     expect(parseProtocolContent({ msg_type: 'device_control', command: 'status', action: 'restart' }))
       .toEqual({ kind: 'invalid', code: 'conflicting_alias' });
+  });
+
+  it('extracts device-control fields from the JSON payload used by Web and UniApp command messages', () => {
+    expect(parseProtocolContent({
+      msg_type: 'device_control',
+      source_im_id: 'user-1',
+      destination_im_id: 'node-1',
+      request_id: 'request-control-1',
+      content: JSON.stringify({ command: 'rename_device', name: 'Office Codex' }),
+    })).toEqual({
+      kind: 'protocol',
+      msgType: 'device_control',
+      value: {
+        msg_type: 'device_control',
+        request_id: 'request-control-1',
+        source_im_id: 'user-1',
+        destination_im_id: 'node-1',
+        command: 'rename_device',
+        content: JSON.stringify({ command: 'rename_device', name: 'Office Codex' }),
+        name: 'Office Codex',
+      },
+    });
   });
 
   it('enforces required legacy chatroom and response correlation fields', () => {

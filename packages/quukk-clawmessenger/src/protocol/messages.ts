@@ -344,6 +344,7 @@ function decodeContent(input: unknown): DecodedContent | null {
     if (typeof nested !== 'string') return { rawContent };
     const parsed = parseRecordJson(nested);
     if (parsed && depth < 2) {
+      if (typeof rawContent.msg_type === 'string') return { rawContent };
       value = parsed;
       rawContent = parsed;
       continue;
@@ -451,7 +452,10 @@ export function normalizeRongCloudMessage(raw: unknown): NormalizeMessageResult 
   if (!record(snapshot.value)) return { ok: false, code: 'invalid_message' };
   const safeRaw = snapshot.value;
 
-  const uid = alias(safeRaw, ['messageUId', 'messageUID', 'messageUid', 'messageId'], identifier);
+  const globalUid = alias(safeRaw, ['messageUId', 'messageUID', 'messageUid'], identifier);
+  const uid = globalUid.ok && globalUid.value === undefined
+    ? alias(safeRaw, ['messageId'], identifier)
+    : globalUid;
   const sender = alias(safeRaw, ['senderUserId', 'senderId'], identifier);
   const objectName = alias(safeRaw, ['messageType', 'objectName', 'messageName'], (value) => identifier(value, 128));
   if (!uid.ok || !sender.ok || !objectName.ok) {
@@ -518,7 +522,17 @@ function unwrapProtocolValue(input: unknown): { value?: Record<string, unknown>;
 }
 
 function canonicalLegacy(value: Record<string, unknown>): Record<string, unknown> | null {
-  const result: Record<string, unknown> = { msg_type: value.msg_type };
+  let source = value;
+  if (typeof value.content === 'string') {
+    const payload = parseRecordJson(value.content);
+    if (payload !== null) {
+      for (const key of Object.keys(payload)) {
+        if (key !== 'content' && own(value, key) && value[key] !== payload[key]) return null;
+      }
+      source = { ...payload, ...value };
+    }
+  }
+  const result: Record<string, unknown> = { msg_type: source.msg_type };
   const groups: Array<[string, readonly string[], (raw: unknown) => unknown | null]> = [
     ['request_id', ['request_id', 'requestId'], identifier],
     ['source_im_id', ['source_im_id', 'sourceImId'], identifier],
@@ -531,17 +545,17 @@ function canonicalLegacy(value: Record<string, unknown>): Record<string, unknown
     ['max_rounds', ['max_rounds', 'maxRounds', 'openclaw_max_rounds'], safePositiveInteger],
   ];
   for (const [output, keys, parse] of groups) {
-    const selected = alias(value, keys, parse);
+    const selected = alias(source, keys, parse);
     if (!selected.ok) return null;
     if (selected.value !== undefined) result[output] = selected.value;
   }
 
-  const command = alias(value, ['command', 'action', 'type', 'cmd'], (raw) => identifier(raw, 64));
+  const command = alias(source, ['command', 'action', 'type', 'cmd'], (raw) => identifier(raw, 64));
   if (!command.ok) return null;
   if (command.value !== undefined) result.command = command.value;
 
   for (const key of ['content', 'title', 'name', 'status', 'message', 'data', 'opencode_session_id', 'timestamp']) {
-    if (own(value, key) && value[key] !== undefined) result[key] = value[key];
+    if (own(source, key) && source[key] !== undefined) result[key] = source[key];
   }
   return result;
 }

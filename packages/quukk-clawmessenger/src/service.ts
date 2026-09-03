@@ -93,6 +93,7 @@ import { RegistrationClient } from './registration/client.js';
 import type { WorkerEvent } from './rongcloud/worker-protocol.js';
 import {
   RongCloudWorkerSupervisor,
+  SUPERVISOR_ONLINE_TIMEOUT_MS,
   type RongCloudWorkerSupervisorOptions,
   type SupervisorBinding,
   type SupervisorCredential,
@@ -580,6 +581,99 @@ function supervisorBindings(
         storageDir: join(storageRoot, binding.runtimeId),
       }]
     : []);
+}
+
+const PAIRING_ONLINE_POLL_MS = 100;
+
+export interface PairingBindingActivatorOptions {
+  mutationGate: ServiceMutationGate;
+  bindings: Pick<ServiceBindingPort, 'list'>;
+  workers(): ServiceWorkerPort | undefined;
+  router(): ServiceRouterPort | undefined;
+  storageRoot: string;
+  now?: () => number;
+  sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  onlineTimeoutMs?: number;
+}
+
+function activationSleep(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolvePromise, reject) => {
+    if (signal.aborted) {
+      reject(new ServiceError('operation_unavailable'));
+      return;
+    }
+    const completed = () => {
+      signal.removeEventListener('abort', cancelled);
+      resolvePromise();
+    };
+    const timer = setTimeout(completed, milliseconds);
+    const cancelled = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', cancelled);
+      reject(new ServiceError('operation_unavailable'));
+    };
+    signal.addEventListener('abort', cancelled, { once: true });
+  });
+}
+
+export function createPairingBindingActivator(
+  options: PairingBindingActivatorOptions,
+): (binding: RuntimeBinding, signal: AbortSignal) => Promise<void> {
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? activationSleep;
+  const timeout = Math.max(1, Math.min(
+    SUPERVISOR_ONLINE_TIMEOUT_MS,
+    Math.trunc(options.onlineTimeoutMs ?? SUPERVISOR_ONLINE_TIMEOUT_MS),
+  ));
+  return async (enabled, signal) => {
+    const activated = await enqueueServiceMutation(options.mutationGate, async () => {
+      if (signal.aborted) throw new ServiceError('operation_unavailable');
+      const workers = options.workers();
+      const router = options.router();
+      const fresh = options.bindings.list();
+      const current = fresh.find((binding) => binding.runtimeId === enabled.runtimeId);
+      if (workers === undefined
+        || router === undefined
+        || current === undefined
+        || !completeEnabledBinding(current)
+        || !exactBinding(current, enabled)) {
+        throw new ServiceError('operation_unavailable');
+      }
+      await router.activateBinding({ runtimeId: current.runtimeId, nodeId: current.nodeId });
+      if (signal.aborted) throw new ServiceError('operation_unavailable');
+      await ensureProtectedStorage(options.storageRoot, current.runtimeId);
+      if (signal.aborted) throw new ServiceError('operation_unavailable');
+      await workers.reconcile(supervisorBindings(options.storageRoot, fresh));
+      return { workers, runtimeId: current.runtimeId, nodeId: current.nodeId };
+    });
+    const expiresAt = now() + timeout;
+    while (true) {
+      if (signal.aborted) throw new ServiceError('operation_unavailable');
+      const worker = activated.workers.snapshots().find((snapshot) =>
+        snapshot.runtimeId === activated.runtimeId && snapshot.nodeId === activated.nodeId);
+      if (worker?.state === 'online') break;
+      const remaining = expiresAt - now();
+      if (remaining <= 0) throw new ServiceError('operation_unavailable');
+      await sleep(Math.min(PAIRING_ONLINE_POLL_MS, remaining), signal);
+    }
+    await enqueueServiceMutation(options.mutationGate, async () => {
+      if (signal.aborted || options.workers() !== activated.workers) {
+        throw new ServiceError('operation_unavailable');
+      }
+      const current = options.bindings.list().find((binding) =>
+        binding.runtimeId === activated.runtimeId);
+      const worker = activated.workers.snapshots().find((snapshot) =>
+        snapshot.runtimeId === activated.runtimeId && snapshot.nodeId === activated.nodeId);
+      if (current === undefined
+        || !completeEnabledBinding(current)
+        || current.runtimePath !== enabled.runtimePath
+        || current.provider !== enabled.provider
+        || current.nodeId !== activated.nodeId
+        || worker?.state !== 'online') {
+        throw new ServiceError('operation_unavailable');
+      }
+    });
+  };
 }
 
 export class QuukkService implements LocalApiPort, LocalControlPort {
@@ -1109,6 +1203,7 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
       () => this.#http?.close(),
       Math.min(HTTP_CLOSE_TIMEOUT_MS, preIdentityRemaining()),
     );
+    await this.#cleanupStep('pairing_cancel_failed', () => this.#pairing.cancel(), preIdentityRemaining());
     await this.#cleanupStep('mutation_drain_failed', () => this.#mutationGate.tail, preIdentityRemaining());
     await this.#cleanupStep(
       'router_dispose_failed',
@@ -1341,7 +1436,7 @@ export function createConservativeRouterControl(options: {
   workers: Pick<ServiceWorkerPort, 'snapshots'>;
 }): RouterControlPort {
   return {
-    authorize: async (_input: AuthorizedControl) => false,
+    authorize: async (input: AuthorizedControl) => input.scope === 'device.read',
     status: async (identity: WorkerIdentity): Promise<SafeDeviceStatus> => {
       let runtime: RuntimeDiscoveryStatus = 'not_found';
       try {
@@ -1670,22 +1765,14 @@ async function composeProductionServiceWithin(
       bindings,
       runtimeSource: productionRuntimeSource(client),
       installAbuseKey,
-      onBindingEnabled: async (enabled) => {
-        const supervisor = workers;
-        const activeRouter = router;
-        const fresh = bindings.list();
-        const current = fresh.find((binding) => binding.runtimeId === enabled.runtimeId);
-        if (supervisor === undefined
-          || activeRouter === undefined
-          || current === undefined
-          || !completeEnabledBinding(current)
-          || !exactBinding(current, enabled)) {
-          throw new ServiceError('operation_unavailable');
-        }
-        await activeRouter.activateBinding({ runtimeId: current.runtimeId, nodeId: current.nodeId });
-        await ensureProtectedStorage(paths.rongcloudDir, current.runtimeId);
-        await supervisor.reconcile(supervisorBindings(paths.rongcloudDir, fresh));
-      },
+      onBindingEnabled: createPairingBindingActivator({
+        mutationGate,
+        bindings,
+        workers: () => workers,
+        router: () => router,
+        storageRoot: paths.rongcloudDir,
+        now: options.now,
+      }),
       now: options.now,
     });
     const routerState = factories.createRouterState({ filePath: paths.sessions });

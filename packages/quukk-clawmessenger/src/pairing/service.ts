@@ -70,7 +70,7 @@ export type PairingServiceDependencies = {
   bindings: PairingBindingPort;
   runtimeSource: PairingRuntimeSource;
   installAbuseKey: string;
-  onBindingEnabled?: (binding: RuntimeBinding) => Promise<void>;
+  onBindingEnabled?: (binding: RuntimeBinding, signal: AbortSignal) => Promise<void>;
   now?: () => number;
   randomBytes?: (size: number) => Uint8Array;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<unknown>;
@@ -178,7 +178,7 @@ export class PairingService {
   readonly #bindings: PairingBindingPort;
   readonly #runtimeSource: PairingRuntimeSource;
   readonly #installAbuseKey: string;
-  readonly #onBindingEnabled: (binding: RuntimeBinding) => Promise<void>;
+  readonly #onBindingEnabled: (binding: RuntimeBinding, signal: AbortSignal) => Promise<void>;
   readonly #now: () => number;
   readonly #randomBytes: (size: number) => Uint8Array;
   readonly #sleep: (milliseconds: number, signal: AbortSignal) => Promise<unknown>;
@@ -486,7 +486,7 @@ export class PairingService {
         if (generation !== this.#generation || signal.aborted) return;
         if (enabled.ok) {
           try {
-            await this.#onBindingEnabled({ ...enabled.binding });
+            await this.#onBindingEnabled({ ...enabled.binding }, signal);
           } catch {
             this.#results.set(candidateId, resultFailure(
               candidateId,

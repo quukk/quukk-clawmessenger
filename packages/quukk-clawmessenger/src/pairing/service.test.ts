@@ -230,7 +230,7 @@ function harness(
     randomStart?: number;
     now?: () => number;
     sleep?: (milliseconds: number, signal: AbortSignal) => Promise<unknown>;
-    onBindingEnabled?: (enabled: RuntimeBinding) => Promise<void>;
+    onBindingEnabled?: (enabled: RuntimeBinding, signal: AbortSignal) => Promise<void>;
   } = {},
 ) {
   const client = options.client ?? new FakePairingClient();
@@ -382,6 +382,31 @@ describe('PairingService', () => {
     await fixture.service.cancel();
   });
 
+  it('aborts an in-flight binding activation when pairing is cancelled', async () => {
+    let activationSignal: AbortSignal | undefined;
+    let activationStarted!: () => void;
+    const started = new Promise<void>((resolvePromise) => { activationStarted = resolvePromise; });
+    const fixture = harness([runtime('codex')], {
+      onBindingEnabled: async (_enabled, signal) => {
+        activationSignal = signal;
+        activationStarted();
+        await new Promise<void>((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(new Error('cancelled')), { once: true });
+        });
+      },
+    });
+
+    await fixture.service.start();
+    const candidateId = fixture.client.createCalls[0]!.candidates[0]!.candidateId;
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [candidateId]));
+    await started;
+
+    await fixture.service.cancel();
+
+    expect(activationSignal?.aborted).toBe(true);
+    expect(fixture.service.snapshot().state).toBe('cancelled');
+  });
+
   it('keeps polling without a default selection and registers only after confirmation', async () => {
     const fixture = harness([runtime('codex')]);
     await fixture.service.start();
@@ -430,6 +455,8 @@ describe('PairingService', () => {
 
     expect(fixture.service.snapshot().state).toBe('completed');
     expect(fixture.bindings.calls).toHaveLength(1);
+    expect(Math.max(...requestTimes.map((seenAt) =>
+      requestTimes.filter((other) => other <= seenAt && seenAt - other < 60_000).length))).toBeLessThanOrEqual(30);
   });
 
   it('cancels the previous active session before generating a replacement', async () => {

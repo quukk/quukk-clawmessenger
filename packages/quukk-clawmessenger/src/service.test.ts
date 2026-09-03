@@ -34,6 +34,7 @@ import {
   QuukkService,
   ServiceError,
   createConservativeRouterControl,
+  createPairingBindingActivator,
   startProductionService,
   type ProductionServiceFactories,
   type ServiceBindingPort,
@@ -299,11 +300,18 @@ class FakePairing {
     results: [],
   };
   readonly calls: string[] = [];
+  readonly trace?: string[];
   startHook: () => Promise<PairingServiceSnapshot> = async () => this.snapshotValue;
+
+  constructor(trace?: string[]) { this.trace = trace; }
 
   snapshot(): PairingServiceSnapshot { this.calls.push('snapshot'); return this.snapshotValue; }
   async start(): Promise<PairingServiceSnapshot> { this.calls.push('start'); return this.startHook(); }
-  async cancel(): Promise<PairingServiceSnapshot> { this.calls.push('cancel'); return this.snapshotValue; }
+  async cancel(): Promise<PairingServiceSnapshot> {
+    this.calls.push('cancel');
+    this.trace?.push('pairing.cancel');
+    return this.snapshotValue;
+  }
   retryFailed(candidateIds: readonly string[]): PairingServiceSnapshot {
     this.calls.push(`retry:${candidateIds.join(',')}`); return this.snapshotValue;
   }
@@ -433,7 +441,7 @@ async function fixture(input: {
   bindings.values = input.bindings?.map((binding) => ({ ...binding })) ?? [];
   store.bindings = bindings.values;
   const workers = new FakeWorkers(trace);
-  const pairing = new FakePairing();
+  const pairing = new FakePairing(trace);
   const router = new FakeRouter(trace);
   const logger = new FakeLogger();
   const identityStore = new FakeIdentityStore(trace);
@@ -804,6 +812,8 @@ describe('QuukkService lifecycle', () => {
     await expect(starting).rejects.toMatchObject({ code: 'operation_unavailable' });
     expect(f.identityStore.removed).toEqual([READY]);
     expect(f.trace.indexOf('http.close')).toBeLessThan(f.trace.indexOf('router.dispose'));
+    expect(f.trace.indexOf('http.close')).toBeLessThan(f.trace.indexOf('pairing.cancel'));
+    expect(f.trace.indexOf('pairing.cancel')).toBeLessThan(f.trace.indexOf('workers.dispose'));
     expect(f.trace.indexOf('router.dispose')).toBeLessThan(f.trace.indexOf('workers.dispose'));
     expect(f.trace.indexOf('workers.dispose')).toBeLessThan(f.trace.indexOf('bridge.stop'));
     expect(f.logger.closeCalls).toBe(1);
@@ -1346,6 +1356,12 @@ describe('conservative production router control', () => {
       identity,
       conversationKey: 'safe',
       senderId: 'sender',
+      scope: 'device.read',
+    })).resolves.toBe(true);
+    await expect(control.authorize({
+      identity,
+      conversationKey: 'safe',
+      senderId: 'sender',
       scope: 'device.mutate',
     })).resolves.toBe(false);
     await expect(control.device({ identity, senderId: 'sender', command: 'disable' })).resolves.toEqual({
@@ -1694,6 +1710,177 @@ describe('startProductionService', () => {
       expect(JSON.stringify(logger.records)).not.toContain('unsafe');
     },
   );
+});
+
+describe('createPairingBindingActivator', () => {
+  it('reconciles multi-selection from fresh binding lists without holding the mutation gate while waiting online', async () => {
+    const root = await temporaryDirectory();
+    const trace: string[] = [];
+    const bindings = new FakeBindings(trace);
+    const workers = new FakeWorkers(trace);
+    const router = new FakeRouter(trace);
+    const opencode = completeBinding('opencode', root);
+    const codex = completeBinding('codex', root);
+    const waiters: Array<() => void> = [];
+    bindings.values = [opencode];
+    workers.values = [{
+      runtimeId: opencode.runtimeId,
+      nodeId: opencode.nodeId!,
+      state: 'starting',
+      instanceId: null,
+      restartCount: 0,
+    }];
+    const activate = createPairingBindingActivator({
+      mutationGate: { tail: Promise.resolve(), stopped: false },
+      bindings,
+      workers: () => workers,
+      router: () => router,
+      storageRoot: join(root, 'rongcloud'),
+      sleep: async (_milliseconds, signal) => new Promise<void>((resolvePromise, reject) => {
+        const aborted = () => reject(new Error('cancelled'));
+        signal.addEventListener('abort', aborted, { once: true });
+        waiters.push(() => {
+          signal.removeEventListener('abort', aborted);
+          resolvePromise();
+        });
+      }),
+    });
+    const signal = new AbortController().signal;
+
+    const first = activate(opencode, signal);
+    await vi.waitFor(() => expect(waiters).toHaveLength(1));
+    bindings.values = [opencode, codex];
+    const second = activate(codex, signal);
+    await vi.waitFor(() => expect(workers.reconciliations).toHaveLength(2));
+    await vi.waitFor(() => expect(waiters).toHaveLength(2));
+
+    workers.values = [
+      { runtimeId: opencode.runtimeId, nodeId: opencode.nodeId!, state: 'online', instanceId: 'worker-a', restartCount: 0 },
+      { runtimeId: codex.runtimeId, nodeId: codex.nodeId!, state: 'online', instanceId: 'worker-b', restartCount: 0 },
+    ];
+    for (const release of waiters.splice(0)) release();
+    await Promise.all([first, second]);
+
+    expect(workers.reconciliations).toHaveLength(2);
+    expect(workers.reconciliations[0]!.map((binding) => binding.runtimeId)).toEqual([opencode.runtimeId]);
+    expect(workers.reconciliations[1]!.map((binding) => binding.runtimeId)).toEqual([
+      opencode.runtimeId,
+      codex.runtimeId,
+    ]);
+  });
+
+  it('revalidates the binding after online wait so a concurrent disable cannot report bound', async () => {
+    const root = await temporaryDirectory();
+    const trace: string[] = [];
+    const bindings = new FakeBindings(trace);
+    const workers = new FakeWorkers(trace);
+    const router = new FakeRouter(trace);
+    const codex = completeBinding('codex', root);
+    let releaseWait!: () => void;
+    bindings.values = [codex];
+    workers.values = [{
+      runtimeId: codex.runtimeId,
+      nodeId: codex.nodeId!,
+      state: 'starting',
+      instanceId: null,
+      restartCount: 0,
+    }];
+    const activate = createPairingBindingActivator({
+      mutationGate: { tail: Promise.resolve(), stopped: false },
+      bindings,
+      workers: () => workers,
+      router: () => router,
+      storageRoot: join(root, 'rongcloud'),
+      sleep: async () => new Promise<void>((resolvePromise) => { releaseWait = resolvePromise; }),
+    });
+
+    const activation = activate(codex, new AbortController().signal);
+    await vi.waitFor(() => expect(releaseWait).toBeTypeOf('function'));
+    bindings.values = [{ ...codex, enabled: false, registrationState: 'offline' }];
+    workers.values = [{
+      runtimeId: codex.runtimeId,
+      nodeId: codex.nodeId!,
+      state: 'online',
+      instanceId: 'worker-codex',
+      restartCount: 0,
+    }];
+    releaseWait();
+
+    await expect(activation).rejects.toMatchObject({ code: 'operation_unavailable' });
+  });
+
+  it('does not report activation complete until the exact worker is online', async () => {
+    const root = await temporaryDirectory();
+    const trace: string[] = [];
+    const bindings = new FakeBindings(trace);
+    const workers = new FakeWorkers(trace);
+    const router = new FakeRouter(trace);
+    const codex = completeBinding('codex', root);
+    let releaseWait!: () => void;
+    bindings.values = [codex];
+    workers.values = [{
+      runtimeId: codex.runtimeId,
+      nodeId: codex.nodeId!,
+      state: 'starting',
+      instanceId: null,
+      restartCount: 0,
+    }];
+    const activate = createPairingBindingActivator({
+      mutationGate: { tail: Promise.resolve(), stopped: false },
+      bindings,
+      workers: () => workers,
+      router: () => router,
+      storageRoot: join(root, 'rongcloud'),
+      sleep: async () => new Promise<void>((resolvePromise) => { releaseWait = resolvePromise; }),
+    });
+    let completed = false;
+
+    const activation = activate(codex, new AbortController().signal).then(() => { completed = true; });
+    await vi.waitFor(() => expect(releaseWait).toBeTypeOf('function'));
+    expect(completed).toBe(false);
+    workers.values = [{
+      runtimeId: codex.runtimeId,
+      nodeId: codex.nodeId!,
+      state: 'online',
+      instanceId: 'worker-codex',
+      restartCount: 0,
+    }];
+    releaseWait();
+
+    await activation;
+    expect(completed).toBe(true);
+  });
+
+  it('bounds the online wait when a worker never becomes ready', async () => {
+    const root = await temporaryDirectory();
+    const trace: string[] = [];
+    const bindings = new FakeBindings(trace);
+    const workers = new FakeWorkers(trace);
+    const router = new FakeRouter(trace);
+    const codex = completeBinding('codex', root);
+    let now = 0;
+    bindings.values = [codex];
+    workers.values = [{
+      runtimeId: codex.runtimeId,
+      nodeId: codex.nodeId!,
+      state: 'starting',
+      instanceId: null,
+      restartCount: 0,
+    }];
+    const activate = createPairingBindingActivator({
+      mutationGate: { tail: Promise.resolve(), stopped: false },
+      bindings,
+      workers: () => workers,
+      router: () => router,
+      storageRoot: join(root, 'rongcloud'),
+      now: () => now,
+      onlineTimeoutMs: 500,
+      sleep: async (milliseconds) => { now += milliseconds; },
+    });
+
+    await expect(activate(codex, new AbortController().signal))
+      .rejects.toMatchObject({ code: 'operation_unavailable' });
+  });
 });
 
 describe('ServiceError', () => {
