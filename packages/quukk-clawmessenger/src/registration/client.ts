@@ -437,13 +437,20 @@ export class RegistrationClient {
         throw new RegistrationError('registration_rejected', 'validation', false);
       }
     }
-    const requestBody: Record<string, unknown> = {
-      name: input.nodeName,
-      mac_address: stableMac(input.installId, this.#networkInterfaces),
-      node_type: input.provider,
-      ai_type: input.provider,
-      capabilities: [...CLAWMESSENGER_NODE_CAPABILITIES],
-    };
+    const requestBody: Record<string, unknown> = input.authorization === undefined
+      ? {
+          name: input.nodeName,
+          mac_address: stableMac(input.installId, this.#networkInterfaces),
+          node_type: input.provider,
+          ai_type: input.provider,
+          capabilities: [...CLAWMESSENGER_NODE_CAPABILITIES],
+        }
+      : {
+          provider: input.provider,
+          name: input.nodeName,
+          mac_address: stableMac(input.installId, this.#networkInterfaces),
+          capabilities: [...CLAWMESSENGER_NODE_CAPABILITIES],
+        };
     if (input.existingNodeId !== undefined) requestBody.node_id = input.existingNodeId;
     const headers: Record<string, string> = {
       Accept: 'application/json',

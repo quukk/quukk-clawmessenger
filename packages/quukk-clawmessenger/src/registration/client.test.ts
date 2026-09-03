@@ -236,6 +236,12 @@ describe('RegistrationClient', () => {
       'idempotency-key': authorization.idempotencyKey,
     });
     expect(headers(transport.calls[0]!)).not.toHaveProperty('x-node-enrollment-token');
+    expect(body(transport.calls[0]!)).toEqual({
+      provider: 'codex',
+      name: 'fixture-host · Codex',
+      mac_address: '32:01:59:EB:E3:21',
+      capabilities: [...CAPABILITIES],
+    });
     expect(JSON.stringify(body(transport.calls[0]!))).not.toContain(authorization.ticket);
     expect(JSON.stringify(body(transport.calls[0]!))).not.toContain(authorization.deviceSecret);
   });
