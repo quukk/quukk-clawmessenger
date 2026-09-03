@@ -1,0 +1,533 @@
+{
+  "schemaVersion": 1,
+  "clock": {
+    "nowMs": 4070908800000,
+    "expiresAt": "2099-01-01T00:05:00+00:00",
+    "expiresAtMs": 4070909100000
+  },
+  "configuredServer": "https://newsradar.dreamdt.cn/im-test",
+  "valid": {
+    "qr": {
+      "input": {
+        "type": "clawmessenger_pairing",
+        "version": 1,
+        "server": "https://newsradar.dreamdt.cn/im-test",
+        "ticket": "ttttttttttttttttttttttttttttttttttttttttttt",
+        "expiresAt": 4070909100000
+      },
+      "normalized": {
+        "type": "clawmessenger_pairing",
+        "version": 1,
+        "server": "https://newsradar.dreamdt.cn/im-test",
+        "ticket": "ttttttttttttttttttttttttttttttttttttttttttt",
+        "expiresAt": 4070909100000
+      }
+    },
+    "candidates": [
+      {
+        "candidateId": "cand-opencode",
+        "provider": "opencode",
+        "displayName": "OpenCode",
+        "version": "1.2.3",
+        "readiness": "ready",
+        "statusReason": null,
+        "registrationState": "unregistered"
+      },
+      {
+        "candidateId": "cand-codex",
+        "provider": "codex",
+        "displayName": "Codex",
+        "version": "2.0.0",
+        "readiness": "ready",
+        "statusReason": null,
+        "registrationState": "unregistered"
+      },
+      {
+        "candidateId": "cand-hermes",
+        "provider": "hermes",
+        "displayName": "Hermes",
+        "version": null,
+        "readiness": "not_ready",
+        "statusReason": "Agent is not signed in",
+        "registrationState": "unregistered"
+      }
+    ],
+    "snapshots": [
+      {
+        "name": "waiting",
+        "appliesTo": ["package", "server", "web", "uniapp"],
+        "value": {
+          "status": "waiting",
+          "selectedCandidateIds": [],
+          "candidates": [
+            {
+              "candidateId": "cand-opencode",
+              "provider": "opencode",
+              "displayName": "OpenCode",
+              "version": "1.2.3",
+              "readiness": "ready",
+              "statusReason": null,
+              "registrationState": "unregistered"
+            },
+            {
+              "candidateId": "cand-codex",
+              "provider": "codex",
+              "displayName": "Codex",
+              "version": "2.0.0",
+              "readiness": "ready",
+              "statusReason": null,
+              "registrationState": "unregistered"
+            },
+            {
+              "candidateId": "cand-hermes",
+              "provider": "hermes",
+              "displayName": "Hermes",
+              "version": null,
+              "readiness": "not_ready",
+              "statusReason": "Agent is not signed in",
+              "registrationState": "unregistered"
+            }
+          ],
+          "expiresAt": "2099-01-01T00:05:00+00:00"
+        }
+      },
+      {
+        "name": "cancelled_after_selection",
+        "appliesTo": ["package", "server", "web", "uniapp"],
+        "value": {
+          "status": "cancelled",
+          "selectedCandidateIds": ["cand-opencode", "cand-codex"],
+          "candidates": [
+            {
+              "candidateId": "cand-opencode",
+              "provider": "opencode",
+              "displayName": "OpenCode",
+              "version": "1.2.3",
+              "readiness": "ready",
+              "statusReason": null,
+              "registrationState": "unregistered"
+            },
+            {
+              "candidateId": "cand-codex",
+              "provider": "codex",
+              "displayName": "Codex",
+              "version": "2.0.0",
+              "readiness": "ready",
+              "statusReason": null,
+              "registrationState": "unregistered"
+            },
+            {
+              "candidateId": "cand-hermes",
+              "provider": "hermes",
+              "displayName": "Hermes",
+              "version": null,
+              "readiness": "not_ready",
+              "statusReason": "Agent is not signed in",
+              "registrationState": "unregistered"
+            }
+          ],
+          "expiresAt": "2099-01-01T00:05:00+00:00"
+        }
+      },
+      {
+        "name": "expired_before_selection",
+        "appliesTo": ["package", "web", "uniapp"],
+        "value": {
+          "status": "expired",
+          "selectedCandidateIds": [],
+          "candidates": [
+            {
+              "candidateId": "cand-opencode",
+              "provider": "opencode",
+              "displayName": "OpenCode",
+              "version": "1.2.3",
+              "readiness": "ready",
+              "statusReason": null,
+              "registrationState": "unregistered"
+            },
+            {
+              "candidateId": "cand-codex",
+              "provider": "codex",
+              "displayName": "Codex",
+              "version": "2.0.0",
+              "readiness": "ready",
+              "statusReason": null,
+              "registrationState": "unregistered"
+            },
+            {
+              "candidateId": "cand-hermes",
+              "provider": "hermes",
+              "displayName": "Hermes",
+              "version": null,
+              "readiness": "not_ready",
+              "statusReason": "Agent is not signed in",
+              "registrationState": "unregistered"
+            }
+          ],
+          "expiresAt": "2099-01-01T00:05:00+00:00"
+        }
+      }
+    ],
+    "progress": [
+      {
+        "name": "partial_with_retryable_failure",
+        "appliesTo": ["package", "server", "web", "uniapp"],
+        "value": {
+          "status": "partial",
+          "selectedCandidateIds": ["cand-opencode", "cand-codex"],
+          "candidates": [
+            {
+              "candidateId": "cand-opencode",
+              "provider": "opencode",
+              "displayName": "OpenCode",
+              "version": "1.2.3",
+              "readiness": "ready",
+              "statusReason": null,
+              "registrationState": "unregistered"
+            },
+            {
+              "candidateId": "cand-codex",
+              "provider": "codex",
+              "displayName": "Codex",
+              "version": "2.0.0",
+              "readiness": "ready",
+              "statusReason": null,
+              "registrationState": "unregistered"
+            },
+            {
+              "candidateId": "cand-hermes",
+              "provider": "hermes",
+              "displayName": "Hermes",
+              "version": null,
+              "readiness": "not_ready",
+              "statusReason": "Agent is not signed in",
+              "registrationState": "unregistered"
+            }
+          ],
+          "expiresAt": "2099-01-01T00:05:00+00:00",
+          "results": [
+            {
+              "candidateId": "cand-opencode",
+              "status": "bound",
+              "errorCode": null,
+              "nodeId": "opencode_fixture-node"
+            },
+            {
+              "candidateId": "cand-codex",
+              "status": "failed",
+              "errorCode": "registration_failed",
+              "nodeId": null
+            }
+          ]
+        }
+      },
+      {
+        "name": "cancelled_with_retained_results",
+        "appliesTo": ["package", "server", "web", "uniapp"],
+        "value": {
+          "status": "cancelled",
+          "selectedCandidateIds": ["cand-opencode", "cand-codex"],
+          "candidates": [
+            {
+              "candidateId": "cand-opencode",
+              "provider": "opencode",
+              "displayName": "OpenCode",
+              "version": "1.2.3",
+              "readiness": "ready",
+              "statusReason": null,
+              "registrationState": "unregistered"
+            },
+            {
+              "candidateId": "cand-codex",
+              "provider": "codex",
+              "displayName": "Codex",
+              "version": "2.0.0",
+              "readiness": "ready",
+              "statusReason": null,
+              "registrationState": "unregistered"
+            },
+            {
+              "candidateId": "cand-hermes",
+              "provider": "hermes",
+              "displayName": "Hermes",
+              "version": null,
+              "readiness": "not_ready",
+              "statusReason": "Agent is not signed in",
+              "registrationState": "unregistered"
+            }
+          ],
+          "expiresAt": "2099-01-01T00:05:00+00:00",
+          "results": [
+            {
+              "candidateId": "cand-opencode",
+              "status": "bound",
+              "errorCode": null,
+              "nodeId": "opencode_fixture-node"
+            },
+            {
+              "candidateId": "cand-codex",
+              "status": "registering",
+              "errorCode": null,
+              "nodeId": null
+            }
+          ]
+        }
+      },
+      {
+        "name": "expired_without_results",
+        "appliesTo": ["package", "web", "uniapp"],
+        "value": {
+          "status": "expired",
+          "selectedCandidateIds": [],
+          "candidates": [
+            {
+              "candidateId": "cand-opencode",
+              "provider": "opencode",
+              "displayName": "OpenCode",
+              "version": "1.2.3",
+              "readiness": "ready",
+              "statusReason": null,
+              "registrationState": "unregistered"
+            },
+            {
+              "candidateId": "cand-codex",
+              "provider": "codex",
+              "displayName": "Codex",
+              "version": "2.0.0",
+              "readiness": "ready",
+              "statusReason": null,
+              "registrationState": "unregistered"
+            },
+            {
+              "candidateId": "cand-hermes",
+              "provider": "hermes",
+              "displayName": "Hermes",
+              "version": null,
+              "readiness": "not_ready",
+              "statusReason": "Agent is not signed in",
+              "registrationState": "unregistered"
+            }
+          ],
+          "expiresAt": "2099-01-01T00:05:00+00:00",
+          "results": []
+        }
+      }
+    ],
+    "retryRequest": {
+      "requestId": "retry-request-0001",
+      "candidateIds": ["cand-codex"]
+    },
+    "commandErrors": [
+      { "status": 202, "expectedCode": "pairing_pending" },
+      { "status": 409, "expectedCode": "pairing_conflict" },
+      { "status": 410, "expectedCode": "pairing_expired" },
+      { "status": 429, "expectedCode": "pairing_rate_limited" }
+    ],
+    "deviceTerminalErrors": [
+      {
+        "name": "cancelled",
+        "httpStatus": 410,
+        "body": { "code": 410, "error": "session_cancelled" },
+        "expectedPackageCode": "pairing_cancelled"
+      },
+      {
+        "name": "expired",
+        "httpStatus": 410,
+        "body": { "code": 410, "error": "session_expired" },
+        "expectedPackageCode": "pairing_expired"
+      }
+    ]
+  },
+  "invalid": [
+    {
+      "name": "qr_extra_key",
+      "kind": "qr",
+      "input": {
+        "type": "clawmessenger_pairing",
+        "version": 1,
+        "server": "https://newsradar.dreamdt.cn/im-test",
+        "ticket": "ttttttttttttttttttttttttttttttttttttttttttt",
+        "expiresAt": 4070909100000,
+        "deviceSecret": "must-not-be-accepted"
+      },
+      "configuredServer": "https://newsradar.dreamdt.cn/im-test",
+      "appliesTo": ["package", "web", "uniapp"],
+      "expectedErrors": {
+        "package": "pairing_qr_invalid",
+        "web": "pairing_qr_invalid",
+        "uniapp": "pairing_qr_invalid"
+      }
+    },
+    {
+      "name": "qr_expired_at_clock",
+      "kind": "qr",
+      "input": {
+        "type": "clawmessenger_pairing",
+        "version": 1,
+        "server": "https://newsradar.dreamdt.cn/im-test",
+        "ticket": "ttttttttttttttttttttttttttttttttttttttttttt",
+        "expiresAt": 4070908800000
+      },
+      "configuredServer": "https://newsradar.dreamdt.cn/im-test",
+      "appliesTo": ["package", "web", "uniapp"],
+      "expectedErrors": {
+        "package": "pairing_expired",
+        "web": "pairing_expired",
+        "uniapp": "pairing_expired"
+      }
+    },
+    {
+      "name": "qr_http_production_origin",
+      "kind": "qr",
+      "input": {
+        "type": "clawmessenger_pairing",
+        "version": 1,
+        "server": "http://newsradar.dreamdt.cn/im-test",
+        "ticket": "ttttttttttttttttttttttttttttttttttttttttttt",
+        "expiresAt": 4070909100000
+      },
+      "configuredServer": "http://newsradar.dreamdt.cn/im-test",
+      "appliesTo": ["package", "web", "uniapp"],
+      "expectedErrors": {
+        "package": "pairing_server_invalid",
+        "web": "pairing_server_invalid",
+        "uniapp": "pairing_server_invalid"
+      }
+    },
+    {
+      "name": "duplicate_candidate_ids",
+      "kind": "snapshot",
+      "input": {
+        "status": "waiting",
+        "selectedCandidateIds": [],
+        "candidates": [
+          {
+            "candidateId": "cand-opencode",
+            "provider": "opencode",
+            "displayName": "OpenCode",
+            "version": "1.2.3",
+            "readiness": "ready",
+            "statusReason": null,
+            "registrationState": "unregistered"
+          },
+          {
+            "candidateId": "cand-opencode",
+            "provider": "codex",
+            "displayName": "Codex",
+            "version": "2.0.0",
+            "readiness": "ready",
+            "statusReason": null,
+            "registrationState": "unregistered"
+          }
+        ],
+        "expiresAt": "2099-01-01T00:05:00+00:00"
+      },
+      "appliesTo": ["package", "server", "web", "uniapp"],
+      "expectedErrors": {
+        "package": "pairing_response_invalid",
+        "server": "invalid_candidates",
+        "web": "pairing_response_invalid",
+        "uniapp": "pairing_response_invalid"
+      }
+    },
+    {
+      "name": "oversized_display_name",
+      "kind": "snapshot",
+      "input": {
+        "status": "waiting",
+        "selectedCandidateIds": [],
+        "candidates": [
+          {
+            "candidateId": "cand-opencode",
+            "provider": "opencode",
+            "displayName": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "version": "1.2.3",
+            "readiness": "ready",
+            "statusReason": null,
+            "registrationState": "unregistered"
+          }
+        ],
+        "expiresAt": "2099-01-01T00:05:00+00:00"
+      },
+      "appliesTo": ["package", "server", "web", "uniapp"],
+      "expectedErrors": {
+        "package": "pairing_response_invalid",
+        "server": "invalid_candidates",
+        "web": "pairing_response_invalid",
+        "uniapp": "pairing_response_invalid"
+      }
+    },
+    {
+      "name": "duplicate_retry_candidate_ids",
+      "kind": "retryRequest",
+      "input": {
+        "requestId": "retry-request-0001",
+        "candidateIds": ["cand-codex", "cand-codex"]
+      },
+      "appliesTo": ["package", "server", "web", "uniapp"],
+      "expectedErrors": {
+        "package": "pairing_response_invalid",
+        "server": "invalid_retry_request",
+        "web": "pairing_response_invalid",
+        "uniapp": "pairing_response_invalid"
+      }
+    },
+    {
+      "name": "partial_with_only_success_results",
+      "kind": "progress",
+      "input": {
+        "status": "partial",
+        "selectedCandidateIds": ["cand-opencode"],
+        "candidates": [
+          {
+            "candidateId": "cand-opencode",
+            "provider": "opencode",
+            "displayName": "OpenCode",
+            "version": "1.2.3",
+            "readiness": "ready",
+            "statusReason": null,
+            "registrationState": "unregistered"
+          }
+        ],
+        "expiresAt": "2099-01-01T00:05:00+00:00",
+        "results": [
+          {
+            "candidateId": "cand-opencode",
+            "status": "bound",
+            "errorCode": null,
+            "nodeId": "opencode_fixture-node"
+          }
+        ]
+      },
+      "appliesTo": ["package", "web", "uniapp"],
+      "expectedErrors": {
+        "package": "pairing_response_invalid",
+        "web": "pairing_response_invalid",
+        "uniapp": "pairing_response_invalid"
+      }
+    },
+    {
+      "name": "selection_expansion_after_confirmation",
+      "kind": "selectionTransition",
+      "input": {
+        "initialCandidateIds": ["cand-opencode"],
+        "attemptedCandidateIds": ["cand-opencode", "cand-codex"]
+      },
+      "appliesTo": ["server"],
+      "expectedErrors": {
+        "server": "selection_frozen"
+      }
+    },
+    {
+      "name": "cross_session_candidate_registration",
+      "kind": "crossSessionCandidate",
+      "input": {
+        "candidateId": "cand-foreign"
+      },
+      "appliesTo": ["server"],
+      "expectedErrors": {
+        "server": "candidate_not_selected"
+      }
+    }
+  ]
+}

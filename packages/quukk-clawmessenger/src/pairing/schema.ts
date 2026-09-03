@@ -176,6 +176,39 @@ function pairingProgressSchemaFor(options: PairingClockOptions = {}) {
         }
         seen.add(result.candidateId);
       }
+      const hasExactCoverage =
+        progress.results.length === progress.selectedCandidateIds.length &&
+        progress.selectedCandidateIds.every((candidateId) => seen.has(candidateId));
+      if (
+        (progress.status === 'waiting' || progress.status === 'claimed') &&
+        progress.results.length !== 0
+      ) {
+        context.addIssue({ code: 'custom', path: ['results'], message: 'unexpected_results' });
+      }
+      if (
+        progress.status === 'completed' &&
+        (!hasExactCoverage ||
+          progress.results.some(
+            (result) => result.status !== 'bound' && result.status !== 'already_bound',
+          ))
+      ) {
+        context.addIssue({ code: 'custom', path: ['results'], message: 'invalid_completed_results' });
+      }
+      if (progress.status === 'partial') {
+        const allTerminal = progress.results.every(
+          (result) =>
+            result.status === 'bound' ||
+            result.status === 'already_bound' ||
+            result.status === 'failed',
+        );
+        if (
+          !hasExactCoverage ||
+          !allTerminal ||
+          !progress.results.some((result) => result.status === 'failed')
+        ) {
+          context.addIssue({ code: 'custom', path: ['results'], message: 'invalid_partial_results' });
+        }
+      }
     });
 }
 

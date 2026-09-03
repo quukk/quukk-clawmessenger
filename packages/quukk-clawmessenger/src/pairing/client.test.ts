@@ -1,5 +1,7 @@
 // @vitest-environment node
 
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import { PairingClient, PairingClientError } from './client.js';
@@ -11,6 +13,18 @@ const DEVICE_SECRET = 's'.repeat(43);
 const ABUSE_KEY = 'a'.repeat(64);
 const IDEMPOTENCY_KEY = 'pairing-create-session-0001';
 const EXPIRES_AT = '2099-09-02T12:05:00.000Z';
+const terminalErrorVectors = (JSON.parse(
+  readFileSync(new URL('../protocol/fixtures/pairing-v1.json', import.meta.url), 'utf8'),
+) as {
+  valid: {
+    deviceTerminalErrors: Array<{
+      name: string;
+      httpStatus: number;
+      body: { code: number; error: string };
+      expectedPackageCode: string;
+    }>;
+  };
+}).valid.deviceTerminalErrors;
 const candidate: PairingCandidate = {
   candidateId: 'cand-opencode',
   provider: 'opencode',
@@ -240,18 +254,18 @@ describe('PairingClient', () => {
     });
   });
 
-  it.each([
-    ['session_cancelled', 'pairing_cancelled'],
-    ['session_expired', 'pairing_expired'],
-  ] as const)('strictly distinguishes remote %s terminal errors', async (remoteError, code) => {
-    const fetchSpy = vi.fn(async () => jsonResponse(410, { code: 410, error: remoteError }));
+  it.each(terminalErrorVectors)(
+    'strictly distinguishes canonical remote $name terminal errors',
+    async ({ httpStatus, body, expectedPackageCode }) => {
+    const fetchSpy = vi.fn(async () => jsonResponse(httpStatus, body));
     const client = new PairingClient({ serverUrl: SERVER, fetch: fetchSpy });
 
     await expect(client.pollRetry(TICKET, DEVICE_SECRET)).rejects.toMatchObject({
-      code,
+      code: expectedPackageCode,
       retryable: false,
     });
-  });
+    },
+  );
 
   it('rejects malformed terminal error DTOs without retaining sensitive fields', async () => {
     const fetchSpy = vi.fn(async () => jsonResponse(410, {

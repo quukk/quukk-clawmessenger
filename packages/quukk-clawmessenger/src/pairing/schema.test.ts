@@ -1,5 +1,7 @@
 // @vitest-environment node
 
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -8,10 +10,37 @@ import {
   pairingQrContent,
   pairingQrSchema,
   pairingQrSchemaFor,
+  pairingRetryRequestSchema,
   pairingSelectionSchema,
   pairingSessionSchemaFor,
   pairingSessionSchema,
 } from './schema.js';
+
+type ContractVector = {
+  name: string;
+  kind: 'qr' | 'snapshot' | 'progress' | 'retryRequest' | 'selectionTransition' | 'crossSessionCandidate';
+  input: unknown;
+  configuredServer?: string;
+  appliesTo: string[];
+  expectedErrors: Record<string, string>;
+};
+
+type PairingFixture = {
+  clock: { nowMs: number };
+  configuredServer: string;
+  valid: {
+    qr: { input: unknown; normalized: unknown };
+    candidates: unknown[];
+    snapshots: Array<{ name: string; value: unknown }>;
+    progress: Array<{ name: string; value: unknown }>;
+    retryRequest: unknown;
+  };
+  invalid: ContractVector[];
+};
+
+const contractFixture = JSON.parse(
+  readFileSync(new URL('../protocol/fixtures/pairing-v1.json', import.meta.url), 'utf8'),
+) as PairingFixture;
 
 const TICKET = 't'.repeat(43);
 const DEVICE_SECRET = 's'.repeat(43);
@@ -155,5 +184,59 @@ describe('pairingQrContent', () => {
         { now: () => now },
       ),
     ).toThrow('pairing_expired');
+  });
+});
+
+describe('canonical pairing-v1 fixture', () => {
+  it('parses every valid package-facing QR, candidate, snapshot, progress, and retry vector', () => {
+    expect(
+      pairingQrSchemaFor({ now: () => contractFixture.clock.nowMs }).parse(
+        contractFixture.valid.qr.input,
+      ),
+    ).toEqual(contractFixture.valid.qr.normalized);
+    for (const candidateVector of contractFixture.valid.candidates) {
+      expect(pairingCandidateSchema.parse(candidateVector)).toEqual(candidateVector);
+    }
+    for (const snapshotVector of contractFixture.valid.snapshots) {
+      expect(pairingSelectionSchema.parse(snapshotVector.value)).toEqual(snapshotVector.value);
+    }
+    for (const progressVector of contractFixture.valid.progress) {
+      expect(pairingProgressSchema.parse(progressVector.value)).toEqual(progressVector.value);
+    }
+    expect(pairingRetryRequestSchema.parse(contractFixture.valid.retryRequest)).toEqual(
+      contractFixture.valid.retryRequest,
+    );
+  });
+
+  it('rejects every invalid package-applicable fixture vector with its stable contract code', () => {
+    const vectors = contractFixture.invalid.filter((vector) => vector.appliesTo.includes('package'));
+    expect(vectors.length).toBeGreaterThan(0);
+
+    for (const vector of vectors) {
+      let code = 'accepted';
+      try {
+        if (vector.kind === 'qr') {
+          pairingQrSchemaFor({ now: () => contractFixture.clock.nowMs }).parse(vector.input);
+        } else if (vector.kind === 'snapshot') {
+          pairingSelectionSchema.parse(vector.input);
+        } else if (vector.kind === 'progress') {
+          pairingProgressSchema.parse(vector.input);
+        } else if (vector.kind === 'retryRequest') {
+          pairingRetryRequestSchema.parse(vector.input);
+        } else {
+          throw new Error(`unsupported_fixture_kind:${vector.kind}`);
+        }
+      } catch (error) {
+        const serialized = String(error);
+        code = serialized.includes('pairing_expired')
+          ? 'pairing_expired'
+          : serialized.includes('pairing_server_invalid')
+            ? 'pairing_server_invalid'
+            : vector.kind === 'qr'
+              ? 'pairing_qr_invalid'
+              : 'pairing_response_invalid';
+      }
+      expect(code, vector.name).toBe(vector.expectedErrors.package);
+    }
   });
 });
