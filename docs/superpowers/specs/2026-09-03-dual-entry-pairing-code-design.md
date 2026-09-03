@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-03
 
-**Status:** Approved in chat; awaiting final document review
+**Status:** Approved in chat
 
 **Extends:** `2026-09-02-agent-platform-pairing-design.md`
 
@@ -49,7 +49,7 @@ The short code is an alias for the existing high-entropy pairing session, not a 
 
 The server continues to create a high-entropy public ticket and a separate high-entropy device secret. Protocol v2 additionally creates a short pairing code for the same session. The QR payload remains version 1 and continues to contain only the server origin, public ticket, and expiration.
 
-The server derives an unpredictable code from a cryptographically random session identifier with HMAC-SHA-256 under a dedicated pairing-code key and a domain-separated nonce. Forty output bits are encoded with the approved alphabet. If the unique lookup hash collides with an active or retained code, the server increments the persisted nonce and derives another code before committing the session.
+The server derives an unpredictable code from a cryptographically random session identifier with HMAC-SHA-256 under a dedicated pairing-code key and a domain-separated nonce. Rejection sampling maps HMAC output uniformly across the approved 30-character alphabet's full eight-character space, providing about 39.3 bits of code entropy. If the unique lookup hash collides with an active or retained code, the server increments the persisted nonce and derives another code before committing the session.
 
 The database stores only:
 
@@ -62,12 +62,12 @@ The plaintext code is returned to the plugin and held in memory for display. It 
 
 ### Authenticated resolve and client lock
 
-New Web and UniApp clients generate a 256-bit random `clientClaimKey` when a bind dialog begins. The value stays in component/session memory and is never persisted. Both entry methods call the same authenticated `ai.resolvePairingV2` command:
+New Web and UniApp clients generate a 256-bit random `clientClaimKey` when a bind dialog begins. The value stays in component/session memory and is never persisted. Both entry methods call the same authenticated logical `ai.resolvePairingV2` operation through the direct HTTPS transport clarified below:
 
 - QR input supplies `{ source: "qr", ticket, clientClaimKey }`.
 - Manual input supplies `{ source: "code", code, clientClaimKey }`.
 
-The server derives the user exclusively from the verified RongCloud sender. In one database transaction it:
+The server derives the user exclusively from the verified Bearer login token on the direct resolve request. In one database transaction it:
 
 1. validates and rate-limits the request;
 2. finds the active session by ticket hash or code lookup hash;
@@ -141,6 +141,8 @@ The authenticated system command surface adds:
 - `ai.retryPairingV2({ sessionRef, clientClaimKey, candidateIds, idempotencyKey })`;
 - `ai.cancelPairingV2({ sessionRef, clientClaimKey })`.
 
+Implementation review found that the existing Web and UniApp system-command transport reaches the backend through a RongCloud webhook. That webhook exposes the delivery service's IP, not the user's device IP, so it cannot safely enforce the approved per-IP manual-code limit. Therefore `ai.resolvePairingV2` is the logical operation but is transported by authenticated direct HTTPS as `POST /api/ai/pairing/v2/resolve`, using the existing user Bearer token. The other four follow-up operations continue over the RongCloud system-command transport. The resolve endpoint accepts the same strict payload, returns the same command envelope, and obtains the client address only from the direct request after trusted-proxy normalization. It ignores `X-Forwarded-For` unless the immediate peer belongs to the configured `PAIRING_TRUSTED_PROXY_CIDRS` set.
+
 Each command uses a strict, bounded payload. Exactly one of `ticket` and `code` is allowed according to `source`. User identity fields in client payloads are rejected rather than ignored. Candidate membership and selection immutability follow the original pairing protocol.
 
 ## Persistence and Migration
@@ -168,7 +170,7 @@ A persistent attempt ledger enforces limits consistently across Gunicorn workers
 3. The server returns ticket, device secret, pairing code, and expiration.
 4. The plugin renders the existing QR and a copyable `XXXX-XXXX` code with one countdown.
 5. A signed-in Web or UniApp user chooses camera scan, image scan, or manual entry.
-6. The client creates an in-memory `clientClaimKey` and calls `ai.resolvePairingV2` with the selected source.
+6. The client creates an in-memory `clientClaimKey` and calls the authenticated HTTPS `ai.resolvePairingV2` operation with the selected source.
 7. The server atomically locks the session to the verified user, client key, and entry source; it moves the session to `claimed` with an empty selection and returns `sessionRef` with candidates.
 8. The user selects ready platforms and confirms through `ai.confirmPairingV2`.
 9. The plugin polls with ticket plus device secret, receives the frozen selection, and registers only selected runtimes.
@@ -273,7 +275,7 @@ These fixes do not mask a remote backend outage. The production-test `/health` a
 
 1. Configure and validate the pairing-code HMAC key in the production-test environment.
 2. Deploy database columns, the attempt ledger, and concurrent indexes.
-3. Deploy server v2 creation and authenticated command handlers while retaining v1.
+3. Deploy server v2 creation, authenticated HTTPS resolve, and four authenticated follow-up command handlers while retaining v1.
 4. Verify `/health`, v1 regression behavior, and v2 contract probes.
 5. Release and clean-install the npm beta with dual display and diagnostic fixes.
 6. Deploy Web with QR/manual choice and complete both paths against production test.
