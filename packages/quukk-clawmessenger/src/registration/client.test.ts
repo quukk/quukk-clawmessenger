@@ -23,6 +23,7 @@ const CAPABILITIES = [
   'artifact_html',
   'discussion_roundtable',
   'discussion_model_routing',
+  'discussion_role_recommendation',
 ] as const;
 
 type FetchCall = { url: string; init: RequestInit };
@@ -155,7 +156,7 @@ afterEach(() => {
 });
 
 describe('RegistrationClient', () => {
-  it('publishes the one literal ordered six-capability protocol tuple', () => {
+  it('publishes the one literal ordered seven-capability protocol tuple', () => {
     expect(CLAWMESSENGER_NODE_CAPABILITIES).toEqual(CAPABILITIES);
   });
 
