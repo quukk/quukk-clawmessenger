@@ -19,6 +19,7 @@ interface WorkflowStep {
 interface WorkflowJob {
   if?: string;
   needs?: string | string[];
+  'runs-on'?: string;
   environment?: string;
   concurrency?: {
     group: string;
@@ -218,6 +219,39 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
     });
   });
 
+  it('installs the packed entry through linked paths on Windows, Linux, and macOS', async () => {
+    const workflow = await loadWorkflow();
+    const smoke = requiredJob(workflow, 'smoke-entry');
+    expect(smoke.needs).toBe('build-entry');
+    expect(smoke['runs-on']).toBe('${{ matrix.os }}');
+    expect(smoke.strategy?.matrix.include.map((target) => target.os)).toEqual([
+      'windows-latest',
+      'ubuntu-latest',
+      'macos-latest',
+    ]);
+
+    const download = requiredStep(smoke, 'Download entry package');
+    expect(download.uses).toBe(
+      'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+    );
+    expect(download.with).toMatchObject({
+      name: 'quukk-entry-package',
+      path: '.artifacts/incoming/entry-smoke',
+    });
+    const install = requiredStep(smoke, 'Install and exercise linked entry');
+    expect(install.run).toContain('npm install');
+    expect(install.run).toContain('--global');
+    expect(install.run).toContain('New-Item -ItemType Junction');
+    expect(install.run).toContain('New-Item -ItemType SymbolicLink');
+    expect(install.run).toContain("'quukk-clawmessenger.ps1'");
+    expect(install.run).toContain("'bin/quukk-clawmessenger'");
+    expect(install.run).toContain('--version');
+    expect(install.run).toContain('setup --no-open');
+    expect(install.run).toContain('status --json');
+    expect(install.run).toContain('rescan --json');
+    expect(install.run).toContain('stop');
+  });
+
   it('keeps all six runtime builds reproducible, attested, and credential-free', async () => {
     const workflow = await loadWorkflow();
     const build = requiredJob(workflow, 'build-runtime');
@@ -289,7 +323,7 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
       "github.repository == 'quukk/quukk-clawmessenger' && github.event_name == 'workflow_dispatch' && inputs.publish == true && inputs.entry_only != true && github.ref_protected == true && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/quukk-clawmessenger-v'))",
     );
     expect(publish.environment).toBe('npm-runtime-prerelease');
-    expect(publish.needs).toEqual(['build-runtime', 'build-entry']);
+    expect(publish.needs).toEqual(['build-runtime', 'build-entry', 'smoke-entry']);
     expect(publish.concurrency).toEqual({
       group: 'quukk-clawmessenger-beta-publish',
       'cancel-in-progress': false,
@@ -373,7 +407,7 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
     expect(publish.if?.replace(/\s+/g, ' ').trim()).toBe(
       "github.repository == 'quukk/quukk-clawmessenger' && github.event_name == 'workflow_dispatch' && inputs.publish == true && inputs.entry_only == true && github.ref_protected == true && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/quukk-clawmessenger-v'))",
     );
-    expect(publish.needs).toBe('build-entry');
+    expect(publish.needs).toEqual(['build-entry', 'smoke-entry']);
     expect(publish.environment).toBe('npm-runtime-prerelease');
     expect(publish.concurrency).toEqual({
       group: 'quukk-clawmessenger-beta-publish',
