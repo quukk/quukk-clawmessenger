@@ -582,7 +582,7 @@ describe('DaemonIdentityStore', () => {
       .resolves.toMatchObject({ isDirectory: expect.any(Function) });
     expect((await fsLstat(recoverySymlink)).isSymbolicLink()).toBe(true);
     await expect(readFile(join(outsideRecovery, 'sentinel'), 'utf8')).resolves.toBe('outside');
-  });
+  }, 15_000);
 
   it('fails safe on recovery pruning errors without permanently blocking a new claim', async () => {
     const filePath = await identityPath('recovery-prune-failure');

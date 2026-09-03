@@ -128,6 +128,11 @@ class FakePairingClient {
     input: CreatePairingSessionInput,
     signal?: AbortSignal,
   ) => Promise<PairingSession>) | undefined;
+  pollImplementation: ((
+    ticket: string,
+    deviceSecret: string,
+    signal?: AbortSignal,
+  ) => Promise<PairingSelection>) | undefined;
 
   async createSession(
     input: CreatePairingSessionInput,
@@ -152,6 +157,9 @@ class FakePairingClient {
     signal?: AbortSignal,
   ): Promise<PairingSelection> {
     this.pollCalls.push({ ticket, deviceSecret, signal });
+    if (this.pollImplementation !== undefined) {
+      return this.pollImplementation(ticket, deviceSecret, signal);
+    }
     const selection = deferred<PairingSelection>();
     this.selections.push(selection);
     signal?.addEventListener('abort', () => {
@@ -222,6 +230,7 @@ function harness(
     randomStart?: number;
     now?: () => number;
     sleep?: (milliseconds: number, signal: AbortSignal) => Promise<unknown>;
+    onBindingEnabled?: (enabled: RuntimeBinding) => Promise<void>;
   } = {},
 ) {
   const client = options.client ?? new FakePairingClient();
@@ -236,6 +245,7 @@ function harness(
     installAbuseKey: INSTALL_ABUSE_KEY,
     now: options.now ?? (() => NOW),
     randomBytes,
+    onBindingEnabled: options.onBindingEnabled,
     sleep: options.sleep ?? (async (_milliseconds: number, signal: AbortSignal) => {
       if (signal.aborted) throw new PairingClientError('pairing_cancelled', 'transport', false);
     }),
@@ -320,6 +330,58 @@ describe('PairingService', () => {
     });
   });
 
+  it('activates a newly paired binding before reporting it as bound', async () => {
+    const codex = runtime('codex');
+    const activation = deferred<void>();
+    const activated: RuntimeBinding[] = [];
+    const fixture = harness([codex], {
+      onBindingEnabled: async (enabled) => {
+        activated.push(enabled);
+        await activation.promise;
+      },
+    });
+
+    await fixture.service.start();
+    const candidateId = fixture.client.createCalls[0]!.candidates[0]!.candidateId;
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [candidateId]));
+    await vi.waitFor(() => expect(activated).toEqual([binding(codex)]));
+
+    expect(fixture.service.snapshot()).toMatchObject({
+      state: 'processing',
+      results: [{ candidateId, status: 'registering' }],
+    });
+
+    activation.resolve();
+    await fixture.service.waitForTerminal();
+    expect(fixture.service.snapshot()).toMatchObject({
+      state: 'completed',
+      results: [{ candidateId, status: 'bound' }],
+    });
+  });
+
+  it('keeps activation failures retryable instead of reporting an unusable binding as bound', async () => {
+    const fixture = harness([runtime('codex')], {
+      onBindingEnabled: async () => { throw new Error('unsafe activation detail'); },
+    });
+
+    await fixture.service.start();
+    const candidateId = fixture.client.createCalls[0]!.candidates[0]!.candidateId;
+    fixture.client.selections[0]!.resolve(selected(fixture.client, [candidateId]));
+    await fixture.service.waitForTerminal();
+
+    expect(fixture.service.snapshot()).toMatchObject({
+      state: 'partial',
+      results: [{
+        candidateId,
+        status: 'failed',
+        errorCode: 'runtime_unavailable',
+        retryable: true,
+      }],
+    });
+    expect(JSON.stringify(fixture.service.snapshot())).not.toContain('unsafe activation detail');
+    await fixture.service.cancel();
+  });
+
   it('keeps polling without a default selection and registers only after confirmation', async () => {
     const fixture = harness([runtime('codex')]);
     await fixture.service.start();
@@ -333,6 +395,41 @@ describe('PairingService', () => {
 
     expect(fixture.bindings.calls).toHaveLength(1);
     expect(fixture.bindings.calls[0]!.authorization.candidateId).toBe(candidateId);
+  });
+
+  it('paces waiting polls so a normal scan stays within the server device request budget', async () => {
+    let now = NOW;
+    const requestTimes: number[] = [];
+    const client = new FakePairingClient();
+    const codex = runtime('codex');
+    client.pollImplementation = async () => {
+      const recent = requestTimes.filter((seenAt) => now - seenAt < 60_000);
+      if (recent.length >= 30) {
+        throw new PairingClientError('pairing_rate_limited', 'transport', true);
+      }
+      requestTimes.push(now);
+      const candidateId = client.createCalls[0]!.candidates[0]!.candidateId;
+      return now - NOW >= 20_000
+        ? selected(client, [candidateId])
+        : selected(client, [], { status: 'waiting' });
+    };
+    const fixture = harness([codex], {
+      client,
+      now: () => now,
+      sleep: async (milliseconds, signal) => {
+        if (signal.aborted) throw new PairingClientError('pairing_cancelled', 'transport', false);
+        now += milliseconds;
+        if (now - NOW > 25_000) {
+          throw new PairingClientError('pairing_cancelled', 'transport', false);
+        }
+      },
+    });
+
+    await fixture.service.start();
+    await fixture.service.waitForTerminal();
+
+    expect(fixture.service.snapshot().state).toBe('completed');
+    expect(fixture.bindings.calls).toHaveLength(1);
   });
 
   it('cancels the previous active session before generating a replacement', async () => {

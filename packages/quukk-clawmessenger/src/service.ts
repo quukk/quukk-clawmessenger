@@ -1670,6 +1670,22 @@ async function composeProductionServiceWithin(
       bindings,
       runtimeSource: productionRuntimeSource(client),
       installAbuseKey,
+      onBindingEnabled: async (enabled) => {
+        const supervisor = workers;
+        const activeRouter = router;
+        const fresh = bindings.list();
+        const current = fresh.find((binding) => binding.runtimeId === enabled.runtimeId);
+        if (supervisor === undefined
+          || activeRouter === undefined
+          || current === undefined
+          || !completeEnabledBinding(current)
+          || !exactBinding(current, enabled)) {
+          throw new ServiceError('operation_unavailable');
+        }
+        await activeRouter.activateBinding({ runtimeId: current.runtimeId, nodeId: current.nodeId });
+        await ensureProtectedStorage(paths.rongcloudDir, current.runtimeId);
+        await supervisor.reconcile(supervisorBindings(paths.rongcloudDir, fresh));
+      },
       now: options.now,
     });
     const routerState = factories.createRouterState({ filePath: paths.sessions });

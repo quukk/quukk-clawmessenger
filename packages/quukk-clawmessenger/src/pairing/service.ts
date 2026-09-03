@@ -20,7 +20,7 @@ import type {
   PairingRetryRequest,
 } from './schema.js';
 
-const POLL_DELAY_MS = 500;
+const POLL_DELAY_MS = 3_000;
 const RETRY_POLL_DELAY_MS = 2_500;
 const RETRY_ERROR_BASE_DELAY_MS = 5_000;
 const RETRY_ERROR_MAX_DELAY_MS = 30_000;
@@ -70,6 +70,7 @@ export type PairingServiceDependencies = {
   bindings: PairingBindingPort;
   runtimeSource: PairingRuntimeSource;
   installAbuseKey: string;
+  onBindingEnabled?: (binding: RuntimeBinding) => Promise<void>;
   now?: () => number;
   randomBytes?: (size: number) => Uint8Array;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<unknown>;
@@ -177,6 +178,7 @@ export class PairingService {
   readonly #bindings: PairingBindingPort;
   readonly #runtimeSource: PairingRuntimeSource;
   readonly #installAbuseKey: string;
+  readonly #onBindingEnabled: (binding: RuntimeBinding) => Promise<void>;
   readonly #now: () => number;
   readonly #randomBytes: (size: number) => Uint8Array;
   readonly #sleep: (milliseconds: number, signal: AbortSignal) => Promise<unknown>;
@@ -203,6 +205,7 @@ export class PairingService {
     this.#bindings = dependencies.bindings;
     this.#runtimeSource = dependencies.runtimeSource;
     this.#installAbuseKey = dependencies.installAbuseKey;
+    this.#onBindingEnabled = dependencies.onBindingEnabled ?? (async () => undefined);
     this.#now = dependencies.now ?? (() => Date.now());
     this.#randomBytes = dependencies.randomBytes ?? cryptoRandomBytes;
     this.#sleep = dependencies.sleep ?? abortableSleep;
@@ -482,6 +485,17 @@ export class PairingService {
         );
         if (generation !== this.#generation || signal.aborted) return;
         if (enabled.ok) {
+          try {
+            await this.#onBindingEnabled({ ...enabled.binding });
+          } catch {
+            this.#results.set(candidateId, resultFailure(
+              candidateId,
+              'runtime_unavailable',
+              true,
+            ));
+            return;
+          }
+          if (generation !== this.#generation || signal.aborted) return;
           this.#results.set(candidateId, {
             candidateId,
             status: 'bound',
