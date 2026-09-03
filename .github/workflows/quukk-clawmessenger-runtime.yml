@@ -153,34 +153,41 @@ jobs:
           if ($archives.Count -ne 1) { throw 'entry artifact must contain exactly one tarball' }
           $physical = Join-Path $env:RUNNER_TEMP 'quukk-entry-physical'
           $linked = Join-Path $env:RUNNER_TEMP 'quukk-entry-linked'
-          $smokeHome = Join-Path $env:RUNNER_TEMP 'quukk-entry-home'
-          New-Item -ItemType Directory -Force $physical, $smokeHome | Out-Null
+          New-Item -ItemType Directory -Force $physical | Out-Null
           & npm install --global --prefix $physical --no-audit --no-fund $archives[0].FullName
           if ($LASTEXITCODE -ne 0) { throw 'entry installation failed' }
           if ($IsWindows) {
             New-Item -ItemType Junction -Path $linked -Target $physical | Out-Null
             $packageRoot = Join-Path $physical 'node_modules/quukk-clawmessenger'
-            $entryCommand = Join-Path $linked 'quukk-clawmessenger.ps1'
+            $entryCommands = @(
+              Join-Path $linked 'quukk-clawmessenger.ps1'
+              Join-Path $linked 'quukk-clawmessenger.cmd'
+            )
           } else {
             New-Item -ItemType SymbolicLink -Path $linked -Target $physical | Out-Null
             $packageRoot = Join-Path $physical 'lib/node_modules/quukk-clawmessenger'
-            $entryCommand = Join-Path $linked 'bin/quukk-clawmessenger'
+            $entryCommands = @(Join-Path $linked 'bin/quukk-clawmessenger')
           }
           $expected = & node -p "require(process.argv[1]).version" (Join-Path $packageRoot 'package.json')
-          $reported = & $entryCommand --version
-          if ($LASTEXITCODE -ne 0 -or $reported -ne $expected) { throw 'linked entry version check failed' }
-          $env:HOME = $smokeHome
-          $env:USERPROFILE = $smokeHome
-          & $entryCommand setup --no-open
-          if ($LASTEXITCODE -ne 0) { throw 'linked entry setup failed' }
-          try {
-            & $entryCommand status --json
-            if ($LASTEXITCODE -ne 0) { throw 'linked entry status failed' }
-            & $entryCommand rescan --json
-            if ($LASTEXITCODE -ne 0) { throw 'linked entry rescan failed' }
-          } finally {
-            & $entryCommand stop
-            if ($LASTEXITCODE -ne 0) { throw 'linked entry stop failed' }
+          for ($index = 0; $index -lt $entryCommands.Count; $index += 1) {
+            $entryCommand = $entryCommands[$index]
+            $smokeHome = Join-Path $env:RUNNER_TEMP "quukk-entry-home-$index"
+            New-Item -ItemType Directory -Force $smokeHome | Out-Null
+            $reported = & $entryCommand --version
+            if ($LASTEXITCODE -ne 0 -or $reported -ne $expected) { throw 'linked entry version check failed' }
+            $env:HOME = $smokeHome
+            $env:USERPROFILE = $smokeHome
+            & $entryCommand setup --no-open
+            if ($LASTEXITCODE -ne 0) { throw 'linked entry setup failed' }
+            try {
+              & $entryCommand status --json
+              if ($LASTEXITCODE -ne 0) { throw 'linked entry status failed' }
+              & $entryCommand rescan --json
+              if ($LASTEXITCODE -ne 0) { throw 'linked entry rescan failed' }
+            } finally {
+              & $entryCommand stop
+              if ($LASTEXITCODE -ne 0) { throw 'linked entry stop failed' }
+            }
           }
 
   build-runtime:

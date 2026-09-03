@@ -1,6 +1,6 @@
 {
   "name": "quukk-clawmessenger",
-  "version": "0.1.0-beta.9",
+  "version": "0.1.0-beta.10",
   "description": "Connect local AI agents to ClawMessenger, built on Multica",
   "type": "module",
   "engines": { "node": ">=22.13.0" },

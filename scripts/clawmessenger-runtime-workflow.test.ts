@@ -244,6 +244,7 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
     expect(install.run).toContain('New-Item -ItemType Junction');
     expect(install.run).toContain('New-Item -ItemType SymbolicLink');
     expect(install.run).toContain("'quukk-clawmessenger.ps1'");
+    expect(install.run).toContain("'quukk-clawmessenger.cmd'");
     expect(install.run).toContain("'bin/quukk-clawmessenger'");
     expect(install.run).toContain('--version');
     expect(install.run).toContain('setup --no-open');
