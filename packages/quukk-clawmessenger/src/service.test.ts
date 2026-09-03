@@ -602,7 +602,7 @@ describe('QuukkService lifecycle', () => {
     ]);
 
     expect(outcome).toMatchObject({ code: 'operation_unavailable' });
-    expect(f.identityStore.removed).toEqual([STARTING]);
+    await vi.waitFor(() => expect(f.identityStore.removed).toEqual([STARTING]));
   });
 
   it('performs no constructor I/O and copies only the QUUKK config environment', async () => {
