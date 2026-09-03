@@ -1,7 +1,8 @@
 import { Button } from '@multica/ui/components/ui/button';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import QRCode from 'react-qr-code';
+import * as QRCodeModule from 'react-qr-code';
 
+import { resolveQrCodeComponent } from './qr-code-component';
 import type {
   BridgeApi,
   PairingCandidate,
@@ -10,6 +11,8 @@ import type {
   PairingState,
   PairingStatusReason,
 } from '../types';
+
+const QRCode = resolveQrCodeComponent(QRCodeModule);
 
 const TERMINAL_STATES = new Set<PairingState>([
   'completed',
