@@ -272,13 +272,21 @@ export function PairingPanel({ api, initialSnapshot, now: clock = Date.now }: Pa
       </div>
 
       {displayState === 'waiting' && snapshot.qrContent !== null ? (
-        <div className="grid justify-items-center gap-3 rounded-lg bg-white p-4 sm:justify-self-start">
+        <div className="grid justify-items-center gap-3 rounded-lg bg-white p-4 text-foreground sm:justify-self-start">
           <div role="img" aria-label="Pairing QR code" className="size-56 max-w-full">
             <QRCode value={snapshot.qrContent} size={224} className="size-full" />
           </div>
           <p className="text-center text-body text-foreground">
             Scan with ClawMessenger to choose platforms.
           </p>
+          {snapshot.pairingCode === null ? null : (
+            <div className="grid justify-items-center gap-1" aria-label="Pairing code">
+              <span className="text-caption text-muted-foreground">Or enter this code</span>
+              <strong className="font-mono text-title-lg tracking-[0.28em]">
+                {snapshot.pairingCode}
+              </strong>
+            </div>
+          )}
         </div>
       ) : null}
 

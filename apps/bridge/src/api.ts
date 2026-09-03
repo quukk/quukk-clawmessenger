@@ -422,7 +422,7 @@ const pairingQrSchema = z
 
 const pairingEnvelopeSchema = z
   .object({
-    schemaVersion: z.literal(1),
+    schemaVersion: z.literal(2),
     state: z.enum([
       'idle',
       'waiting',
@@ -434,6 +434,7 @@ const pairingEnvelopeSchema = z
       'expired',
     ]),
     expiresAt: z.iso.datetime({ offset: true }).nullable(),
+    pairingCode: z.string().regex(/^[ABCDEFGHJKMNPQRSTVWXYZ23456789]{8}$/).nullable(),
     qrContent: z.string().min(1).max(8 << 10).nullable(),
     candidates: z.array(pairingCandidateSchema).max(16),
     results: z.array(pairingResultSchema).max(16),
@@ -457,6 +458,7 @@ const pairingEnvelopeSchema = z
     if (value.state === 'idle') {
       if (
         value.expiresAt !== null ||
+        value.pairingCode !== null ||
         value.qrContent !== null ||
         value.candidates.length !== 0 ||
         value.results.length !== 0
@@ -466,7 +468,8 @@ const pairingEnvelopeSchema = z
       return;
     }
     if (value.state === 'waiting') {
-      if (value.expiresAt === null || value.qrContent === null || value.candidates.length === 0) {
+      if (value.expiresAt === null || value.pairingCode === null
+        || value.qrContent === null || value.candidates.length === 0) {
         context.addIssue({ code: 'custom', path: ['state'] });
         return;
       }
@@ -481,7 +484,7 @@ const pairingEnvelopeSchema = z
       if (!parsedQr.success || parsedQr.data.expiresAt !== Date.parse(value.expiresAt)) {
         context.addIssue({ code: 'custom', path: ['qrContent'] });
       }
-    } else if (value.qrContent !== null) {
+    } else if (value.qrContent !== null || value.pairingCode !== null) {
       context.addIssue({ code: 'custom', path: ['qrContent'] });
     }
   })
@@ -489,6 +492,7 @@ const pairingEnvelopeSchema = z
     (value): PairingSnapshot => ({
       state: value.state,
       expiresAt: value.expiresAt,
+      pairingCode: value.pairingCode,
       qrContent: value.qrContent,
       candidates: value.candidates,
       results: value.results.map(({ nodeId: _nodeId, ...result }) => result),

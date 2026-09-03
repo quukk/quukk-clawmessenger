@@ -47,6 +47,7 @@ const emptySettings: BridgeSettings = {
 const pairing: PairingSnapshot = {
   state: 'waiting',
   expiresAt: '2099-09-02T10:05:00.000Z',
+  pairingCode: 'ABCDEF23',
   qrContent: JSON.stringify({
     type: 'clawmessenger_pairing',
     version: 1,
@@ -104,7 +105,9 @@ function createApi(overrides: Partial<BridgeApi> = {}): BridgeApi {
     updateSettings: vi.fn().mockImplementation(async (settings) => settings),
     startPairing: vi.fn().mockResolvedValue(pairing),
     getPairing: vi.fn().mockResolvedValue(pairing),
-    cancelPairing: vi.fn().mockResolvedValue({ ...pairing, state: 'cancelled', qrContent: null }),
+    cancelPairing: vi.fn().mockResolvedValue({
+      ...pairing, state: 'cancelled', pairingCode: null, qrContent: null,
+    }),
     retryPairing: vi.fn().mockResolvedValue(pairing),
     ...overrides,
   };

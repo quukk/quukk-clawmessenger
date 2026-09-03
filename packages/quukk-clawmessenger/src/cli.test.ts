@@ -1168,7 +1168,8 @@ describe('createSystemBrowserPort', () => {
   it.each([
     {
       platform: 'win32' as const,
-      executable: 'explorer.exe',
+      executable: 'rundll32.exe',
+      expectedArgv: ['url.dll,FileProtocolHandler', url],
       expectedEnv: {
         SYSTEMROOT: 'C:\\Windows', WINDIR: 'C:\\Windows', USERPROFILE: 'C:\\Users\\safe',
         TEMP: 'D:\\Temp', TMP: 'D:\\Tmp', PATH: '/usr/local/bin:/usr/bin',
@@ -1178,6 +1179,7 @@ describe('createSystemBrowserPort', () => {
     {
       platform: 'darwin' as const,
       executable: '/usr/bin/open',
+      expectedArgv: [url],
       expectedEnv: {
         HOME: '/home/safe', USER: 'safe-user', LOGNAME: 'safe-user',
         TMPDIR: '/tmp/safe', TEMP: 'D:\\Temp', TMP: 'D:\\Tmp',
@@ -1187,6 +1189,7 @@ describe('createSystemBrowserPort', () => {
     {
       platform: 'linux' as const,
       executable: 'xdg-open',
+      expectedArgv: [url],
       expectedEnv: {
         HOME: '/home/safe', USER: 'safe-user', LOGNAME: 'safe-user',
         TMPDIR: '/tmp/safe', TEMP: 'D:\\Temp', TMP: 'D:\\Tmp',
@@ -1197,7 +1200,7 @@ describe('createSystemBrowserPort', () => {
       },
     },
   ])('uses the fixed $platform opener, URL-only argv, and minimal environment', async ({
-    platform, executable, expectedEnv,
+    platform, executable, expectedArgv, expectedEnv,
   }) => {
     const child = new EventEmitter() as EventEmitter & { unref: ReturnType<typeof vi.fn> };
     child.unref = vi.fn();
@@ -1213,7 +1216,7 @@ describe('createSystemBrowserPort', () => {
 
     await browser.open(url);
 
-    expect(spawn).toHaveBeenCalledWith(executable, [url], {
+    expect(spawn).toHaveBeenCalledWith(executable, expectedArgv, {
       shell: false,
       detached: true,
       stdio: 'ignore',

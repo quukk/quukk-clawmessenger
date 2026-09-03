@@ -91,9 +91,10 @@ const settings: SettingsResponse = {
 };
 const status: ControlStatusResponse = { schemaVersion: 1, identity, state: 'ready' };
 const pairingWaiting = {
-  schemaVersion: 1 as const,
+  schemaVersion: 2 as const,
   state: 'waiting' as const,
   expiresAt: '2099-09-02T10:05:00.000Z',
+  pairingCode: 'ABCDEF23',
   qrContent: JSON.stringify({
     type: 'clawmessenger_pairing',
     version: 1,
@@ -112,7 +113,12 @@ const pairingWaiting = {
   }],
   results: [],
 };
-const pairingCancelled = { ...pairingWaiting, state: 'cancelled' as const, qrContent: null };
+const pairingCancelled = {
+  ...pairingWaiting,
+  state: 'cancelled' as const,
+  pairingCode: null,
+  qrContent: null,
+};
 
 class FakeApi implements LocalApiPort {
   readonly calls: string[] = [];
@@ -381,6 +387,37 @@ describe('LocalRoutes browser boundary', () => {
     expect(value.api.calls).toEqual([
       'pairingStart', 'pairingStatus', 'pairingCancel', 'pairingRetry:cand-a',
     ]);
+  });
+
+  it.each([
+    ['pairing_unauthorized', 401, 'authentication', false],
+    ['pairing_rate_limited', 429, 'transport', true],
+    ['pairing_response_invalid', 502, 'policy', false],
+    ['pairing_transport', 502, 'transport', true],
+    ['pairing_unavailable', 503, 'transport', true],
+    ['pairing_timeout', 504, 'transport', true],
+  ] as const)('returns the stable local HTTP contract for %s', async (
+    code, expectedStatus, category, retryable,
+  ) => {
+    const value = await harness();
+    const session = await browserSession(value);
+    value.api.pairingStart = async () => {
+      throw Object.assign(new Error('SECRET_REMOTE_DETAIL'), { code });
+    };
+
+    const response = await value.send({
+      method: 'POST',
+      path: '/api/pairing/session',
+      headers: {
+        Cookie: session.cookie,
+        Origin: value.origin,
+        'X-Quukk-CSRF': session.csrf,
+      },
+    });
+
+    expect(response.status).toBe(expectedStatus);
+    expect(response.json).toEqual({ error: { code, category, retryable } });
+    expect(response.body).not.toContain('SECRET_REMOTE_DETAIL');
   });
 
   it('rejects unsafe pairing methods, authentication, framing, and retry bodies before effects', async () => {

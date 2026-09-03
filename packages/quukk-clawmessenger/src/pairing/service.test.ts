@@ -6,7 +6,7 @@ import type { RuntimeBinding, TrustedRuntime } from '../config/schema.js';
 import type { EnableResult } from '../bindings/service.js';
 import { PairingClientError, type CreatePairingSessionInput } from './client.js';
 import { PairingService } from './service.js';
-import type { PairingRegistrationAuthorization, PairingSelection, PairingSession } from './schema.js';
+import type { PairingRegistrationAuthorization, PairingSelection, PairingSessionV2 } from './schema.js';
 
 const NOW = Date.parse('2026-09-02T00:00:00.000Z');
 const EXPIRES_AT = '2026-09-02T00:05:00.000Z';
@@ -127,17 +127,17 @@ class FakePairingClient {
   createImplementation: ((
     input: CreatePairingSessionInput,
     signal?: AbortSignal,
-  ) => Promise<PairingSession>) | undefined;
+  ) => Promise<PairingSessionV2>) | undefined;
   pollImplementation: ((
     ticket: string,
     deviceSecret: string,
     signal?: AbortSignal,
   ) => Promise<PairingSelection>) | undefined;
 
-  async createSession(
+  async createSessionV2(
     input: CreatePairingSessionInput,
     signal?: AbortSignal,
-  ): Promise<PairingSession> {
+  ): Promise<PairingSessionV2> {
     this.createCalls.push({ ...input, candidates: input.candidates.map((candidate) => ({ ...candidate })) });
     this.createSignals.push(signal);
     if (this.createImplementation !== undefined) return this.createImplementation(input, signal);
@@ -145,6 +145,7 @@ class FakePairingClient {
     return {
       ticket: marker.repeat(43),
       deviceSecret: marker.toLowerCase().repeat(43),
+      pairingCode: 'ABCDEF23',
       expiresAt: EXPIRES_AT,
       status: 'waiting',
       candidates: input.candidates.map((candidate) => ({ ...candidate })),
@@ -280,6 +281,10 @@ describe('PairingService', () => {
       expect.objectContaining({ provider: 'codex', readiness: 'not_ready', statusReason: 'provider_conflict' }),
     ]);
     expect(snapshot.results).toEqual([]);
+    expect(snapshot).toMatchObject({
+      ticket: 'T'.repeat(43),
+      pairingCode: 'ABCDEF23',
+    });
     expect(fixture.bindings.calls).toEqual([]);
     expect(JSON.stringify(request.candidates)).not.toMatch(/runtimeId|runtimePath|\\tools\\|\/tools\//);
     await fixture.service.cancel();
@@ -420,6 +425,11 @@ describe('PairingService', () => {
 
     expect(fixture.bindings.calls).toHaveLength(1);
     expect(fixture.bindings.calls[0]!.authorization.candidateId).toBe(candidateId);
+    expect(fixture.service.snapshot()).toMatchObject({
+      state: 'completed',
+      ticket: null,
+      pairingCode: null,
+    });
   });
 
   it('paces waiting polls so a normal scan stays within the server device request budget', async () => {
@@ -474,7 +484,7 @@ describe('PairingService', () => {
   });
 
   it('cancels an in-flight creation generation and fences its late response', async () => {
-    const pending = deferred<PairingSession>();
+    const pending = deferred<PairingSessionV2>();
     const client = new FakePairingClient();
     client.createImplementation = async () => pending.promise;
     const fixture = harness([runtime('codex')], { client });
@@ -490,6 +500,7 @@ describe('PairingService', () => {
     pending.resolve({
       ticket: 'T'.repeat(43),
       deviceSecret: 't'.repeat(43),
+      pairingCode: 'ABCDEF23',
       expiresAt: EXPIRES_AT,
       status: 'waiting',
       candidates: request.candidates,
@@ -505,8 +516,8 @@ describe('PairingService', () => {
   });
 
   it('starts a replacement before an abort-ignoring cancelled creation settles', async () => {
-    const firstCreation = deferred<PairingSession>();
-    const secondCreation = deferred<PairingSession>();
+    const firstCreation = deferred<PairingSessionV2>();
+    const secondCreation = deferred<PairingSessionV2>();
     const client = new FakePairingClient();
     client.createImplementation = async () => (
       client.createCalls.length === 1 ? firstCreation.promise : secondCreation.promise
@@ -524,6 +535,7 @@ describe('PairingService', () => {
     secondCreation.resolve({
       ticket: 'U'.repeat(43),
       deviceSecret: 'u'.repeat(43),
+      pairingCode: 'UVWXYZ23',
       expiresAt: EXPIRES_AT,
       status: 'waiting',
       candidates: replacementRequest.candidates,
@@ -541,6 +553,7 @@ describe('PairingService', () => {
     firstCreation.resolve({
       ticket: 'T'.repeat(43),
       deviceSecret: 't'.repeat(43),
+      pairingCode: 'ABCDEF23',
       expiresAt: EXPIRES_AT,
       status: 'waiting',
       candidates: cancelledRequest.candidates,

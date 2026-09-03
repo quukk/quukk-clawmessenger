@@ -13,6 +13,7 @@ const expiresAt = '2099-09-02T10:05:00.000Z';
 const waiting: PairingSnapshot = {
   state: 'waiting',
   expiresAt,
+  pairingCode: 'ABCDEF23',
   qrContent: JSON.stringify({
     type: 'clawmessenger_pairing',
     version: 1,
@@ -44,6 +45,7 @@ const waiting: PairingSnapshot = {
 const completed: PairingSnapshot = {
   ...waiting,
   state: 'completed',
+  pairingCode: null,
   qrContent: null,
   results: [
     {
@@ -68,7 +70,9 @@ function createApi(overrides: Partial<BridgeApi> = {}): BridgeApi {
     updateSettings: vi.fn(),
     startPairing: vi.fn().mockResolvedValue(waiting),
     getPairing: vi.fn().mockResolvedValue(waiting),
-    cancelPairing: vi.fn().mockResolvedValue({ ...waiting, state: 'cancelled', qrContent: null }),
+    cancelPairing: vi.fn().mockResolvedValue({
+      ...waiting, state: 'cancelled', pairingCode: null, qrContent: null,
+    }),
     retryPairing: vi.fn().mockResolvedValue(waiting),
     ...overrides,
   };
@@ -94,6 +98,7 @@ describe('pairing panel', () => {
     const { container } = render(<PairingPanel api={api} initialSnapshot={waiting} />);
 
     expect(screen.getByLabelText(/pairing qr code/i)).toBeVisible();
+    expect(screen.getByLabelText(/pairing code/i)).toHaveTextContent('ABCDEF23');
     expect(screen.getByText(/expires/i)).toBeVisible();
     expect(within(screen.getByTestId('pairing-candidate-opencode')).getByText('OpenCode')).toBeVisible();
     expect(
@@ -210,7 +215,7 @@ describe('pairing panel', () => {
     vi.useFakeTimers();
     const getPairing = vi
       .fn<BridgeApi['getPairing']>()
-      .mockResolvedValueOnce({ ...waiting, state: 'claimed' })
+      .mockResolvedValueOnce({ ...waiting, state: 'claimed', pairingCode: null, qrContent: null })
       .mockResolvedValueOnce(completed);
     render(<PairingPanel api={createApi({ getPairing })} initialSnapshot={waiting} />);
 
@@ -309,7 +314,9 @@ describe('pairing panel', () => {
     expect(startPairing).not.toHaveBeenCalled();
 
     await act(async () => {
-      cancellation.resolve({ ...waiting, state: 'cancelled', qrContent: null });
+      cancellation.resolve({
+        ...waiting, state: 'cancelled', pairingCode: null, qrContent: null,
+      });
       await cancellation.promise;
     });
     expect(startPairing).toHaveBeenCalledTimes(1);
@@ -320,6 +327,7 @@ describe('pairing panel', () => {
     const partial: PairingSnapshot = {
       ...waiting,
       state: 'partial',
+      pairingCode: null,
       qrContent: null,
       results: [
         {

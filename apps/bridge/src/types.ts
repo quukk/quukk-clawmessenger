@@ -96,6 +96,7 @@ export type PairingCandidateResult = {
 export type PairingSnapshot = {
   state: PairingState;
   expiresAt: string | null;
+  pairingCode: string | null;
   qrContent: string | null;
   candidates: readonly PairingCandidate[];
   results: readonly PairingCandidateResult[];

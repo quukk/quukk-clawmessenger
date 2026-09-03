@@ -41,7 +41,7 @@ const providerLabels = {
 
 type PairingClientPort = Pick<
   PairingClient,
-  'createSession' | 'pollSelection' | 'cancelSession' | 'pollRetry' | 'ackRetry'
+  'createSessionV2' | 'pollSelection' | 'cancelSession' | 'pollRetry' | 'ackRetry'
 >;
 
 export type PairingSessionState =
@@ -81,6 +81,7 @@ export type PairingServiceResult = PairingCandidateResult & { retryable: boolean
 export type PairingServiceSnapshot = {
   state: PairingSessionState;
   ticket: string | null;
+  pairingCode: string | null;
   expiresAt: string | null;
   candidates: readonly PairingCandidate[];
   results: readonly PairingServiceResult[];
@@ -184,6 +185,7 @@ export class PairingService {
   readonly #sleep: (milliseconds: number, signal: AbortSignal) => Promise<unknown>;
   #state: PairingSessionState = 'idle';
   #ticket: string | null = null;
+  #pairingCode: string | null = null;
   #expiresAt: string | null = null;
   #candidates: PairingCandidate[] = [];
   #results = new Map<string, PairingServiceResult>();
@@ -212,9 +214,11 @@ export class PairingService {
   }
 
   snapshot(): PairingServiceSnapshot {
+    const exposePairingSecrets = this.#state === 'waiting';
     return {
       state: this.#state,
-      ticket: this.#ticket,
+      ticket: exposePairingSecrets ? this.#ticket : null,
+      pairingCode: exposePairingSecrets ? this.#pairingCode : null,
       expiresAt: this.#expiresAt,
       candidates: this.#candidates.map(cloneCandidate),
       results: this.#selectedCandidates.flatMap((candidateId) => {
@@ -351,6 +355,7 @@ export class PairingService {
       candidates,
     };
     this.#ticket = null;
+    this.#pairingCode = null;
     this.#expiresAt = null;
     this.#candidates = [];
     this.#selectedCandidates = [];
@@ -362,7 +367,7 @@ export class PairingService {
     this.#controller = controller;
     let session;
     try {
-      session = await this.#client.createSession(input, controller.signal);
+      session = await this.#client.createSessionV2(input, controller.signal);
     } catch (error) {
       if (generation === this.#generation) {
         this.#controller = undefined;
@@ -379,14 +384,15 @@ export class PairingService {
       expiresAt: session.expiresAt,
     };
     this.#ticket = session.ticket;
+    this.#pairingCode = session.pairingCode;
     this.#expiresAt = session.expiresAt;
     this.#candidates = candidates.map(cloneCandidate);
     this.#candidateToRuntime = candidateToRuntime;
     this.#readyCandidates = readyCandidates;
     this.#selectedCandidates = [];
     this.#results.clear();
-    this.#state = session.status === 'expired' ? 'expired' : 'waiting';
-    if (this.#state === 'expired' || this.#expired()) {
+    this.#state = 'waiting';
+    if (this.#expired()) {
       this.#state = 'expired';
       this.#clearPrivateState();
       this.#cycle = Promise.resolve();
@@ -436,6 +442,7 @@ export class PairingService {
       }
       if (selection.selectedCandidateIds.length === 0) {
         this.#state = selection.status === 'completed' ? 'completed' : selection.status;
+        if (this.#state !== 'waiting') this.#hidePublicPairingSecrets();
         if (this.#state === 'completed') {
           this.#clearPrivateState();
           return;
@@ -445,6 +452,7 @@ export class PairingService {
       }
       this.#selectedCandidates = [...new Set(selection.selectedCandidateIds)];
       this.#state = 'processing';
+      this.#hidePublicPairingSecrets();
       await this.#registerCandidates(this.#selectedCandidates, generation, signal);
       this.#finishRegistration(generation);
       return;
@@ -651,6 +659,12 @@ export class PairingService {
     this.#candidateToRuntime.clear();
     this.#readyCandidates.clear();
     this.#controller = undefined;
+    this.#hidePublicPairingSecrets();
+  }
+
+  #hidePublicPairingSecrets(): void {
+    this.#ticket = null;
+    this.#pairingCode = null;
   }
 
   #armExpiry(generation: number, controller: AbortController, expiresAt: string): void {

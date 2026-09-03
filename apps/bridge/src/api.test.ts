@@ -7,9 +7,10 @@ import type { BridgeApi } from './types';
 
 const runtimeId = `rt_${'1'.repeat(32)}`;
 const pairingResponse = {
-  schemaVersion: 1 as const,
+  schemaVersion: 2 as const,
   state: 'waiting' as const,
   expiresAt: '2099-09-02T10:05:00.000Z',
+  pairingCode: 'ABCDEF23',
   qrContent: JSON.stringify({
     type: 'clawmessenger_pairing',
     version: 1,
@@ -69,9 +70,15 @@ describe('local bridge API client', () => {
       )
       .mockResolvedValueOnce(response(settingsResponse('https://configured.example')))
       .mockResolvedValueOnce(response(pairingResponse))
-      .mockResolvedValueOnce(response({ ...pairingResponse, state: 'claimed', qrContent: null }))
-      .mockResolvedValueOnce(response({ ...pairingResponse, state: 'cancelled', qrContent: null }))
-      .mockResolvedValueOnce(response({ ...pairingResponse, state: 'processing', qrContent: null }));
+      .mockResolvedValueOnce(response({
+        ...pairingResponse, state: 'claimed', pairingCode: null, qrContent: null,
+      }))
+      .mockResolvedValueOnce(response({
+        ...pairingResponse, state: 'cancelled', pairingCode: null, qrContent: null,
+      }))
+      .mockResolvedValueOnce(response({
+        ...pairingResponse, state: 'processing', pairingCode: null, qrContent: null,
+      }));
     const api = createBridgeApi({
       fetch,
       href: `http://127.0.0.1:48321/#ticket=${ticket}`,

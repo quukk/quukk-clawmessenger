@@ -393,13 +393,16 @@ export function createSystemBrowserPort(
         throw browserFailure();
       }
       const executable = platform === 'win32'
-        ? 'explorer.exe'
+        ? 'rundll32.exe'
         : platform === 'darwin'
           ? '/usr/bin/open'
           : 'xdg-open';
+      const argv = platform === 'win32'
+        ? ['url.dll,FileProtocolHandler', value]
+        : [value];
       let child: BrowserChildProcess;
       try {
-        child = spawn(executable, [value], {
+        child = spawn(executable, argv, {
           shell: false,
           detached: true,
           stdio: 'ignore',

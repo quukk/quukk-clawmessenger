@@ -181,11 +181,12 @@ export type SettingsResponse = z.infer<typeof SettingsResponseSchema>;
 
 const PairingResultSchema = pairingCandidateResultSchema.safeExtend({ retryable: z.boolean() });
 export const PairingResponseSchema = z.strictObject({
-  schemaVersion: z.literal(1),
+  schemaVersion: z.literal(2),
   state: z.enum([
     'idle', 'waiting', 'claimed', 'processing', 'completed', 'partial', 'cancelled', 'expired',
   ]),
   expiresAt: rfc3339.nullable(),
+  pairingCode: z.string().regex(/^[ABCDEFGHJKMNPQRSTVWXYZ23456789]{8}$/).nullable(),
   qrContent: z.string().min(1).max(8 << 10).nullable(),
   candidates: z.array(pairingCandidateSchema).max(PAIRING_MAX_CANDIDATES),
   results: z.array(PairingResultSchema).max(PAIRING_MAX_CANDIDATES),
@@ -282,6 +283,12 @@ const ERROR_DEFINITIONS = {
   bridge_unavailable: { status: 503, category: 'transport', retryable: true },
   ui_unavailable: { status: 503, category: 'transport', retryable: true },
   operation_unavailable: { status: 503, category: 'transport', retryable: true },
+  pairing_unauthorized: { status: 401, category: 'authentication', retryable: false },
+  pairing_rate_limited: { status: 429, category: 'transport', retryable: true },
+  pairing_response_invalid: { status: 502, category: 'policy', retryable: false },
+  pairing_transport: { status: 502, category: 'transport', retryable: true },
+  pairing_unavailable: { status: 503, category: 'transport', retryable: true },
+  pairing_timeout: { status: 504, category: 'transport', retryable: true },
   operation_timeout: { status: 504, category: 'transport', retryable: true },
 } as const satisfies Record<string, ErrorDefinition>;
 export type PublicErrorCode = keyof typeof ERROR_DEFINITIONS;

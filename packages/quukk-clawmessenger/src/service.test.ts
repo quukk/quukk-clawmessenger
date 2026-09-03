@@ -292,6 +292,7 @@ class FakePairing {
   snapshotValue: PairingServiceSnapshot = {
     state: 'waiting',
     ticket: 'p'.repeat(43),
+    pairingCode: 'ABCDEF23',
     expiresAt: '2099-09-02T10:05:00.000Z',
     candidates: [{
       candidateId: 'cand-a', provider: 'opencode', displayName: 'OpenCode', version: '1.2.3',
@@ -860,6 +861,25 @@ describe('QuukkService lifecycle', () => {
 });
 
 describe('QuukkService mutations', () => {
+  it.each([
+    'pairing_timeout',
+    'pairing_transport',
+    'pairing_unauthorized',
+    'pairing_response_invalid',
+    'pairing_rate_limited',
+    'pairing_unavailable',
+  ] as const)('preserves the explicit %s failure from remote pairing creation', async (code) => {
+    const f = await fixture();
+    await start(f);
+    f.pairing.startHook = async () => {
+      throw Object.assign(new Error('SECRET_REMOTE_PAIRING_DETAIL'), { code });
+    };
+
+    await expect(f.service.pairingStart(new AbortController().signal))
+      .rejects.toMatchObject({ code, message: code });
+    await f.service.stop();
+  });
+
   it('deduplicates concurrent pairing starts inside the external mutation gate and projects a safe snapshot', async () => {
     const f = await fixture();
     await start(f);
@@ -889,9 +909,10 @@ describe('QuukkService mutations', () => {
     const [left, right] = await Promise.all([first, second]);
     expect(left).toEqual(right);
     expect(left).toEqual({
-      schemaVersion: 1,
+      schemaVersion: 2,
       state: 'waiting',
       expiresAt: '2099-09-02T10:05:00.000Z',
+      pairingCode: 'ABCDEF23',
       qrContent: JSON.stringify({
         type: 'clawmessenger_pairing', version: 1, server: DEFAULT_CONFIG.serverUrl,
         ticket: 'p'.repeat(43), expiresAt: Date.parse('2099-09-02T10:05:00.000Z'),
@@ -940,7 +961,7 @@ describe('QuukkService mutations', () => {
 
     expect(firstPromptResult).toMatchObject({ code: 'operation_unavailable' });
     expect(secondResult).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       state: 'waiting',
       qrContent: expect.any(String),
     });

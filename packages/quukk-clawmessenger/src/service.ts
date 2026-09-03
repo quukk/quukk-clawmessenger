@@ -223,7 +223,13 @@ export type ServiceErrorCode =
   | 'operation_unavailable'
   | 'bridge_unavailable'
   | 'runtime_not_found'
-  | 'config_recovery_required';
+  | 'config_recovery_required'
+  | 'pairing_timeout'
+  | 'pairing_transport'
+  | 'pairing_unauthorized'
+  | 'pairing_response_invalid'
+  | 'pairing_rate_limited'
+  | 'pairing_unavailable';
 
 export class ServiceError extends Error {
   constructor(readonly code: ServiceErrorCode) {
@@ -409,6 +415,11 @@ function normalizedServiceError(error: unknown, fallback: ServiceErrorCode): Ser
   const code = explicitCode(error);
   if (code === 'runtime_not_found') return new ServiceError('runtime_not_found');
   if (code === 'config_recovery_required') return new ServiceError('config_recovery_required');
+  if (code === 'pairing_timeout' || code === 'pairing_transport'
+    || code === 'pairing_unauthorized' || code === 'pairing_response_invalid'
+    || code === 'pairing_rate_limited' || code === 'pairing_unavailable') {
+    return new ServiceError(code);
+  }
   return new ServiceError(fallback);
 }
 
@@ -1357,9 +1368,10 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
       qrContent = JSON.stringify(qr);
     }
     const parsed = PairingResponseSchema.safeParse({
-      schemaVersion: 1,
+      schemaVersion: 2,
       state: snapshot.state,
       expiresAt: snapshot.expiresAt,
+      pairingCode: snapshot.pairingCode,
       qrContent,
       candidates: snapshot.candidates.map((candidate) => ({
         candidateId: candidate.candidateId,
