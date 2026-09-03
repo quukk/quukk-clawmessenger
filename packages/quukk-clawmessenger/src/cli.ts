@@ -2324,7 +2324,11 @@ export function packagedCliCandidate(
   const packagedBinPath = resolve(packageRoot, 'bin', 'quukk-clawmessenger.js');
   const invokedBinPath = resolve(processArgv[1]!);
   const localShimPath = resolve(dirname(packageRoot), '.bin', 'quukk-clawmessenger');
-  const invokedFromBinDirectory = basename(invokedBinPath) === 'quukk-clawmessenger'
+  const invokedFilename = basename(invokedBinPath);
+  const invokedFromBinDirectory = (
+    invokedFilename === 'quukk-clawmessenger'
+    || invokedFilename === 'quukk-clawmessenger.js'
+  )
     && (basename(dirname(invokedBinPath)) === 'bin' || basename(dirname(invokedBinPath)) === '.bin');
   if (
     invokedBinPath !== packagedBinPath

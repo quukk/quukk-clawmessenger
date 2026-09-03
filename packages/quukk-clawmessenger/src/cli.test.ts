@@ -2758,6 +2758,25 @@ describe('createProductionCliRuntime', () => {
     ], pathToFileURL(resolve(packageRoot, 'src', 'cli.ts')).href)).toBeUndefined();
   });
 
+  it('accepts the packaged bin through a linked package root before native realpath verification', () => {
+    const physicalPackageRoot = resolve(
+      'nvm-versions', 'v22.16.0', 'node_modules', 'quukk-clawmessenger',
+    );
+    const linkedPackageRoot = resolve(
+      'nvm-current', 'node_modules', 'quukk-clawmessenger',
+    );
+    const invokedBinPath = resolve(linkedPackageRoot, 'bin', 'quukk-clawmessenger.js');
+    const packagedBinPath = resolve(physicalPackageRoot, 'bin', 'quukk-clawmessenger.js');
+
+    expect(packagedCliCandidate([
+      EXECUTABLE, invokedBinPath, 'setup', '--no-open',
+    ], pathToFileURL(resolve(physicalPackageRoot, 'dist', 'cli.js')).href)).toEqual({
+      invokedBinPath,
+      packagedBinPath,
+      argv: ['setup', '--no-open'],
+    });
+  });
+
   it('runs once only after native realpaths match and passes explicit production defaults', async () => {
     const packageRoot = resolve('selfexec-entry', 'node_modules', 'quukk-clawmessenger');
     const packagedBinPath = resolve(packageRoot, 'bin', 'quukk-clawmessenger.js');

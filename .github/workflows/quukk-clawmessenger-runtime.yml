@@ -126,6 +126,63 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  smoke-entry:
+    needs: build-entry
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+          - os: ubuntu-latest
+          - os: macos-latest
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Download entry package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: quukk-entry-package
+          path: .artifacts/incoming/entry-smoke
+      - name: Install and exercise linked entry
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archives = @(Get-ChildItem '.artifacts/incoming/entry-smoke' -Filter '*.tgz' -File)
+          if ($archives.Count -ne 1) { throw 'entry artifact must contain exactly one tarball' }
+          $physical = Join-Path $env:RUNNER_TEMP 'quukk-entry-physical'
+          $linked = Join-Path $env:RUNNER_TEMP 'quukk-entry-linked'
+          $smokeHome = Join-Path $env:RUNNER_TEMP 'quukk-entry-home'
+          New-Item -ItemType Directory -Force $physical, $smokeHome | Out-Null
+          & npm install --global --prefix $physical --no-audit --no-fund $archives[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'entry installation failed' }
+          if ($IsWindows) {
+            New-Item -ItemType Junction -Path $linked -Target $physical | Out-Null
+            $packageRoot = Join-Path $physical 'node_modules/quukk-clawmessenger'
+            $entryCommand = Join-Path $linked 'quukk-clawmessenger.ps1'
+          } else {
+            New-Item -ItemType SymbolicLink -Path $linked -Target $physical | Out-Null
+            $packageRoot = Join-Path $physical 'lib/node_modules/quukk-clawmessenger'
+            $entryCommand = Join-Path $linked 'bin/quukk-clawmessenger'
+          }
+          $expected = & node -p "require(process.argv[1]).version" (Join-Path $packageRoot 'package.json')
+          $reported = & $entryCommand --version
+          if ($LASTEXITCODE -ne 0 -or $reported -ne $expected) { throw 'linked entry version check failed' }
+          $env:HOME = $smokeHome
+          $env:USERPROFILE = $smokeHome
+          & $entryCommand setup --no-open
+          if ($LASTEXITCODE -ne 0) { throw 'linked entry setup failed' }
+          try {
+            & $entryCommand status --json
+            if ($LASTEXITCODE -ne 0) { throw 'linked entry status failed' }
+            & $entryCommand rescan --json
+            if ($LASTEXITCODE -ne 0) { throw 'linked entry rescan failed' }
+          } finally {
+            & $entryCommand stop
+            if ($LASTEXITCODE -ne 0) { throw 'linked entry stop failed' }
+          }
+
   build-runtime:
     if: >-
       github.event_name != 'workflow_dispatch' ||
@@ -246,6 +303,7 @@ jobs:
     needs:
       - build-runtime
       - build-entry
+      - smoke-entry
     runs-on: ubuntu-latest
     environment: npm-runtime-prerelease
     concurrency:
@@ -534,7 +592,9 @@ jobs:
       github.ref_protected == true &&
       (github.ref == 'refs/heads/main' ||
       startsWith(github.ref, 'refs/tags/quukk-clawmessenger-v'))
-    needs: build-entry
+    needs:
+      - build-entry
+      - smoke-entry
     runs-on: ubuntu-latest
     environment: npm-runtime-prerelease
     concurrency:
