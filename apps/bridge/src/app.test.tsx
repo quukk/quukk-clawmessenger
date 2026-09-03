@@ -274,7 +274,7 @@ describe('bridge app', () => {
     await vi.waitFor(() => expect(getRuntimes).toHaveBeenCalledTimes(3));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(
-      within(screen.getByTestId('runtime-opencode')).getByLabelText(/status: online/i),
+      await within(screen.getByTestId('runtime-opencode')).findByLabelText(/status: online/i),
     ).toBeVisible();
   });
 

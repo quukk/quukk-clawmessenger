@@ -234,6 +234,9 @@ const ENTRY_MODULES = [
   'logging/logger',
   'migration/discover',
   'migration/import',
+  'pairing/client',
+  'pairing/schema',
+  'pairing/service',
   'process/identity',
   'process/service-identity',
   'process/supervisor',
@@ -463,7 +466,7 @@ describe('audit-tarball', () => {
   it('accepts an exact entry listing with legal files, bin, UI assets, worker, and npm manifest', async () => {
     const fixture = await entryFixture();
 
-    expect(ENTRY_FILES).toHaveLength(100);
+    expect(ENTRY_FILES).toHaveLength(106);
     await expect(auditTarball({
       packJsonPath: fixture.report,
       packageDirectory: fixture.entry,
