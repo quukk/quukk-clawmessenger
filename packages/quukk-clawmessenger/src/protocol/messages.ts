@@ -35,6 +35,8 @@ export const EXTERNAL_MESSAGE_TYPES = [
   'discussion_node_error',
   'discussion_model_catalog_request',
   'discussion_model_catalog_response',
+  'discussion_role_recommendation_request',
+  'discussion_role_recommendation_response',
   'discussion_wire_chunk',
 ] as const;
 
@@ -106,6 +108,8 @@ const v2AndCardTypes = new Set<string>([
   'discussion_node_error',
   'discussion_model_catalog_request',
   'discussion_model_catalog_response',
+  'discussion_role_recommendation_request',
+  'discussion_role_recommendation_response',
   'discussion_wire_chunk',
 ]);
 const cardEnvelopeTypes = new Set<string>(['card_message', 'card_update', 'command_result']);
@@ -126,6 +130,9 @@ const rawContentKeys = new Set([
   'memberPositions', 'agreements', 'disagreements', 'openQuestions', 'nextFocus', 'recommendation',
   'artifactType', 'instructions', 'operation', 'baseVersion', 'isFinal', 'category', 'defaultModel',
   'providers', 'messageId', 'sha256', 'chunkIndex', 'chunkCount', 'schema', 'card',
+  'max_roles', 'candidates', 'recommendation_prompt', 'config_version', 'node_id', 'display_name',
+  'runtime_type', 'capabilities', 'default_model', 'models', 'role_name', 'role_prompt',
+  'speaking_order', 'error_code',
 ]);
 const invalidClone = Symbol('invalid-clone');
 const oversizedClone = Symbol('oversized-clone');

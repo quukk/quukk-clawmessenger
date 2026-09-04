@@ -17,6 +17,8 @@ import {
   discussionV2LogicalKey,
   parseDiscussionModelCatalogRequest,
   parseDiscussionModelCatalogResponse,
+  parseRoleRecommendationRequest,
+  parseRoleRecommendationResponse,
   parseDiscussionV2Command,
   parseHostDecision,
   type DiscussionArtifactAck,
@@ -39,6 +41,36 @@ const fixture = JSON.parse(
 ) as V2Fixture;
 
 const clone = <T>(value: T): T => structuredClone(value);
+
+const roleRecommendationRequest = {
+  msg_type: 'discussion_role_recommendation_request',
+  request_id: 'request-demo-001',
+  topic: 'Fixture migration decision',
+  goal: 'Choose a safe rollout plan',
+  max_roles: 2,
+  candidates: [
+    {
+      node_id: 'node-role-a',
+      display_name: 'Role A',
+      runtime_type: 'codex',
+      capabilities: ['discussion_model_routing', 'discussion_participant', 'discussion_roundtable'],
+      default_model: 'openai/gpt-5',
+      models: ['openai/gpt-5'],
+      status: 'online',
+    },
+    {
+      node_id: 'node-role-b',
+      display_name: 'Role B',
+      runtime_type: 'opencode',
+      capabilities: ['discussion_model_routing', 'discussion_participant', 'discussion_roundtable'],
+      default_model: null,
+      models: [],
+      status: 'online',
+    },
+  ],
+  recommendation_prompt: 'private instruction',
+  config_version: 1,
+};
 
 describe('discussion v2 strict inputs', () => {
   it('parses all four exact command fixtures', () => {
@@ -84,6 +116,64 @@ describe('discussion v2 strict inputs', () => {
       ...fixture.artifactAck,
       idempotencyKey: 'different-update',
     })).toBeNull();
+  });
+});
+
+describe('discussion role recommendation protocol', () => {
+  it('parses exact candidate assignments and normalizes wire field names', () => {
+    expect(parseRoleRecommendationRequest(roleRecommendationRequest)).toMatchObject({
+      msgType: 'discussion_role_recommendation_request',
+      requestId: 'request-demo-001',
+      topic: 'Fixture migration decision',
+      candidates: [
+        { nodeId: 'node-role-a', runtimeType: 'codex', status: 'online' },
+        { nodeId: 'node-role-b', runtimeType: 'opencode', status: 'online' },
+      ],
+    });
+  });
+
+  it('rejects extra keys, duplicate candidates, offline candidates and invalid bounds', () => {
+    expect(parseRoleRecommendationRequest({ ...roleRecommendationRequest, extra: true })).toBeNull();
+    expect(parseRoleRecommendationRequest({
+      ...roleRecommendationRequest,
+      candidates: [roleRecommendationRequest.candidates[0], roleRecommendationRequest.candidates[0]],
+    })).toBeNull();
+    expect(parseRoleRecommendationRequest({
+      ...roleRecommendationRequest,
+      candidates: [{ ...roleRecommendationRequest.candidates[0], status: 'offline' }],
+    })).toBeNull();
+    expect(parseRoleRecommendationRequest({
+      ...roleRecommendationRequest,
+      candidates: Array.from({ length: 9 }, (_, index) => ({
+        ...roleRecommendationRequest.candidates[0], node_id: `node-${index}`,
+      })),
+    })).toBeNull();
+    expect(parseRoleRecommendationRequest({
+      ...roleRecommendationRequest,
+      candidates: [{ ...roleRecommendationRequest.candidates[0], models: ['invalid model'] }],
+    })).toBeNull();
+    expect(parseRoleRecommendationRequest({ ...roleRecommendationRequest, topic: 'x'.repeat(4_001) })).toBeNull();
+  });
+
+  it('validates strict response assignments against the request candidates', () => {
+    const request = parseRoleRecommendationRequest(roleRecommendationRequest)!;
+    expect(parseRoleRecommendationResponse({
+      roles: [
+        {
+          role_name: '架构师', role_prompt: '评估边界', node_id: 'node-role-a',
+          model: 'openai/gpt-5', speaking_order: 0,
+        },
+        {
+          role_name: '交付负责人', role_prompt: '评估发布', node_id: 'node-role-b',
+          model: null, speaking_order: 1,
+        },
+      ],
+    }, request)).toHaveLength(2);
+    expect(parseRoleRecommendationResponse({
+      roles: [{
+        role_name: '未知', role_prompt: '无效', node_id: 'unknown', model: null, speaking_order: 0,
+      }],
+    }, request)).toBeNull();
   });
 });
 

@@ -24,6 +24,7 @@ const CAPABILITIES = [
   'discussion_roundtable',
   'discussion_model_routing',
   'discussion_role_recommendation',
+  'discussion_role_auto_assignment',
 ] as const;
 
 type FetchCall = { url: string; init: RequestInit };

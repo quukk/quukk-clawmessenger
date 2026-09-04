@@ -181,6 +181,31 @@ function discussionCancel(overrides: Record<string, unknown> = {}): Record<strin
   };
 }
 
+function roleRecommendationRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    msg_type: 'discussion_role_recommendation_request',
+    request_id: 'recommend-1',
+    topic: 'Choose an API migration plan',
+    goal: 'Reach a safe decision',
+    max_roles: 2,
+    candidates: [
+      {
+        node_id: 'node-a', display_name: 'Codex A', runtime_type: 'codex',
+        capabilities: ['discussion_participant'], default_model: 'openai/gpt-5',
+        models: ['openai/gpt-5'], status: 'online',
+      },
+      {
+        node_id: 'node-b', display_name: 'OpenCode B', runtime_type: 'opencode',
+        capabilities: ['discussion_participant'], default_model: null,
+        models: [], status: 'online',
+      },
+    ],
+    recommendation_prompt: 'Recommend complementary roles.',
+    config_version: 1,
+    ...overrides,
+  };
+}
+
 class RecordingStateStore extends RouterStateStore {
   readonly order: string[];
   failAdmit = false;
@@ -2776,6 +2801,120 @@ describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
     expect(fixture.sent.some(({ input }) => input.messageType === 'command_result'
       && input.content.msg_type === 'discussion_model_catalog_response'
       && input.content.requestId === 'catalog-request')).toBe(true);
+  });
+
+  it('runs a system role recommendation task and returns strict assignments', async () => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', { output: JSON.stringify({
+        roles: [
+          {
+            role_name: '架构师', role_prompt: '评估边界', node_id: 'node-a',
+            model: 'openai/gpt-5', speaking_order: 0,
+          },
+          {
+            role_name: '交付负责人', role_prompt: '评估发布', node_id: 'node-b',
+            model: null, speaking_order: 1,
+          },
+        ],
+      }) });
+    })());
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'role-recommendation',
+      roleRecommendationRequest(),
+      { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+    )));
+
+    expect(fixture.starts).toHaveLength(1);
+    expect(fixture.starts[0]!.prompt).toContain('Use each node_id at most once');
+    expect(fixture.sent.some(({ input }) => input.messageType === 'command_result'
+      && input.content.msg_type === 'discussion_role_recommendation_response'
+      && input.content.request_id === 'recommend-1'
+      && Array.isArray(input.content.roles))).toBe(true);
+  });
+
+  it.each([
+    ['Markdown-wrapped output', '```json\n{"roles":[]}\n```'],
+    ['unknown candidate', JSON.stringify({ roles: [{
+      role_name: '未知', role_prompt: '无效', node_id: 'unknown', model: null, speaking_order: 0,
+    }] })],
+    ['duplicate candidate', JSON.stringify({ roles: [
+      { role_name: 'A', role_prompt: 'A', node_id: 'node-a', model: null, speaking_order: 0 },
+      { role_name: 'B', role_prompt: 'B', node_id: 'node-a', model: null, speaking_order: 1 },
+    ] })],
+  ])('returns a safe role error for %s', async (_label, output) => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', { output });
+    })());
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      `role-invalid-${_label}`,
+      roleRecommendationRequest(),
+      { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+    )));
+
+    expect(fixture.sent.some(({ input }) => input.messageType === 'command_result'
+      && input.content.msg_type === 'discussion_role_recommendation_response'
+      && input.content.error_code === 'role_recommendation_invalid')).toBe(true);
+  });
+
+  it('returns a safe role error when the recommendation task fails', async () => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'failed', {
+        error: { category: 'model', code: 'raw-private-error', message: 'must not leak', retryable: false },
+      });
+    })());
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'role-failed',
+      roleRecommendationRequest(),
+      { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+    )));
+
+    const response = fixture.sent.find(({ input }) => input.messageType === 'command_result'
+      && input.content.msg_type === 'discussion_role_recommendation_response')?.input.content;
+    expect(response?.error_code).toBe('role_recommendation_invalid');
+    expect(JSON.stringify(response)).not.toContain('must not leak');
+  });
+
+  it('cancels a timed-out role recommendation and returns a safe timeout error', async () => {
+    let expire!: () => void;
+    const fixture = await routerHarness({
+      timers: {
+        setTimeout(callback) {
+          expire = callback;
+          return 1;
+        },
+        clearTimeout() {},
+      },
+    });
+    let resolveNext!: (value: IteratorResult<BridgeTaskEvent>) => void;
+    fixture.setEvents(() => ({
+      [Symbol.asyncIterator]: () => ({
+        next: () => new Promise((resolve) => { resolveNext = resolve; }),
+        return: async () => {
+          resolveNext({ done: true, value: undefined });
+          return { done: true, value: undefined };
+        },
+      }),
+    }));
+
+    const pending = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'role-timeout',
+      roleRecommendationRequest(),
+      { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+    )));
+    await vi.waitFor(() => expect(fixture.starts).toHaveLength(1));
+    expire();
+    await pending;
+
+    expect(fixture.cancellations).toEqual(['task_1_1']);
+    expect(fixture.sent.some(({ input }) => input.messageType === 'command_result'
+      && input.content.msg_type === 'discussion_role_recommendation_response'
+      && input.content.error_code === 'role_recommendation_timeout')).toBe(true);
   });
 
   it('routes a reassembled payload larger than the generic 64 KiB protocol limit through the exact v2 parser', async () => {

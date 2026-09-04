@@ -36,6 +36,8 @@ import {
   buildNodeError,
   discussionV2LogicalKey,
   parseDiscussionModelCatalogRequest,
+  parseRoleRecommendationRequest,
+  parseRoleRecommendationResponse,
   parseDiscussionV2Command,
   parseHostDecision,
   type ArtifactAckExpectation,
@@ -43,6 +45,7 @@ import {
   type DiscussionAssignment,
   type DiscussionHostTurn,
   type HostDecision,
+  type RoleRecommendationRequest,
 } from '../protocol/discussion-v2.js';
 import { DiscussionWireReassembler, encodeDiscussionWire } from '../protocol/discussion-wire.js';
 import {
@@ -74,6 +77,7 @@ const OUTPUT_FLUSH_MS = 250;
 const OUTPUT_EARLY_FLUSH_BYTES = 16 * 1024;
 const OUTPUT_CHUNK_BYTES = 32 * 1024;
 const TASK_WATCHDOG_MS = 2 * 60 * 60 * 1_000 + 60_000;
+const ROLE_RECOMMENDATION_WATCHDOG_MS = 3 * 60 * 1_000;
 const MAX_BUFFERED_OUTPUT_ENTRIES = 32;
 const MAX_BUFFERED_OUTPUT_BYTES = 1024 * 1024;
 const TRANSIENT_OUTPUT_CODES = new Set([
@@ -398,6 +402,7 @@ const RESPONSE_ONLY_TYPES = new Set<ExternalMessageType>([
   'discussion_artifact_update',
   'discussion_node_error',
   'discussion_model_catalog_response',
+  'discussion_role_recommendation_response',
 ]);
 
 const DEVICE_COMMANDS = new Set<DeviceCommand>([
@@ -813,7 +818,8 @@ export class MessageRouter {
       || msgType === 'discussion_assignment'
       || msgType === 'discussion_cancel'
       || msgType === 'discussion_artifact_ack'
-      || msgType === 'discussion_model_catalog_request') {
+      || msgType === 'discussion_model_catalog_request'
+      || msgType === 'discussion_role_recommendation_request') {
       await this.#dispatchDiscussion(identity, message, msgType, value, false);
       return;
     }
@@ -936,6 +942,10 @@ export class MessageRouter {
     }
     if (msgType === 'discussion_model_catalog_request') {
       await this.#runDiscussionCatalog(identity, message, value, physicalAdmitted);
+      return;
+    }
+    if (msgType === 'discussion_role_recommendation_request') {
+      await this.#runRoleRecommendation(identity, message, value, physicalAdmitted);
       return;
     }
     if (msgType !== 'discussion_token'
@@ -2117,6 +2127,147 @@ export class MessageRouter {
       return;
     }
     if (claim) await this.#admitOnly(identity, message, claim, generation, outputSent);
+  }
+
+  async #runRoleRecommendation(
+    identity: WorkerIdentity,
+    message: NormalizedRongCloudMessage,
+    value: Record<string, unknown>,
+    physicalAdmitted: boolean,
+  ): Promise<void> {
+    const generation = this.#bindingGeneration(identity);
+    const conversation = conversationFrom(message, identity);
+    const claim = physicalAdmitted
+      ? undefined
+      : await this.#claimLocal(identity, message.messageUid, conversation, generation);
+    if (!physicalAdmitted && !claim) return;
+    const request = message.senderId === 'system'
+      ? parseRoleRecommendationRequest(value)
+      : null;
+    if (!request) {
+      if (claim) await this.#admitOnly(identity, message, claim, generation);
+      return;
+    }
+
+    let taskId: string | undefined;
+    let iterator: AsyncIterator<BridgeTaskEvent> | undefined;
+    let watchdog: unknown;
+    try {
+      await this.#recheckBinding(identity);
+      this.#requireBindingGeneration(identity, generation);
+      const workdir = await this.#binding.authorizeDefaultWorkdir(identity);
+      this.#requireBindingGeneration(identity, generation);
+      await this.#recheckBinding(identity);
+      this.#requireBindingGeneration(identity, generation);
+      const prompt = this.#roleRecommendationPrompt(request);
+      if (Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES) throw new Error('prompt_too_large');
+      const started = await this.#task.startTask({
+        runtimeId: identity.runtimeId,
+        conversationKey: conversationKey(conversation),
+        prompt,
+        workdir,
+      });
+      taskId = started.taskId;
+      this.#requireBindingGeneration(identity, generation);
+      iterator = this.#task.events(taskId)[Symbol.asyncIterator]();
+      const output = await this.#collectRoleRecommendation(taskId, iterator, (timer) => {
+        watchdog = timer;
+      });
+      this.#requireBindingGeneration(identity, generation);
+      const roles = output.kind === 'completed'
+        ? parseRoleRecommendationResponse(JSON.parse(output.output.trim()) as unknown, request)
+        : null;
+      const response = this.#structuredResponse(conversation, 'command_result', roles === null ? {
+        msg_type: 'discussion_role_recommendation_response',
+        request_id: request.requestId,
+        error_code: output.kind === 'timeout'
+          ? 'role_recommendation_timeout'
+          : 'role_recommendation_invalid',
+      } : {
+        msg_type: 'discussion_role_recommendation_response',
+        request_id: request.requestId,
+        roles: roles.map((role) => ({
+          role_name: role.roleName,
+          role_prompt: role.rolePrompt,
+          node_id: role.nodeId,
+          model: role.model,
+          speaking_order: role.speakingOrder,
+        })),
+      });
+      if (claim) {
+        await this.#finishRead(identity, message, conversation, claim, response, generation);
+      } else {
+        await this.#sendWorker(identity, response);
+      }
+    } catch {
+      if (taskId !== undefined) await this.#task.cancelTask(taskId).catch(() => undefined);
+      if (!this.#bindingGenerationCurrent(identity, generation)) {
+        if (claim) await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
+        return;
+      }
+      const response = this.#structuredResponse(conversation, 'command_result', {
+        msg_type: 'discussion_role_recommendation_response',
+        request_id: request.requestId,
+        error_code: 'role_recommendation_invalid',
+      });
+      if (claim) {
+        await this.#finishRead(identity, message, conversation, claim, response, generation);
+      } else {
+        await this.#sendWorker(identity, response).catch(() => undefined);
+      }
+    } finally {
+      if (watchdog !== undefined) this.#clearTimeout(watchdog);
+      if (iterator?.return !== undefined) void iterator.return().catch(() => undefined);
+    }
+  }
+
+  #roleRecommendationPrompt(request: RoleRecommendationRequest): string {
+    return [
+      '[private system role recommendation]',
+      `Topic: ${request.topic}`,
+      `Goal: ${request.goal}`,
+      `Maximum roles: ${request.maxRoles}`,
+      `Candidates: ${JSON.stringify(request.candidates)}`,
+      `Host instructions: ${request.recommendationPrompt}`,
+      'Return exactly one JSON object with a roles array. Use each node_id at most once, use only listed models or null, and use contiguous speaking_order values beginning at 0. Do not wrap the JSON in Markdown.',
+    ].join('\n');
+  }
+
+  async #collectRoleRecommendation(
+    taskId: string,
+    iterator: AsyncIterator<BridgeTaskEvent>,
+    registerWatchdog: (timer: unknown) => void,
+  ): Promise<{ kind: 'completed'; output: string } | { kind: 'invalid' } | { kind: 'timeout' }> {
+    const output = { output: '', outputBytes: 0, outputTruncated: false };
+    const terminal = (async () => {
+      while (true) {
+        const next = await iterator.next();
+        if (next.done) return { kind: 'invalid' as const };
+        const event = next.value;
+        if (event.task_id !== taskId) continue;
+        if (event.type === 'text_delta' && event.text) {
+          this.#appendDiscussionOutput(output, event.text);
+          continue;
+        }
+        if (event.type === 'completed') {
+          if (event.output) this.#appendDiscussionCompleted(output, event.output);
+          return output.outputTruncated || output.output.trim().length === 0
+            ? { kind: 'invalid' as const }
+            : { kind: 'completed' as const, output: output.output };
+        }
+        if (event.type === 'failed' || event.type === 'cancelled') {
+          return { kind: 'invalid' as const };
+        }
+      }
+    })();
+    const timeout = new Promise<{ kind: 'timeout' }>((resolve) => {
+      registerWatchdog(this.#setTimeout(() => resolve({ kind: 'timeout' }), ROLE_RECOMMENDATION_WATCHDOG_MS));
+    });
+    const result = await Promise.race([terminal, timeout]);
+    if (result.kind === 'timeout') {
+      await this.#task.cancelTask(taskId).catch(() => undefined);
+    }
+    return result;
   }
 
   async #recheckBinding(identity: WorkerIdentity): Promise<void> {

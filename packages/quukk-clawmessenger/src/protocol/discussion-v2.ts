@@ -161,6 +161,35 @@ export interface DiscussionModelCatalogResponse extends ModelCatalog {
   timestamp: number;
 }
 
+export interface RoleRecommendationCandidate {
+  nodeId: string;
+  displayName: string;
+  runtimeType: string;
+  capabilities: string[];
+  defaultModel: string | null;
+  models: string[];
+  status: 'online';
+}
+
+export interface RoleRecommendationRequest {
+  msgType: 'discussion_role_recommendation_request';
+  requestId: string;
+  topic: string;
+  goal: string;
+  maxRoles: number;
+  candidates: RoleRecommendationCandidate[];
+  recommendationPrompt: string;
+  configVersion: number;
+}
+
+export interface RecommendedAssignment {
+  roleName: string;
+  rolePrompt: string;
+  nodeId: string;
+  model: string | null;
+  speakingOrder: number;
+}
+
 type WorkCommand = DiscussionHostTurn | DiscussionAssignment;
 type NodeErrorCategory = 'invalid_response' | 'model_error' | 'timeout';
 
@@ -466,6 +495,109 @@ function validNativeModel(value: unknown): value is string {
     && value.trim() === value
     && !value.includes('/')
     && !controlCharacters.test(value);
+}
+
+export function parseRoleRecommendationRequest(value: unknown): RoleRecommendationRequest | null {
+  if (!record(value)
+    || !exactKeys(value, [
+      'msg_type', 'request_id', 'topic', 'goal', 'max_roles', 'candidates',
+      'recommendation_prompt', 'config_version',
+    ])
+    || value.msg_type !== 'discussion_role_recommendation_request'
+    || !boundedId(value.request_id)
+    || !bounded(value.topic, DISCUSSION_V2_LIMITS.maxTopic)
+    || !bounded(value.goal, DISCUSSION_V2_LIMITS.maxGoal, true)
+    || !integer(value.max_roles, 1)
+    || value.max_roles > 8
+    || !Array.isArray(value.candidates)
+    || value.candidates.length < value.max_roles
+    || value.candidates.length > 8
+    || !bounded(value.recommendation_prompt, 32_000, true)
+    || !integer(value.config_version, 0)) return null;
+
+  const candidates: RoleRecommendationCandidate[] = [];
+  const nodeIds = new Set<string>();
+  for (const candidate of value.candidates) {
+    if (!record(candidate)
+      || !exactKeys(candidate, [
+        'node_id', 'display_name', 'runtime_type', 'capabilities',
+        'default_model', 'models', 'status',
+      ])
+      || !boundedId(candidate.node_id)
+      || nodeIds.has(candidate.node_id)
+      || !bounded(candidate.display_name, DISCUSSION_V2_LIMITS.maxTitle)
+      || !boundedId(candidate.runtime_type)
+      || candidate.status !== 'online'
+      || !Array.isArray(candidate.capabilities)
+      || candidate.capabilities.length > 64
+      || !candidate.capabilities.every((item) => boundedId(item))
+      || new Set(candidate.capabilities).size !== candidate.capabilities.length
+      || !Array.isArray(candidate.models)
+      || candidate.models.length > 500
+      || !candidate.models.every((model) => modelRoute(model))
+      || new Set(candidate.models).size !== candidate.models.length
+      || (candidate.default_model !== null
+        && (!modelRoute(candidate.default_model) || !candidate.models.includes(candidate.default_model)))) return null;
+    nodeIds.add(candidate.node_id);
+    candidates.push({
+      nodeId: candidate.node_id,
+      displayName: candidate.display_name,
+      runtimeType: candidate.runtime_type,
+      capabilities: [...candidate.capabilities],
+      defaultModel: candidate.default_model,
+      models: [...candidate.models],
+      status: 'online',
+    });
+  }
+  return {
+    msgType: 'discussion_role_recommendation_request',
+    requestId: value.request_id,
+    topic: value.topic,
+    goal: value.goal,
+    maxRoles: value.max_roles,
+    candidates,
+    recommendationPrompt: value.recommendation_prompt,
+    configVersion: value.config_version,
+  };
+}
+
+export function parseRoleRecommendationResponse(
+  value: unknown,
+  request: RoleRecommendationRequest,
+): RecommendedAssignment[] | null {
+  if (!record(value) || !exactKeys(value, ['roles']) || !Array.isArray(value.roles)
+    || value.roles.length < 1 || value.roles.length > request.maxRoles) return null;
+  const candidates = new Map(request.candidates.map((candidate) => [candidate.nodeId, candidate]));
+  const names = new Set<string>();
+  const nodes = new Set<string>();
+  const orders: number[] = [];
+  const roles: RecommendedAssignment[] = [];
+  for (const role of value.roles) {
+    if (!record(role)
+      || !exactKeys(role, ['role_name', 'role_prompt', 'node_id', 'model', 'speaking_order'])
+      || !bounded(role.role_name, 80)
+      || !bounded(role.role_prompt, 8_000)
+      || !boundedId(role.node_id)
+      || !integer(role.speaking_order, 0)) return null;
+    const candidate = candidates.get(role.node_id);
+    const normalizedName = role.role_name.normalize('NFKC').toLocaleLowerCase();
+    if (!candidate || names.has(normalizedName) || nodes.has(role.node_id)
+      || (role.model !== null
+        && (!modelRoute(role.model) || !candidate.models.includes(role.model)))) return null;
+    names.add(normalizedName);
+    nodes.add(role.node_id);
+    orders.push(role.speaking_order);
+    roles.push({
+      roleName: role.role_name.trim(),
+      rolePrompt: role.role_prompt.trim(),
+      nodeId: role.node_id,
+      model: role.model,
+      speakingOrder: role.speaking_order,
+    });
+  }
+  if (orders.slice().sort((left, right) => left - right)
+    .some((order, index) => order !== index)) return null;
+  return roles.sort((left, right) => left.speakingOrder - right.speakingOrder);
 }
 
 function validCatalog(value: unknown): value is ModelCatalog {
