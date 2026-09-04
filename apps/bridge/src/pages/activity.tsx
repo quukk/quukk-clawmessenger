@@ -2,6 +2,7 @@ import { Card, CardContent } from '@multica/ui/components/ui/card';
 import { useEffect, useMemo, useState } from 'react';
 
 import { runtimeDisplayLabel } from '../components/runtime-card';
+import { useI18n } from '../i18n';
 import type { ActivityEntry, BridgeApi, BridgeRuntime } from '../types';
 
 export function ActivityPage({
@@ -11,6 +12,7 @@ export function ActivityPage({
   api: BridgeApi;
   runtimes: readonly BridgeRuntime[];
 }) {
+  const { t } = useI18n();
   const [entries, setEntries] = useState<readonly ActivityEntry[] | null>(null);
   const [error, setError] = useState(false);
   const runtimeLabels = useMemo(
@@ -42,23 +44,23 @@ export function ActivityPage({
     <section className="grid gap-6" aria-labelledby="activity-title">
       <header className="grid max-w-2xl gap-2">
         <h1 id="activity-title" className="font-heading text-display-sm font-semibold tracking-tight">
-          Recent activity
+          {t('activity.title')}
         </h1>
         <p className="text-body-lg text-muted-foreground">
-          Local, bounded summaries only. Prompts and credentials are never shown here.
+          {t('activity.description')}
         </p>
       </header>
 
       {error ? (
         <p role="alert" className="rounded-lg border border-destructive/30 bg-destructive/8 p-3 text-destructive">
-          Unable to load activity.
+          {t('activity.loadError')}
         </p>
       ) : entries === null ? (
-        <div className="skeleton-block" aria-label="Loading activity" />
+        <div className="skeleton-block" aria-label={t('activity.loading')} />
       ) : entries.length === 0 ? (
         <div className="empty-state">
-          <h2>No activity yet</h2>
-          <p>Messages and task lifecycle summaries will appear after an agent is enabled.</p>
+          <h2>{t('activity.emptyTitle')}</h2>
+          <p>{t('activity.emptyBody')}</p>
         </div>
       ) : (
         <div className="grid gap-3">
@@ -74,8 +76,8 @@ export function ActivityPage({
                 <span className="text-caption text-muted-foreground">{entry.kind}</span>
                 <span className="text-caption font-medium text-foreground">
                   {entry.runtimeId
-                    ? (runtimeLabels.get(entry.runtimeId) ?? 'Unknown runtime')
-                    : 'Bridge'}
+                    ? (runtimeLabels.get(entry.runtimeId) ?? t('activity.unknownRuntime'))
+                    : t('activity.bridge')}
                 </span>
               </CardContent>
             </Card>

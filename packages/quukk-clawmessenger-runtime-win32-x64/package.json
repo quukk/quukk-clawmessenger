@@ -1,6 +1,6 @@
 {
   "name": "@quukk/clawmessenger-runtime-win32-x64",
-  "version": "0.1.0-beta.5",
+  "version": "0.1.0-beta.6",
   "description": "Multica Bridge runtime for Quukk ClawMessenger on Windows x64",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {

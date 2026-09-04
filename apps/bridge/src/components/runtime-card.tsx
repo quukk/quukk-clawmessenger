@@ -8,6 +8,7 @@ import {
 } from '@multica/ui/components/ui/card';
 import { Checkbox } from '@multica/ui/components/ui/checkbox';
 
+import { useI18n } from '../i18n';
 import type { BridgeRuntime, Provider, RegistrationProgress } from '../types';
 import { StatusPill } from './status-pill';
 
@@ -22,23 +23,23 @@ export function runtimeDisplayLabel(runtime: Pick<BridgeRuntime, 'provider'>): s
   return PROVIDER_LABELS[runtime.provider];
 }
 
-function guidance(runtime: BridgeRuntime): string {
+function guidance(runtime: BridgeRuntime, t: ReturnType<typeof useI18n>['t']): string {
   const label = runtimeDisplayLabel(runtime);
   switch (runtime.status) {
     case 'ready':
       return runtime.binding?.enabled
-        ? 'This agent has its own RongCloud identity.'
-        : 'Ready to register an independent RongCloud identity.';
+        ? t('runtime.readyRegistered')
+        : t('runtime.ready');
     case 'needs_auth':
-      return `Sign in to ${label}, then rescan.`;
+      return t('runtime.needsAuth', { provider: label });
     case 'found_not_runnable':
-      return 'The executable was found but could not run. Check its permissions and path.';
+      return t('runtime.notRunnable');
     case 'not_found':
-      return 'Not found on this device. Install it or set an explicit path in Settings.';
+      return runtime.provider === 'codex' ? t('runtime.codexNotFound') : t('runtime.notFound');
     case 'probe_failed':
-      return 'Detection failed. Rescan or set an explicit path in Settings.';
+      return t('runtime.probeFailed');
     default:
-      return 'The runtime state is unavailable.';
+      return t('runtime.unknown');
   }
 }
 
@@ -63,6 +64,7 @@ export function RuntimeCard({
   onReregister,
   busy = false,
 }: RuntimeCardProps) {
+  const { t } = useI18n();
   const label = runtimeDisplayLabel(runtime);
   const canSelect = runtime.status === 'ready' && runtime.id !== undefined;
 
@@ -76,7 +78,7 @@ export function RuntimeCard({
         <CardTitle className="flex min-w-0 items-center gap-2">
           {selectable ? (
             <Checkbox
-              aria-label={`Select ${label}`}
+              aria-label={t('runtime.select', { provider: label })}
               checked={selected}
               disabled={!canSelect || busy}
               onCheckedChange={(checked) => onSelectedChange?.(checked === true)}
@@ -94,18 +96,18 @@ export function RuntimeCard({
         </CardAction>
       </CardHeader>
       <CardContent className="grid gap-3">
-        <p className="text-body text-muted-foreground">{guidance(runtime)}</p>
+        <p className="text-body text-muted-foreground">{guidance(runtime, t)}</p>
         {runtime.version || runtime.path ? (
           <dl className="grid gap-1 text-caption text-muted-foreground">
             {runtime.version ? (
               <div className="flex gap-2">
-                <dt className="min-w-14 font-medium text-foreground">Version</dt>
+                <dt className="min-w-14 font-medium text-foreground">{t('runtime.version')}</dt>
                 <dd className="truncate">{runtime.version}</dd>
               </div>
             ) : null}
             {runtime.path ? (
               <div className="flex min-w-0 gap-2">
-                <dt className="min-w-14 font-medium text-foreground">Path</dt>
+                <dt className="min-w-14 font-medium text-foreground">{t('runtime.path')}</dt>
                 <dd className="truncate font-mono" title={runtime.path}>
                   {runtime.path}
                 </dd>
@@ -120,10 +122,10 @@ export function RuntimeCard({
                 variant="outline"
                 size="sm"
                 disabled={busy}
-                aria-label={`Disable ${label}`}
+                aria-label={t('runtime.disableAria', { provider: label })}
                 onClick={onDisable}
               >
-                Disable
+                {t('runtime.disable')}
               </Button>
             ) : null}
             {onReregister && runtime.binding ? (
@@ -131,10 +133,10 @@ export function RuntimeCard({
                 variant="outline"
                 size="sm"
                 disabled={busy}
-                aria-label={`Reregister ${label}`}
+                aria-label={t('runtime.reregisterAria', { provider: label })}
                 onClick={onReregister}
               >
-                Reregister
+                {t('runtime.reregister')}
               </Button>
             ) : null}
           </div>

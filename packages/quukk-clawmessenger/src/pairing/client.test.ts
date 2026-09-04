@@ -70,6 +70,64 @@ function sessionV2Envelope(): unknown {
 }
 
 describe('PairingClient', () => {
+  it('retries a transport failure through the IPv4 fallback transport', async () => {
+    const primaryFetch = vi.fn(async () => {
+      throw new TypeError('dual-stack connection failed');
+    });
+    const ipv4Fetch = vi.fn(async () => jsonResponse(201, sessionV2Envelope()));
+    const client = new PairingClient({
+      serverUrl: SERVER,
+      fetch: primaryFetch,
+      ipv4Fetch,
+      sleep: async () => undefined,
+    });
+
+    await expect(client.createSessionV2({
+      installAbuseKey: ABUSE_KEY,
+      idempotencyKey: IDEMPOTENCY_KEY,
+      candidates: [],
+    })).resolves.toMatchObject({ pairingCode: 'ABCDEF23' });
+    expect(primaryFetch).toHaveBeenCalledTimes(1);
+    expect(ipv4Fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a missing pairing v2 route without falling back to IPv4', async () => {
+    const primaryFetch = vi.fn(async () => jsonResponse(404, {
+      code: 404,
+      message: 'route not found',
+    }));
+    const ipv4Fetch = vi.fn<typeof fetch>();
+    const client = new PairingClient({ serverUrl: SERVER, fetch: primaryFetch, ipv4Fetch });
+
+    await expect(client.createSessionV2({
+      installAbuseKey: ABUSE_KEY,
+      idempotencyKey: IDEMPOTENCY_KEY,
+      candidates: [],
+    })).rejects.toMatchObject({ code: 'pairing_api_unavailable', retryable: false });
+    expect(ipv4Fetch).not.toHaveBeenCalled();
+  });
+
+  it('keeps ordinary HTTP retries on the primary transport', async () => {
+    const primaryFetch = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(503, { code: 503 }))
+      .mockResolvedValueOnce(jsonResponse(201, sessionV2Envelope()));
+    const ipv4Fetch = vi.fn<typeof fetch>();
+    const client = new PairingClient({
+      serverUrl: SERVER,
+      fetch: primaryFetch,
+      ipv4Fetch,
+      sleep: async () => undefined,
+    });
+
+    await expect(client.createSessionV2({
+      installAbuseKey: ABUSE_KEY,
+      idempotencyKey: IDEMPOTENCY_KEY,
+      candidates: [],
+    })).resolves.toMatchObject({ pairingCode: 'ABCDEF23' });
+    expect(primaryFetch).toHaveBeenCalledTimes(2);
+    expect(ipv4Fetch).not.toHaveBeenCalled();
+  });
+
   it('creates a v2 session through the exact endpoint and headers', async () => {
     const fetchSpy = vi.fn(async () => jsonResponse(201, sessionV2Envelope()));
     const client = new PairingClient({ serverUrl: SERVER, fetch: fetchSpy });

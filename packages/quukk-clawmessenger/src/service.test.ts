@@ -862,6 +862,7 @@ describe('QuukkService lifecycle', () => {
 
 describe('QuukkService mutations', () => {
   it.each([
+    'pairing_api_unavailable',
     'pairing_timeout',
     'pairing_transport',
     'pairing_unauthorized',

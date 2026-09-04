@@ -112,6 +112,7 @@ const ENTRY_MODULES = [
   'migration/discover',
   'migration/import',
   'pairing/client',
+  'pairing/ipv4-fetch',
   'pairing/schema',
   'pairing/service',
   'process/identity',

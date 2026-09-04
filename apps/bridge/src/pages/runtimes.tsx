@@ -2,6 +2,7 @@ import { Button } from '@multica/ui/components/ui/button';
 import { useEffect, useState } from 'react';
 
 import { RuntimeCard } from '../components/runtime-card';
+import { useI18n } from '../i18n';
 import type { BridgeApi, BridgeRuntime } from '../types';
 import { useRequestFence } from '../use-request-fence';
 
@@ -27,6 +28,7 @@ async function waitForAutomaticRefresh(): Promise<void> {
 }
 
 export function RuntimesPage({ api, runtimes, onRuntimesChange }: RuntimesPageProps) {
+  const { t } = useI18n();
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const requestFence = useRequestFence();
@@ -49,12 +51,12 @@ export function RuntimesPage({ api, runtimes, onRuntimesChange }: RuntimesPagePr
             attempt === AUTOMATIC_REFRESH_ATTEMPTS - 1 &&
             requestFence.isCurrent(generation)
           ) {
-            setError('Unable to refresh local agents.');
+            setError(t('runtimes.refreshError'));
           }
         }
       }
     })();
-  }, [api, onRuntimesChange, requestFence]);
+  }, [api, onRuntimesChange, requestFence, t]);
 
   async function refresh() {
     const generation = requestFence.begin();
@@ -64,7 +66,7 @@ export function RuntimesPage({ api, runtimes, onRuntimesChange }: RuntimesPagePr
       const nextRuntimes = await api.rescanRuntimes();
       if (requestFence.isCurrent(generation)) onRuntimesChange(nextRuntimes);
     } catch {
-      if (requestFence.isCurrent(generation)) setError('Unable to rescan local agents.');
+      if (requestFence.isCurrent(generation)) setError(t('runtimes.rescanError'));
     } finally {
       if (requestFence.isCurrent(generation)) setBusy(null);
     }
@@ -81,7 +83,9 @@ export function RuntimesPage({ api, runtimes, onRuntimesChange }: RuntimesPagePr
       const nextRuntimes = await api.getRuntimes();
       if (requestFence.isCurrent(generation)) onRuntimesChange(nextRuntimes);
     } catch {
-      if (requestFence.isCurrent(generation)) setError(`Unable to ${operation} this agent.`);
+      if (requestFence.isCurrent(generation)) {
+        setError(t(operation === 'disable' ? 'runtimes.disableError' : 'runtimes.reregisterError'));
+      }
     } finally {
       if (requestFence.isCurrent(generation)) setBusy(null);
     }
@@ -92,14 +96,14 @@ export function RuntimesPage({ api, runtimes, onRuntimesChange }: RuntimesPagePr
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div className="grid max-w-2xl gap-2">
           <h1 id="runtimes-title" className="font-heading text-display-sm font-semibold tracking-tight">
-            Local runtimes
+            {t('runtimes.title')}
           </h1>
           <p className="text-body-lg text-muted-foreground">
-            Detection and RongCloud registration are isolated for every agent.
+            {t('runtimes.description')}
           </p>
         </div>
         <Button variant="outline" disabled={busy !== null} onClick={() => void refresh()}>
-          {busy === 'rescan' ? 'Rescanning' : 'Rescan'}
+          {busy === 'rescan' ? t('runtimes.rescanning') : t('runtimes.rescan')}
         </Button>
       </header>
 

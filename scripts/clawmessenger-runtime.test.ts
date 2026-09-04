@@ -22,8 +22,8 @@ import {
 } from './build-clawmessenger-runtime.mjs';
 import { verifyRuntimePackage } from './verify-clawmessenger-runtime.mjs';
 
-const VERSION = '0.1.0-beta.5';
-const ENTRY_VERSION = '0.1.0-beta.10';
+const VERSION = '0.1.0-beta.6';
+const ENTRY_VERSION = '0.1.0-beta.11';
 const SOURCE_COMMIT = 'a'.repeat(40);
 const MODULES = [
   'github.com/example/common@v1.2.3',
