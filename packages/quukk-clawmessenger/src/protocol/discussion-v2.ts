@@ -168,7 +168,7 @@ export interface RoleRecommendationCandidate {
   capabilities: string[];
   defaultModel: string | null;
   models: string[];
-  status: 'online';
+  status: 'online' | 'offline';
 }
 
 export interface RoleRecommendationRequest {
@@ -527,7 +527,7 @@ export function parseRoleRecommendationRequest(value: unknown): RoleRecommendati
       || nodeIds.has(candidate.node_id)
       || !bounded(candidate.display_name, DISCUSSION_V2_LIMITS.maxTitle)
       || !boundedId(candidate.runtime_type)
-      || candidate.status !== 'online'
+      || (candidate.status !== 'online' && candidate.status !== 'offline')
       || !Array.isArray(candidate.capabilities)
       || candidate.capabilities.length > 64
       || !candidate.capabilities.every((item) => boundedId(item))
@@ -546,7 +546,7 @@ export function parseRoleRecommendationRequest(value: unknown): RoleRecommendati
       capabilities: [...candidate.capabilities],
       defaultModel: candidate.default_model,
       models: [...candidate.models],
-      status: 'online',
+      status: candidate.status,
     });
   }
   return {

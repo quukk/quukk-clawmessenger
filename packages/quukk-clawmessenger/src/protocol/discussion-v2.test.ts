@@ -132,7 +132,19 @@ describe('discussion role recommendation protocol', () => {
     });
   });
 
-  it('rejects extra keys, duplicate candidates, offline candidates and invalid bounds', () => {
+  it('accepts offline candidates so the host can assign them for wake-up', () => {
+    const offlineRequest = clone(roleRecommendationRequest);
+    offlineRequest.candidates[1]!.status = 'offline';
+
+    expect(parseRoleRecommendationRequest(offlineRequest)?.candidates[1]).toMatchObject({
+      nodeId: 'node-role-b',
+      status: 'offline',
+      defaultModel: null,
+      models: [],
+    });
+  });
+
+  it('rejects extra keys, duplicate candidates, unknown statuses and invalid bounds', () => {
     expect(parseRoleRecommendationRequest({ ...roleRecommendationRequest, extra: true })).toBeNull();
     expect(parseRoleRecommendationRequest({
       ...roleRecommendationRequest,
@@ -140,7 +152,7 @@ describe('discussion role recommendation protocol', () => {
     })).toBeNull();
     expect(parseRoleRecommendationRequest({
       ...roleRecommendationRequest,
-      candidates: [{ ...roleRecommendationRequest.candidates[0], status: 'offline' }],
+      candidates: [{ ...roleRecommendationRequest.candidates[0], status: 'sleeping' }],
     })).toBeNull();
     expect(parseRoleRecommendationRequest({
       ...roleRecommendationRequest,
