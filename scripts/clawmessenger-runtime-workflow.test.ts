@@ -222,7 +222,7 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
   it('installs the packed entry through linked paths on Windows, Linux, and macOS', async () => {
     const workflow = await loadWorkflow();
     const smoke = requiredJob(workflow, 'smoke-entry');
-    expect(smoke.needs).toBe('build-entry');
+    expect(smoke.needs).toEqual(['build-entry', 'build-runtime']);
     expect(smoke['runs-on']).toBe('${{ matrix.os }}');
     expect(smoke.strategy?.matrix.include.map((target) => target.os)).toEqual([
       'windows-latest',
@@ -238,6 +238,14 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
       name: 'quukk-entry-package',
       path: '.artifacts/incoming/entry-smoke',
     });
+    const runtimeDownload = requiredStep(smoke, 'Download runtime packages');
+    expect(runtimeDownload.uses).toBe(
+      'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+    );
+    expect(runtimeDownload.with).toMatchObject({
+      pattern: 'quukk-runtime-*',
+      path: '.artifacts/incoming/runtime-smoke',
+    });
     const install = requiredStep(smoke, 'Install and exercise linked entry');
     expect(install.run).toContain('npm install');
     expect(install.run).toContain('--global');
@@ -251,14 +259,14 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
     expect(install.run).toContain('status --json');
     expect(install.run).toContain('rescan --json');
     expect(install.run).toContain('stop');
+    expect(install.run).toContain("process.platform + '-' + process.arch");
+    expect(install.run).toContain('$runtimeArchives[0].FullName');
   });
 
   it('keeps all six runtime builds reproducible, attested, and credential-free', async () => {
     const workflow = await loadWorkflow();
     const build = requiredJob(workflow, 'build-runtime');
-    expect(build.if?.replace(/\s+/g, ' ').trim()).toBe(
-      "github.event_name != 'workflow_dispatch' || inputs.entry_only != true",
-    );
+    expect(build.if).toBeUndefined();
     const reproducible = requiredStep(build, 'Verify reproducible rebuild');
     const notices = requiredStep(build, 'Verify Go third-party notices');
     const dryRun = requiredStep(build, 'Audit runtime tarball');
