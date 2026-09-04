@@ -1622,6 +1622,49 @@ describe('MessageRouter session, legacy, device, and chatroom dispatch', () => {
     expect(JSON.stringify(fixture.sent)).toContain('authorization_denied');
   });
 
+  it('routes only an exact system runtime recovery request to the bound node', async () => {
+    const fixture = await routerHarness();
+    fixture.control.authorize = async (input) => {
+      fixture.authorized.push(structuredClone(input));
+      return input.senderId === 'system';
+    };
+    fixture.control.device = async (input) => {
+      fixture.deviceCalls.push({ command: input.command });
+      return {
+        status: 'success', code: 'ready', message: 'ready',
+        data: { enabled: true, worker: 'online', runtime: 'ready' },
+      };
+    };
+    const exact = {
+      msg_type: 'device_control', request_id: 'recover-1', source_im_id: 'system',
+      destination_im_id: IDENTITY_A.nodeId, command: 'recover_runtime',
+    };
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'recover-valid', exact, { senderId: 'system' },
+    )));
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'recover-wrong-destination', { ...exact, request_id: 'recover-2', destination_im_id: 'other' },
+      { senderId: 'system' },
+    )));
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'recover-extra', { ...exact, request_id: 'recover-3', path: 'C:/unsafe.exe' },
+      { senderId: 'system' },
+    )));
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'recover-non-system', { ...exact, request_id: 'recover-4', source_im_id: 'sender' },
+      { senderId: 'sender' },
+    )));
+
+    expect(fixture.deviceCalls).toEqual([{ command: 'recover_runtime' }]);
+    expect(fixture.sent.some(({ input }) => input.messageType === 'command_result'
+      && typeof input.content === 'object'
+      && input.content.msg_type === 'device_control_result'
+      && input.content.request_id === 'recover-1'
+      && typeof input.content.content === 'object')).toBe(true);
+    expect(JSON.stringify(fixture.sent)).toContain('authorization_denied');
+  });
+
   it('never releases a device mutation after the control port accepted its side effect', async () => {
     const fixture = await routerHarness();
     fixture.control.authorize = async () => true;

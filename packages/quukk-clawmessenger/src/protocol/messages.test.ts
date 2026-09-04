@@ -291,6 +291,20 @@ describe('parseProtocolContent', () => {
       .toEqual({ kind: 'invalid', code: 'conflicting_alias' });
   });
 
+  it('accepts recovery only as the exact system-to-node fixed command', () => {
+    const command = {
+      msg_type: 'device_control', request_id: 'request-recover', source_im_id: 'system',
+      destination_im_id: 'codex_node-a', command: 'recover_runtime',
+    };
+    expect(parseProtocolContent(command)).toEqual({
+      kind: 'protocol', msgType: 'device_control', value: command,
+    });
+    for (const extra of ['path', 'args', 'commandLine', 'shell', 'workdir']) {
+      expect(parseProtocolContent({ ...command, [extra]: 'unsafe' }))
+        .toEqual({ kind: 'invalid', code: 'invalid_content' });
+    }
+  });
+
   it('extracts device-control fields from the JSON payload used by Web and UniApp command messages', () => {
     expect(parseProtocolContent({
       msg_type: 'device_control',
@@ -417,6 +431,8 @@ describe('parseProtocolContent', () => {
       'discussion_node_error',
       'discussion_model_catalog_request',
       'discussion_model_catalog_response',
+      'discussion_role_recommendation_request',
+      'discussion_role_recommendation_response',
       'discussion_wire_chunk',
     ]);
   });

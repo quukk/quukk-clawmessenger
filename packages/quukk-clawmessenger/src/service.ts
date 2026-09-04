@@ -1447,9 +1447,59 @@ export function createConservativeRouterControl(options: {
   runtimes: ServiceRuntimePort;
   bindings: ServiceBindingPort;
   workers: Pick<ServiceWorkerPort, 'snapshots'>;
+  mutationGate?: ServiceMutationGate;
 }): RouterControlPort {
+  const mutationGate = options.mutationGate ?? createServiceMutationGate();
+  const recoveryByRuntime = new Map<string, Promise<SafeDeviceResult>>();
+  const recoverBoundRuntime = (identity: WorkerIdentity): Promise<SafeDeviceResult> => {
+    const existing = recoveryByRuntime.get(identity.runtimeId);
+    if (existing !== undefined) return existing;
+    const operation = enqueueServiceMutation(mutationGate, async () => {
+      const binding = options.bindings.list().find((candidate) =>
+        candidate.runtimeId === identity.runtimeId
+        && candidate.nodeId === identity.nodeId
+        && candidate.enabled);
+      const worker = binding === undefined
+        ? undefined
+        : options.workers.snapshots().find((candidate) =>
+          candidate.runtimeId === identity.runtimeId && candidate.nodeId === identity.nodeId);
+      const workerState = worker?.state ?? 'stopped';
+      if (binding === undefined) {
+        return {
+          status: 'error' as const, code: 'not_found', message: 'not_found',
+          data: { enabled: false, worker: workerState, runtime: 'not_found' as const },
+        };
+      }
+      let runtime: BridgeRuntime | undefined;
+      try {
+        runtime = parseCatalog(await options.runtimes.refreshRuntimes()).find((candidate) =>
+          candidate.id === identity.runtimeId && candidate.path === binding.runtimePath);
+      } catch {
+        return {
+          status: 'error' as const, code: 'start_failed', message: 'start_failed',
+          data: { enabled: true, worker: workerState, runtime: 'probe_failed' as const },
+        };
+      }
+      const runtimeState = runtime?.status ?? 'not_found';
+      const code = runtimeState === 'probe_failed' ? 'start_failed' : runtimeState;
+      return {
+        status: runtimeState === 'ready' ? 'success' as const : 'error' as const,
+        code,
+        message: code,
+        data: { enabled: true, worker: workerState, runtime: runtimeState },
+      };
+    });
+    recoveryByRuntime.set(identity.runtimeId, operation);
+    void operation.finally(() => {
+      if (recoveryByRuntime.get(identity.runtimeId) === operation) {
+        recoveryByRuntime.delete(identity.runtimeId);
+      }
+    }).catch(() => undefined);
+    return operation;
+  };
   return {
-    authorize: async (input: AuthorizedControl) => input.scope === 'device.read',
+    authorize: async (input: AuthorizedControl) => input.scope === 'device.read'
+      || (input.scope === 'device.mutate' && input.senderId === 'system'),
     status: async (identity: WorkerIdentity): Promise<SafeDeviceStatus> => {
       let runtime: RuntimeDiscoveryStatus = 'not_found';
       try {
@@ -1482,9 +1532,12 @@ export function createConservativeRouterControl(options: {
         runtime,
       };
     },
-    device: async (_input: AuthorizedDeviceCommand): Promise<SafeDeviceResult> => ({
-      status: 'error', code: 'authorization_denied', message: 'authorization_denied',
-    }),
+    device: async (input: AuthorizedDeviceCommand): Promise<SafeDeviceResult> => {
+      if (input.senderId !== 'system' || input.command !== 'recover_runtime') {
+        return { status: 'error', code: 'authorization_denied', message: 'authorization_denied' };
+      }
+      return recoverBoundRuntime(input.identity);
+    },
     card: async (_input: AuthorizedCardIntent): Promise<SafeCardResult> => ({
       status: 'error',
       code: 'unsupported_interactive_approval',
@@ -1834,7 +1887,7 @@ async function composeProductionServiceWithin(
         });
       },
     });
-    const control = createConservativeRouterControl({ runtimes: client, bindings, workers });
+    const control = createConservativeRouterControl({ runtimes: client, bindings, workers, mutationGate });
     router = factories.createRouter({
       task: client,
       worker: workers,

@@ -153,7 +153,8 @@ export type DeviceCommand =
   | 'start'
   | 'delete'
   | 'restart'
-  | 'rename_device';
+  | 'rename_device'
+  | 'recover_runtime';
 
 export interface AuthorizedControl {
   identity: WorkerIdentity;
@@ -407,6 +408,7 @@ const RESPONSE_ONLY_TYPES = new Set<ExternalMessageType>([
 
 const DEVICE_COMMANDS = new Set<DeviceCommand>([
   'status', 'disable', 'stop', 'enable', 'start', 'delete', 'restart', 'rename_device',
+  'recover_runtime',
 ]);
 
 function safeIdentifier(value: string, maximum = 256): boolean {
@@ -2878,14 +2880,22 @@ export class MessageRouter {
           ? received
           : { status: 'error', code: 'unsupported_action', message: 'unsupported_action' };
       }
-      const envelope = buildLegacyEnvelope({
-        msgType: 'device_control_result',
-        requestId: requestId ?? 'missing_request',
-        sourceImId: identity.nodeId,
-        destinationImId: message.senderId,
-        content: result,
-        timestamp: this.#time(),
-      });
+      const envelope = command === 'recover_runtime'
+        ? {
+            msg_type: 'device_control_result',
+            request_id: requestId ?? 'missing_request',
+            source_im_id: identity.nodeId,
+            destination_im_id: message.senderId,
+            content: result,
+          }
+        : buildLegacyEnvelope({
+            msgType: 'device_control_result',
+            requestId: requestId ?? 'missing_request',
+            sourceImId: identity.nodeId,
+            destinationImId: message.senderId,
+            content: result,
+            timestamp: this.#time(),
+          });
       const response = this.#structuredResponse(conversation, 'command_result', envelope);
       if (accepted && command !== 'status') {
         await this.#finishMutation(identity, message, conversation, claim, response, generation);

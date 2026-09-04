@@ -140,6 +140,7 @@ const MAX_PASSIVE_JSON_ITEMS = 32_768;
 const MAX_PASSIVE_JSON_DEPTH = 32;
 const deviceControlCommands = new Set([
   'status', 'disable', 'stop', 'enable', 'start', 'delete', 'restart', 'rename_device',
+  'recover_runtime',
 ]);
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -615,6 +616,18 @@ export function parseProtocolContent(input: unknown): ProtocolContentResult {
   if (msgType === 'device_control'
     && (typeof canonical.command !== 'string' || !deviceControlCommands.has(canonical.command))) {
     return { kind: 'invalid', code: 'invalid_content' };
+  }
+  if (msgType === 'device_control' && canonical.command === 'recover_runtime') {
+    const expected = new Set([
+      'msg_type', 'request_id', 'source_im_id', 'destination_im_id', 'command',
+    ]);
+    if (Object.keys(value).length !== expected.size
+      || Object.keys(value).some((key) => !expected.has(key))
+      || typeof canonical.request_id !== 'string'
+      || typeof canonical.source_im_id !== 'string'
+      || typeof canonical.destination_im_id !== 'string') {
+      return { kind: 'invalid', code: 'invalid_content' };
+    }
   }
   if (!validLegacySemantics(msgType as ExternalMessageType, canonical)) {
     return { kind: 'invalid', code: 'invalid_content' };

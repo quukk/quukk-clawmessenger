@@ -1410,6 +1410,48 @@ describe('conservative production router control', () => {
     });
     expect(trace).not.toContain(expect.stringContaining('bindings.disable'));
   });
+
+  it('lets only the system identity refresh the exact bound runtime with stable outcomes', async () => {
+    const root = await temporaryDirectory();
+    const trace: string[] = [];
+    const runtime = new FakeRuntime(runtimeCatalog(root), trace);
+    const bindings = new FakeBindings(trace);
+    const binding = completeBinding('codex', root);
+    bindings.values = [binding];
+    const workers = new FakeWorkers(trace);
+    workers.values = [{
+      runtimeId: binding.runtimeId, nodeId: binding.nodeId!, state: 'online',
+      instanceId: 'rw_0123456789abcdef0123456789abcdef', restartCount: 0,
+    }];
+    const mutationGate = { tail: Promise.resolve(), stopped: false };
+    const control = createConservativeRouterControl({ runtimes: runtime, bindings, workers, mutationGate });
+    const input = { identity: { runtimeId: binding.runtimeId, nodeId: binding.nodeId! }, senderId: 'system', command: 'recover_runtime' as const };
+
+    await expect(control.authorize({
+      ...input, conversationKey: 'system-control', scope: 'device.mutate',
+    })).resolves.toBe(true);
+    await expect(control.device(input)).resolves.toMatchObject({ status: 'success', code: 'ready' });
+
+    for (const [status, code] of [
+      ['needs_auth', 'needs_auth'],
+      ['found_not_runnable', 'found_not_runnable'],
+      ['not_found', 'not_found'],
+      ['probe_failed', 'start_failed'],
+    ] as const) {
+      runtime.catalog = runtimeCatalog(root).map((candidate) => candidate.id === binding.runtimeId
+        ? { ...candidate, status }
+        : candidate);
+      await expect(control.device(input)).resolves.toMatchObject({ status: 'error', code });
+    }
+    runtime.catalog = runtimeCatalog(root);
+    runtime.catalog = runtime.catalog.map((candidate) => candidate.id === binding.runtimeId
+      ? { ...candidate, path: join(root, 'other', 'codex.exe') }
+      : candidate);
+    await expect(control.device(input)).resolves.toMatchObject({ status: 'error', code: 'not_found' });
+    await expect(control.device({ ...input, senderId: 'attacker' })).resolves.toMatchObject({
+      status: 'error', code: 'authorization_denied',
+    });
+  });
 });
 
 describe('startProductionService', () => {
