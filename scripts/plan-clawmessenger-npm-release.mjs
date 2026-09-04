@@ -185,13 +185,18 @@ async function readReleaseInputs(manifestPath, versionPath, mode) {
     .map((line) => line.split('\t'));
   if (
     rows.length !== (mode === 'entry' ? 1 : 7) ||
-    rows.some((fields) => fields.length !== 2 || fields.some((field) => field.length === 0))
+    rows.some((fields) => (
+      ![2, 3].includes(fields.length)
+      || fields.some((field) => field.length === 0)
+      || (fields.length === 3 && !SEMVER.test(fields[2]))
+    ))
   ) {
     throw new Error('invalid_release_manifest');
   }
-  const packages = rows.map(([name, archive]) => ({
+  const packages = rows.map(([name, archive, packageVersion]) => ({
     name,
     archive,
+    version: packageVersion ?? version,
     role: name === ENTRY_PACKAGE ? 'entry' : RUNTIME_PACKAGES.has(name) ? 'runtime' : 'invalid',
   }));
   const names = new Set(packages.map((item) => item.name));
@@ -199,6 +204,7 @@ async function readReleaseInputs(manifestPath, versionPath, mode) {
     if (
       packages[0]?.name !== ENTRY_PACKAGE
       || packages[0]?.role !== 'entry'
+      || packages[0]?.version !== version
       || names.size !== 1
     ) throw new Error('invalid_release_set');
     return { packages, version };
@@ -206,7 +212,8 @@ async function readReleaseInputs(manifestPath, versionPath, mode) {
   if (
     names.size !== 7 ||
     [...EXPECTED_PACKAGES].some((name) => !names.has(name)) ||
-    packages.some((item) => item.role === 'invalid')
+    packages.some((item) => item.role === 'invalid') ||
+    packages.find((item) => item.role === 'entry')?.version !== version
   ) {
     throw new Error('invalid_release_set');
   }
@@ -232,7 +239,7 @@ export async function createReleasePlan({
   const observed = [];
   for (const item of packages) {
     const local = await hashArchive(item.archive);
-    const remote = queryDistribution(item.name, version);
+    const remote = queryDistribution(item.name, item.version);
     const state = remote?.state === 'missing' ? 'missing' : compareDistribution(local, remote);
     observed.push({ ...item, state });
   }

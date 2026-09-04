@@ -407,6 +407,26 @@ jobs:
             '@quukk/clawmessenger-runtime-linux-x64'
             '@quukk/clawmessenger-runtime-linux-arm64'
           )
+          expected_runtime_version="$(node -e '
+            const manifest = require("./packages/quukk-clawmessenger/package.json");
+            const expectedNames = process.argv.slice(1).sort();
+            const optionalDependencies = manifest.optionalDependencies;
+            const actualNames = optionalDependencies && typeof optionalDependencies === "object"
+              ? Object.keys(optionalDependencies).sort()
+              : [];
+            const versions = actualNames.map((name) => optionalDependencies[name]);
+            const semver = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+            if (
+              JSON.stringify(actualNames) !== JSON.stringify(expectedNames) ||
+              versions.some((version) => typeof version !== "string") ||
+              new Set(versions).size !== 1 ||
+              !semver.test(versions[0])
+            ) process.exit(2);
+            process.stdout.write(versions[0]);
+          ' "${runtime_names[@]}")" || {
+            echo "::error::source runtime optionalDependencies are invalid"
+            exit 1
+          }
           expected_names=("${runtime_names[@]}" 'quukk-clawmessenger')
           artifact_directories=(
             '.artifacts/incoming/win32-x64'
@@ -474,7 +494,11 @@ jobs:
               exit 1
             }
             IFS=$'\t' read -r package_name package_version <<< "$package_identity"
-            if [ "$package_name" != "$expected_name" ] || [ "$package_version" != "$expected_version" ]; then
+            expected_package_version="$expected_runtime_version"
+            if [ "$expected_name" = 'quukk-clawmessenger' ]; then
+              expected_package_version="$expected_version"
+            fi
+            if [ "$package_name" != "$expected_name" ] || [ "$package_version" != "$expected_package_version" ]; then
               echo "::error::unexpected package identity in $archive_name"
               exit 1
             fi
@@ -483,7 +507,7 @@ jobs:
               exit 1
             fi
             seen_package_names[$package_name]=1
-            printf '%s\t%s\n' "$package_name" "$archive" >> "$release_manifest"
+            printf '%s\t%s\t%s\n' "$package_name" "$archive" "$package_version" >> "$release_manifest"
             if [ "$package_name" = 'quukk-clawmessenger' ]; then
               entry_archive="$archive"
             fi
@@ -494,7 +518,7 @@ jobs:
             exit 1
           fi
           tar -xOf "$entry_archive" package/package.json |
-            EXPECTED_VERSION="$expected_version" node --input-type=module -e '
+            EXPECTED_VERSION="$expected_runtime_version" node --input-type=module -e '
               let data = "";
               for await (const chunk of process.stdin) data += chunk;
               const manifest = JSON.parse(data);
