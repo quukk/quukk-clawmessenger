@@ -127,7 +127,9 @@ jobs:
           retention-days: 14
 
   smoke-entry:
-    needs: build-entry
+    needs:
+      - build-entry
+      - build-runtime
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -145,16 +147,30 @@ jobs:
         with:
           name: quukk-entry-package
           path: .artifacts/incoming/entry-smoke
+      - name: Download runtime packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: quukk-runtime-*
+          path: .artifacts/incoming/runtime-smoke
       - name: Install and exercise linked entry
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $archives = @(Get-ChildItem '.artifacts/incoming/entry-smoke' -Filter '*.tgz' -File)
           if ($archives.Count -ne 1) { throw 'entry artifact must contain exactly one tarball' }
+          $target = & node -p "process.platform + '-' + process.arch"
+          if ($LASTEXITCODE -ne 0) { throw 'runtime target detection failed' }
+          $runtimeArchives = @(
+            Get-ChildItem '.artifacts/incoming/runtime-smoke' -Filter "*-$target-*.tgz" -File -Recurse
+          )
+          if ($runtimeArchives.Count -ne 1) {
+            throw "runtime artifacts must contain exactly one package for $target"
+          }
           $physical = Join-Path $env:RUNNER_TEMP 'quukk-entry-physical'
           $linked = Join-Path $env:RUNNER_TEMP 'quukk-entry-linked'
           New-Item -ItemType Directory -Force $physical | Out-Null
-          & npm install --global --prefix $physical --no-audit --no-fund $archives[0].FullName
+          & npm install --global --prefix $physical --no-audit --no-fund `
+            $runtimeArchives[0].FullName $archives[0].FullName
           if ($LASTEXITCODE -ne 0) { throw 'entry installation failed' }
           if ($IsWindows) {
             New-Item -ItemType Junction -Path $linked -Target $physical | Out-Null
@@ -191,9 +207,6 @@ jobs:
           }
 
   build-runtime:
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.entry_only != true
     needs: runtime-contracts
     runs-on: ubuntu-latest
     env:
