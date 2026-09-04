@@ -110,6 +110,17 @@ describe('pairing panel', () => {
     expect(container).not.toHaveTextContent('p'.repeat(43));
   });
 
+  it('keeps the manual pairing code readable on the fixed white QR card in dark mode', () => {
+    render(
+      <div className="dark">
+        <PairingPanel api={createApi()} initialSnapshot={waiting} />
+      </div>,
+    );
+
+    expect(screen.getByText(/or enter this code/i)).toHaveClass('text-neutral-600');
+    expect(screen.getByText('ABCDEF23')).toHaveClass('text-neutral-950');
+  });
+
   it('renders an expired waiting snapshot without a stale QR or polling at zero', async () => {
     vi.useFakeTimers();
     const getPairing = vi.fn<BridgeApi['getPairing']>().mockResolvedValue(waiting);

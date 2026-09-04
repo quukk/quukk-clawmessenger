@@ -65,7 +65,7 @@ const validSession = {
 } as const;
 
 describe('pairing schemas', () => {
-  it('parses a strict v2 creation response with a compact code', () => {
+  it('parses a strict v2 creation response with a compact code and bounded clock skew', () => {
     const parsed = pairingSessionV2SchemaFor({
       now: () => Date.parse('2026-09-03T08:30:00.000Z'),
     }).parse({
@@ -84,9 +84,13 @@ describe('pairing schemas', () => {
         expiresAt: '1970-01-01T00:10:00.000Z',
       })).toThrow();
     }
+    expect(pairingSessionV2SchemaFor({ now: () => 0 }).parse({
+      ...parsed,
+      expiresAt: '1970-01-01T00:10:30.000Z',
+    }).expiresAt).toBe('1970-01-01T00:10:30.000Z');
     expect(() => pairingSessionV2SchemaFor({ now: () => 0 }).parse({
       ...parsed,
-      expiresAt: '1970-01-01T00:10:00.001Z',
+      expiresAt: '1970-01-01T00:10:30.001Z',
     })).toThrow('pairing_response_invalid');
   });
   it('accepts the bounded package/server contract', () => {

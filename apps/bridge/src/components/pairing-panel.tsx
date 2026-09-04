@@ -280,17 +280,17 @@ export function PairingPanel({ api, initialSnapshot, now: clock = Date.now }: Pa
       </div>
 
       {displayState === 'waiting' && snapshot.qrContent !== null ? (
-        <div className="grid justify-items-center gap-3 rounded-lg bg-white p-4 text-foreground sm:justify-self-start">
+        <div className="grid justify-items-center gap-3 rounded-lg bg-white p-4 text-neutral-950 sm:justify-self-start">
           <div role="img" aria-label={t('pairing.qrAria')} className="size-56 max-w-full">
             <QRCode value={snapshot.qrContent} size={224} className="size-full" />
           </div>
-          <p className="text-center text-body text-foreground">
+          <p className="text-center text-body text-neutral-950">
             {t('pairing.scan')}
           </p>
           {snapshot.pairingCode === null ? null : (
             <div className="grid justify-items-center gap-1" aria-label={t('pairing.codeAria')}>
-              <span className="text-caption text-muted-foreground">{t('pairing.enterCode')}</span>
-              <strong className="font-mono text-title-lg tracking-[0.28em]">
+              <span className="text-caption text-neutral-600">{t('pairing.enterCode')}</span>
+              <strong className="font-mono text-title-lg tracking-[0.28em] text-neutral-950">
                 {snapshot.pairingCode}
               </strong>
             </div>

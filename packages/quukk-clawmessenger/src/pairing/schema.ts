@@ -30,6 +30,9 @@ export const PAIRING_CREDENTIAL_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 export const PAIRING_CANDIDATE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 export const PAIRING_IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{16,128}$/;
 
+const PAIRING_V2_TTL_MS = 600_000;
+const PAIRING_RESPONSE_CLOCK_SKEW_MS = 30_000;
+
 const boundedTrimmedString = (maximum: number) =>
   z.string().min(1).max(maximum).refine((value) => value === value.trim());
 
@@ -95,7 +98,8 @@ export function pairingSessionV2SchemaFor(options: PairingClockOptions = {}) {
     pairingCode: z.string().regex(/^[ABCDEFGHJKMNPQRSTVWXYZ23456789]{8}$/),
     expiresAt: z.iso.datetime({ offset: true }).superRefine((value, context) => {
       const remaining = Date.parse(value) - now();
-      if (remaining <= 0 || remaining > 600_000) {
+      const maximumRemaining = PAIRING_V2_TTL_MS + PAIRING_RESPONSE_CLOCK_SKEW_MS;
+      if (remaining <= 0 || remaining > maximumRemaining) {
         context.addIssue({ code: 'custom', message: 'pairing_response_invalid' });
       }
     }),
