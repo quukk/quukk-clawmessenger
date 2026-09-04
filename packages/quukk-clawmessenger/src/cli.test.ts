@@ -1854,6 +1854,82 @@ describe('createProductionCliRuntime', () => {
     expect(spawnSerialization).not.toContain('https://example.test/im');
   });
 
+  it('retries a transient identity claim while its owned child becomes ready', async () => {
+    const store = identityStore();
+    store.read
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({ identity: STARTING_IDENTITY, contentDigest: '1'.repeat(64) })
+      .mockRejectedValueOnce({ code: 'identity_corrupt' })
+      .mockResolvedValueOnce({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
+    const child = daemonChild();
+    const transport = requestSequence([
+      controlFrame({ schemaVersion: 1, identity: READY_IDENTITY, state: 'ready' }),
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      spawn: vi.fn(() => child),
+      kill: vi.fn(),
+      sleep,
+      readJson: vi.fn(async () => ({
+        schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {},
+      })),
+      request: transport.request,
+    }) as never);
+
+    await expect(runtime.start({
+      foreground: false, noOpen: true, configOverrides: {},
+    })).resolves.toEqual({ identity: READY_IDENTITY, alreadyRunning: false });
+
+    expect(transport.bodies).toEqual(['{"command":"status"}']);
+    expect(store.read).toHaveBeenCalledTimes(4);
+    expect(sleep).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not retry identity corruption before observing its owned child identity', async () => {
+    const store = identityStore();
+    store.read
+      .mockResolvedValueOnce({})
+      .mockRejectedValueOnce({ code: 'identity_corrupt' });
+    const child = daemonChild();
+    const sleep = vi.fn(async () => undefined);
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      spawn: vi.fn(() => child),
+      sleep,
+    }) as never);
+
+    await expect(runtime.start({
+      foreground: false, noOpen: true, configOverrides: {},
+    })).rejects.toMatchObject({ code: 'identity_corrupt', message: 'identity_corrupt' });
+
+    expect(store.read).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledOnce();
+  });
+
+  it('does not retry failed authentication for a ready identity it did not spawn', async () => {
+    const store = identityStore({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
+    const transport = requestSequence([
+      controlFrame({ error: { code: 'operation_unavailable' } }, 503),
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    const spawn = vi.fn();
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      spawn,
+      sleep,
+      readJson: vi.fn(async () => ({
+        schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {},
+      })),
+      request: transport.request,
+    }) as never);
+
+    await expect(runtime.start({
+      foreground: false, noOpen: true, configOverrides: {},
+    })).rejects.toMatchObject({ code: 'process_unverified', message: 'process_unverified' });
+
+    expect(transport.bodies).toEqual(['{"command":"status"}']);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it('authenticates an existing ready winner without spawning or trusting PID alone', async () => {
     const store = identityStore({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
     const transport = requestSequence([

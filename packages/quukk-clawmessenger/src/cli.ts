@@ -1975,7 +1975,17 @@ export function createProductionCliRuntime(
       await sleep(Math.min(POLL_MS, remainingDeadline(deadline)));
       checkChild();
       remainingDeadline(deadline);
-      snapshot = await readStoredIdentity();
+      try {
+        snapshot = await readStoredIdentity();
+      } catch (error) {
+        if (
+          errorCodeOf(error) !== 'identity_corrupt'
+          || ownedPid === undefined
+          || snapshot.identity?.state !== 'starting'
+          || snapshot.identity.pid !== ownedPid
+        ) throw error;
+        continue;
+      }
       remainingDeadline(deadline);
     }
   };
