@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 
 import { getBrowserBridgeApi } from './api';
 import { Brand } from './components/brand';
+import { LocaleProvider, useI18n, type TranslationKey } from './i18n';
 import { ActivityPage } from './pages/activity';
 import { DiagnosticsPage } from './pages/diagnostics';
 import { RuntimesPage } from './pages/runtimes';
@@ -12,16 +13,25 @@ import type { BridgeApi, BridgeRuntime, BridgeSettings } from './types';
 
 type Page = 'setup' | 'runtimes' | 'activity' | 'diagnostics' | 'settings';
 
-const NAVIGATION: readonly { page: Page; label: string }[] = [
-  { page: 'setup', label: 'Setup' },
-  { page: 'runtimes', label: 'Runtimes' },
-  { page: 'activity', label: 'Activity' },
-  { page: 'diagnostics', label: 'Diagnostics' },
-  { page: 'settings', label: 'Settings' },
+const NAVIGATION: readonly { page: Page; label: TranslationKey }[] = [
+  { page: 'setup', label: 'nav.setup' },
+  { page: 'runtimes', label: 'nav.runtimes' },
+  { page: 'activity', label: 'nav.activity' },
+  { page: 'diagnostics', label: 'nav.diagnostics' },
+  { page: 'settings', label: 'nav.settings' },
 ];
 
 export function App({ api: suppliedApi }: { api?: BridgeApi }) {
+  return (
+    <LocaleProvider>
+      <AppContent api={suppliedApi} />
+    </LocaleProvider>
+  );
+}
+
+function AppContent({ api: suppliedApi }: { api?: BridgeApi }) {
   const api = suppliedApi ?? getBrowserBridgeApi();
+  const { locale, setLocale, t } = useI18n();
   const [page, setPage] = useState<Page>('setup');
   const [runtimes, setRuntimes] = useState<readonly BridgeRuntime[] | null>(null);
   const [settings, setSettings] = useState<BridgeSettings | null>(null);
@@ -57,13 +67,13 @@ export function App({ api: suppliedApi }: { api?: BridgeApi }) {
   if (loadError) {
     content = (
       <div role="alert" className="empty-state border-destructive/30">
-        <h1>Unable to open the local bridge</h1>
-        <p>Run quukk-clawmessenger setup again to create a fresh local session.</p>
+        <h1>{t('shell.loadErrorTitle')}</h1>
+        <p>{t('shell.loadErrorBody')}</p>
       </div>
     );
   } else if (runtimes === null || settings === null) {
     content = (
-      <div className="grid gap-4" aria-label="Loading local bridge">
+      <div className="grid gap-4" aria-label={t('shell.loading')}>
         <div className="skeleton-line w-44" />
         <div className="skeleton-block" />
         <div className="skeleton-block" />
@@ -108,34 +118,45 @@ export function App({ api: suppliedApi }: { api?: BridgeApi }) {
       <header className="border-b border-surface-border bg-surface/95">
         <div className="app-container flex min-h-18 flex-col gap-3 py-3 md:flex-row md:items-center md:justify-between">
           <Brand />
-          <nav aria-label="Bridge pages" className="nav-strip">
-            {NAVIGATION.map((item) => (
-              <Button
-                key={item.page}
-                type="button"
-                size="sm"
-                variant={page === item.page ? 'brandSubtle' : 'ghost'}
-                aria-current={page === item.page ? 'page' : undefined}
-                onClick={() => setPage(item.page)}
-              >
-                {item.label}
-              </Button>
-            ))}
-          </nav>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <nav aria-label={t('nav.aria')} className="nav-strip">
+              {NAVIGATION.map((item) => (
+                <Button
+                  key={item.page}
+                  type="button"
+                  size="sm"
+                  variant={page === item.page ? 'brandSubtle' : 'ghost'}
+                  aria-current={page === item.page ? 'page' : undefined}
+                  onClick={() => setPage(item.page)}
+                >
+                  {t(item.label)}
+                </Button>
+              ))}
+            </nav>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              aria-label={locale === 'zh-CN' ? t('locale.toEnglish') : t('locale.toChinese')}
+              onClick={() => setLocale(locale === 'zh-CN' ? 'en' : 'zh-CN')}
+            >
+              {locale === 'zh-CN' ? 'English' : '中文'}
+            </Button>
+          </div>
         </div>
       </header>
 
       <main className="app-container py-6 sm:py-8">{content}</main>
 
       <footer className="app-container flex flex-wrap items-center justify-between gap-2 border-t border-surface-border py-5 text-caption text-muted-foreground">
-        <span>Multica interface and attribution retained.</span>
+        <span>{t('shell.attribution')}</span>
         <a
           className="font-medium text-foreground underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
           href="https://github.com/multica-ai/multica"
           target="_blank"
           rel="noreferrer"
         >
-          Built on Multica
+          {t('shell.builtOn')}
         </a>
       </footer>
     </div>

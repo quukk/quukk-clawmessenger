@@ -1,5 +1,6 @@
 import { Badge } from '@multica/ui/components/ui/badge';
 
+import { useI18n } from '../i18n';
 import type {
   RegistrationProgress,
   RegistrationState,
@@ -19,34 +20,35 @@ function labelForStatus({
   registrationState,
   workerState,
   progress,
-}: StatusPillProps): string {
-  if (progress?.state === 'registering') return 'Registering';
-  if (progress?.state === 'connected') return 'Connected';
-  if (progress?.state === 'failed') return 'Registration failed';
-  if (registrationState === 'error') return 'Connection error';
-  if (registrationState === 'registering') return 'Registering';
-  if (workerState === 'online') return 'Online';
-  if (workerState !== undefined) return 'Registered offline';
-  if (registrationState === 'online') return 'Online';
-  if (registrationState === 'offline') return 'Registered offline';
+}: StatusPillProps, t: ReturnType<typeof useI18n>['t']): string {
+  if (progress?.state === 'registering') return t('status.registering');
+  if (progress?.state === 'connected') return t('status.connected');
+  if (progress?.state === 'failed') return t('status.registrationFailed');
+  if (registrationState === 'error') return t('status.connectionError');
+  if (registrationState === 'registering') return t('status.registering');
+  if (workerState === 'online') return t('status.online');
+  if (workerState !== undefined) return t('status.registeredOffline');
+  if (registrationState === 'online') return t('status.online');
+  if (registrationState === 'offline') return t('status.registeredOffline');
 
   switch (runtimeStatus) {
     case 'ready':
-      return 'Ready';
+      return t('status.ready');
     case 'needs_auth':
-      return 'Needs sign-in';
+      return t('status.needsSignIn');
     case 'found_not_runnable':
-      return 'Cannot run';
+      return t('status.cannotRun');
     case 'not_found':
-      return 'Not found';
+      return t('status.notFound');
     case 'probe_failed':
-      return 'Probe failed';
+      return t('status.probeFailed');
     default:
-      return 'Unknown';
+      return t('status.unknown');
   }
 }
 
 export function StatusPill(props: StatusPillProps) {
+  const { t } = useI18n();
   const failed =
     props.progress?.state === 'failed' ||
     props.registrationState === 'error' ||
@@ -61,9 +63,9 @@ export function StatusPill(props: StatusPillProps) {
   return (
     <Badge
       variant={failed ? 'destructive' : positive ? 'default' : 'outline'}
-      aria-label={`Status: ${labelForStatus(props)}`}
+      aria-label={t('status.aria', { status: labelForStatus(props, t) })}
     >
-      {labelForStatus(props)}
+      {labelForStatus(props, t)}
     </Badge>
   );
 }

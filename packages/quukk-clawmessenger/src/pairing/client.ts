@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { normalizeServerUrl } from '../config/schema.js';
+import { createIPv4Fetch } from './ipv4-fetch.js';
 import {
   PAIRING_CREDENTIAL_PATTERN,
   PAIRING_IDEMPOTENCY_KEY_PATTERN,
@@ -21,6 +22,7 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const TRANSIENT_STATUSES = new Set([408, 425, 500, 502, 503, 504]);
 
 export const PAIRING_CLIENT_ERROR_CODES = [
+  'pairing_api_unavailable',
   'pairing_cancelled',
   'pairing_conflict',
   'pairing_expired',
@@ -75,15 +77,16 @@ export type CreatePairingSessionInput = {
 export type PairingClientDependencies = {
   serverUrl: string;
   fetch?: typeof globalThis.fetch;
+  ipv4Fetch?: typeof globalThis.fetch;
   sleep?: (milliseconds: number) => Promise<unknown>;
   random?: () => number;
   timeoutMs?: number;
 };
 
 class AttemptFailure {
-  readonly kind: 'transport' | 'timeout';
+  readonly kind: 'transport' | 'timeout' | 'status';
 
-  constructor(kind: 'transport' | 'timeout') {
+  constructor(kind: 'transport' | 'timeout' | 'status') {
     this.kind = kind;
   }
 }
@@ -180,6 +183,7 @@ async function boundedJson(response: Response): Promise<unknown> {
 export class PairingClient {
   readonly #serverUrl: string;
   readonly #fetch: typeof globalThis.fetch;
+  readonly #ipv4Fetch: typeof globalThis.fetch;
   readonly #sleep: (milliseconds: number) => Promise<unknown>;
   readonly #random: () => number;
   readonly #timeoutMs: number;
@@ -191,6 +195,8 @@ export class PairingClient {
       throw rejected();
     }
     this.#fetch = dependencies.fetch ?? globalThis.fetch;
+    this.#ipv4Fetch = dependencies.ipv4Fetch
+      ?? (dependencies.fetch === undefined ? createIPv4Fetch() : this.#fetch);
     this.#sleep =
       dependencies.sleep ??
       ((milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
@@ -207,7 +213,9 @@ export class PairingClient {
     expectedStatus: 200 | 201,
     callerSignal?: AbortSignal,
     allowNoContent = false,
+    unavailableOnNotFound = false,
   ): Promise<unknown> {
+    let useIPv4Fallback = false;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       if (callerSignal?.aborted) {
         throw new PairingClientError('pairing_cancelled', 'transport', false);
@@ -222,7 +230,8 @@ export class PairingClient {
       }, this.#timeoutMs);
       let failure: AttemptFailure | undefined;
       try {
-        const response = await this.#fetch(url, {
+        const transport = useIPv4Fallback ? this.#ipv4Fetch : this.#fetch;
+        const response = await transport(url, {
           ...init,
           redirect: 'manual',
           signal: controller.signal,
@@ -232,6 +241,10 @@ export class PairingClient {
           return null;
         }
         if (response.status !== expectedStatus) {
+          if (unavailableOnNotFound && response.status === 404) {
+            await response.body?.cancel().catch(() => undefined);
+            throw new PairingClientError('pairing_api_unavailable', 'pairing', false);
+          }
           if (response.status === 503) {
             try {
               const unavailable = unavailableEnvelopeSchema.safeParse(
@@ -258,7 +271,7 @@ export class PairingClient {
           }
           await response.body?.cancel().catch(() => undefined);
           if (TRANSIENT_STATUSES.has(response.status)) {
-            failure = new AttemptFailure('transport');
+            failure = new AttemptFailure('status');
           } else {
             throw statusError(response.status);
           }
@@ -292,6 +305,7 @@ export class PairingClient {
         callerSignal?.removeEventListener('abort', cancel);
       }
       if (attempt === 0) {
+        useIPv4Fallback = failure?.kind !== 'status';
         const random = Math.min(Math.max(this.#random(), 0), 0.999_999_999);
         await this.#sleep(250 + Math.floor(random * 251));
         continue;
@@ -371,6 +385,8 @@ export class PairingClient {
       },
       201,
       signal,
+      false,
+      true,
     );
     const envelope = createV2EnvelopeSchema.safeParse(response);
     if (!envelope.success) throw invalidResponse();

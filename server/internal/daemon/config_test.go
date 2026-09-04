@@ -572,9 +572,9 @@ func TestLoadConfig_SkipsMulticaHooksFromLoginShellFallback(t *testing.T) {
 	t.Setenv("ENV", rc)
 	t.Setenv("MULTICA_DAEMON_ID", "11111111-1111-1111-1111-111111111111")
 	pinNonCodexAgentsToMissingPaths(t)
-	oldBundlePaths := codexDesktopAppBundlePaths
-	codexDesktopAppBundlePaths = func() []string { return nil }
-	t.Cleanup(func() { codexDesktopAppBundlePaths = oldBundlePaths })
+	oldBundlePaths := codexDesktopExecutablePaths
+	codexDesktopExecutablePaths = func() []string { return nil }
+	t.Cleanup(func() { codexDesktopExecutablePaths = oldBundlePaths })
 
 	cfg, err := LoadConfig(Overrides{
 		ServerURL:      "http://localhost:0",
@@ -1136,9 +1136,9 @@ func TestLoadConfig_UsesCodexDesktopAppBundleFallback(t *testing.T) {
 		t.Fatalf("write fake Codex bundle CLI: %v", err)
 	}
 
-	oldBundlePaths := codexDesktopAppBundlePaths
-	codexDesktopAppBundlePaths = func() []string { return []string{fakeCodex} }
-	t.Cleanup(func() { codexDesktopAppBundlePaths = oldBundlePaths })
+	oldBundlePaths := codexDesktopExecutablePaths
+	codexDesktopExecutablePaths = func() []string { return []string{fakeCodex} }
+	t.Cleanup(func() { codexDesktopExecutablePaths = oldBundlePaths })
 
 	t.Setenv("PATH", t.TempDir())
 	t.Setenv("SHELL", filepath.Join(t.TempDir(), "fish"))
@@ -1181,10 +1181,10 @@ func TestLoadConfig_UsesChatGPTAppBundleCodexPath(t *testing.T) {
 		}
 	}
 
-	oldBundlePaths := codexDesktopAppBundlePaths
+	oldBundlePaths := codexDesktopExecutablePaths
 	// Prefer ChatGPT first, matching production ordering.
-	codexDesktopAppBundlePaths = func() []string { return []string{fakeChatGPT, fakeLegacy} }
-	t.Cleanup(func() { codexDesktopAppBundlePaths = oldBundlePaths })
+	codexDesktopExecutablePaths = func() []string { return []string{fakeChatGPT, fakeLegacy} }
+	t.Cleanup(func() { codexDesktopExecutablePaths = oldBundlePaths })
 
 	t.Setenv("PATH", t.TempDir())
 	t.Setenv("SHELL", filepath.Join(t.TempDir(), "fish"))
@@ -1249,9 +1249,9 @@ func TestLoadConfig_CodexDesktopFallbackDoesNotOverrideExplicitPath(t *testing.T
 		t.Fatalf("write fake Codex bundle CLI: %v", err)
 	}
 
-	oldBundlePaths := codexDesktopAppBundlePaths
-	codexDesktopAppBundlePaths = func() []string { return []string{fakeCodex} }
-	t.Cleanup(func() { codexDesktopAppBundlePaths = oldBundlePaths })
+	oldBundlePaths := codexDesktopExecutablePaths
+	codexDesktopExecutablePaths = func() []string { return []string{fakeCodex} }
+	t.Cleanup(func() { codexDesktopExecutablePaths = oldBundlePaths })
 
 	t.Setenv("PATH", t.TempDir())
 	t.Setenv("SHELL", filepath.Join(t.TempDir(), "fish"))

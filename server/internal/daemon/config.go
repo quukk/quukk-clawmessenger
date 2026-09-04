@@ -903,6 +903,10 @@ var codexDesktopAppBundlePaths = func() []string {
 	return paths
 }
 
+// codexDesktopExecutablePaths is replaceable so discovery tests can provide
+// platform-shaped fixtures without depending on a real desktop installation.
+var codexDesktopExecutablePaths = platformCodexDesktopExecutablePaths
+
 // loginShellResolveTimeout caps how long the daemon will wait for the user's
 // login shell to print canonical agent paths. A broken rc file should not
 // block startup — if the shell takes longer than this, we proceed without

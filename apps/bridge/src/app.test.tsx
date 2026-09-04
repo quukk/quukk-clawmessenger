@@ -3,7 +3,7 @@ import '@testing-library/jest-dom/vitest';
 import { act, cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { StrictMode } from 'react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { App } from './app';
 import { RuntimesPage } from './pages/runtimes';
@@ -130,13 +130,43 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+beforeEach(() => {
+  window.localStorage.setItem('quukk-clawmessenger.locale', 'en');
+});
+
 afterEach(() => {
   cleanup();
+  window.localStorage.clear();
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
 describe('bridge app', () => {
+  it('starts in Chinese and lets the user switch the complete shell to English', async () => {
+    window.localStorage.clear();
+    const user = userEvent.setup();
+    render(<App api={createApi()} />);
+
+    expect(await screen.findByRole('heading', { name: '选择本地智能体' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Switch to English' })).toBeVisible();
+    expect(screen.getByRole('navigation', { name: '本地桥接页面' })).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Switch to English' }));
+
+    expect(screen.getByRole('heading', { name: 'Choose local agents' })).toBeVisible();
+    expect(screen.getByRole('button', { name: '切换到中文' })).toBeVisible();
+    expect(window.localStorage.getItem('quukk-clawmessenger.locale')).toBe('en');
+
+    await user.click(screen.getByRole('button', { name: '切换到中文' }));
+    await user.click(screen.getByRole('button', { name: '本地智能体' }));
+    expect(await screen.findByRole('heading', { name: '本地智能体' })).toBeVisible();
+    await user.click(screen.getByRole('button', { name: '活动' }));
+    expect(await screen.findByRole('heading', { name: '最近活动' })).toBeVisible();
+    await user.click(screen.getByRole('button', { name: '诊断' }));
+    expect(await screen.findByRole('heading', { name: '诊断' })).toBeVisible();
+    await user.click(screen.getByRole('button', { name: '设置' }));
+    expect(await screen.findByRole('heading', { name: '设置' })).toBeVisible();
+  });
+
   it('keeps Multica attribution beside the derivative product name', async () => {
     render(<App api={createApi()} />);
 

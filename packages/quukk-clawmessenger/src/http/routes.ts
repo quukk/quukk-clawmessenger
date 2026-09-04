@@ -283,6 +283,7 @@ const ERROR_DEFINITIONS = {
   bridge_unavailable: { status: 503, category: 'transport', retryable: true },
   ui_unavailable: { status: 503, category: 'transport', retryable: true },
   operation_unavailable: { status: 503, category: 'transport', retryable: true },
+  pairing_api_unavailable: { status: 502, category: 'transport', retryable: false },
   pairing_unauthorized: { status: 401, category: 'authentication', retryable: false },
   pairing_rate_limited: { status: 429, category: 'transport', retryable: true },
   pairing_response_invalid: { status: 502, category: 'policy', retryable: false },

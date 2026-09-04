@@ -2,6 +2,7 @@ import { Button } from '@multica/ui/components/ui/button';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import * as QRCodeModule from 'react-qr-code';
 
+import { useI18n, type TranslationKey } from '../i18n';
 import { resolveQrCodeComponent } from './qr-code-component';
 import type {
   BridgeApi,
@@ -22,23 +23,23 @@ const TERMINAL_STATES = new Set<PairingState>([
 ]);
 const MAX_TIMEOUT_MS = 2_147_483_647;
 
-const STATE_COPY: Record<PairingState, string> = {
-  idle: 'Pairing is ready to start.',
-  waiting: 'Waiting for a scan',
-  claimed: 'Awaiting platform selection',
-  processing: 'Registering selected platforms',
-  completed: 'Pairing completed',
-  partial: 'Pairing partially completed',
-  cancelled: 'Pairing cancelled',
-  expired: 'Pairing code expired',
+const STATE_COPY: Record<PairingState, TranslationKey> = {
+  idle: 'pairing.state.idle',
+  waiting: 'pairing.state.waiting',
+  claimed: 'pairing.state.claimed',
+  processing: 'pairing.state.processing',
+  completed: 'pairing.state.completed',
+  partial: 'pairing.state.partial',
+  cancelled: 'pairing.state.cancelled',
+  expired: 'pairing.state.expired',
 };
 
-const RESULT_COPY: Record<PairingCandidateResult['status'], string> = {
-  pending: 'Waiting',
-  registering: 'Registering',
-  bound: 'Connected',
-  already_bound: 'Already connected',
-  failed: 'Could not add this platform',
+const RESULT_COPY: Record<PairingCandidateResult['status'], TranslationKey> = {
+  pending: 'pairing.result.pending',
+  registering: 'pairing.result.registering',
+  bound: 'pairing.result.bound',
+  already_bound: 'pairing.result.alreadyBound',
+  failed: 'pairing.result.failed',
 };
 
 const PROVIDER_COPY: Record<PairingCandidate['provider'], string> = {
@@ -48,19 +49,19 @@ const PROVIDER_COPY: Record<PairingCandidate['provider'], string> = {
   hermes: 'Hermes',
 };
 
-const STATUS_REASON_COPY: Omit<Record<PairingStatusReason, string>, 'needs_auth'> = {
-  found_not_runnable: 'This platform is not ready to run locally.',
-  not_found: 'This platform is not installed locally.',
-  probe_failed: 'This platform could not be checked locally.',
-  provider_conflict: 'Another local installation of this platform was detected.',
+const STATUS_REASON_COPY: Omit<Record<PairingStatusReason, TranslationKey>, 'needs_auth'> = {
+  found_not_runnable: 'pairing.reason.notRunnable',
+  not_found: 'pairing.reason.notFound',
+  probe_failed: 'pairing.reason.probeFailed',
+  provider_conflict: 'pairing.reason.conflict',
 };
 
-function statusReasonCopy(candidate: PairingCandidate): string | null {
+function statusReasonCopy(candidate: PairingCandidate, t: ReturnType<typeof useI18n>['t']): string | null {
   if (candidate.statusReason === null) return null;
   if (candidate.statusReason === 'needs_auth') {
-    return `Sign in to ${PROVIDER_COPY[candidate.provider]} locally.`;
+    return t('pairing.reason.needsAuth', { provider: PROVIDER_COPY[candidate.provider] });
   }
-  return STATUS_REASON_COPY[candidate.statusReason];
+  return t(STATUS_REASON_COPY[candidate.statusReason]);
 }
 
 function safeVersion(value: string | null): string | null {
@@ -69,26 +70,30 @@ function safeVersion(value: string | null): string | null {
     : null;
 }
 
-function readinessCopy(candidate: PairingCandidate): string {
+function readinessCopy(candidate: PairingCandidate, t: ReturnType<typeof useI18n>['t']): string {
   switch (candidate.readiness) {
     case 'ready':
-      return 'Ready';
+      return t('pairing.readiness.ready');
     case 'not_ready':
-      return 'Not ready';
+      return t('pairing.readiness.notReady');
     case 'already_registered':
-      return 'Already registered';
+      return t('pairing.readiness.registered');
     default:
-      return 'Unavailable';
+      return t('pairing.readiness.unavailable');
   }
 }
 
-function expiresCopy(expiresAt: string | null, now: number): string | null {
+function expiresCopy(
+  expiresAt: string | null,
+  now: number,
+  t: ReturnType<typeof useI18n>['t'],
+): string | null {
   if (expiresAt === null) return null;
   const remainingSeconds = Math.ceil((Date.parse(expiresAt) - now) / 1_000);
   if (remainingSeconds <= 0) return null;
   const minutes = Math.floor(remainingSeconds / 60);
   const seconds = remainingSeconds % 60;
-  return `Expires in ${minutes}:${seconds.toString().padStart(2, '0')}`;
+  return t('pairing.expires', { minutes, seconds: seconds.toString().padStart(2, '0') });
 }
 
 function isExpiredWaiting(snapshot: PairingSnapshot, now: number): boolean {
@@ -106,6 +111,7 @@ type PairingPanelProps = {
 };
 
 export function PairingPanel({ api, initialSnapshot, now: clock = Date.now }: PairingPanelProps) {
+  const { t } = useI18n();
   const [snapshot, setSnapshot] = useState(initialSnapshot);
   const [currentTime, setCurrentTime] = useState(() => clock());
   const [actionBusy, setActionBusy] = useState(false);
@@ -199,7 +205,9 @@ export function PairingPanel({ api, initialSnapshot, now: clock = Date.now }: Pa
     retryCandidateIds.length > 0 &&
     snapshot.expiresAt !== null &&
     Date.parse(snapshot.expiresAt) > currentTime;
-  const expires = displayState === 'expired' ? null : expiresCopy(snapshot.expiresAt, currentTime);
+  const expires = displayState === 'expired'
+    ? null
+    : expiresCopy(snapshot.expiresAt, currentTime, t);
 
   function beginAction(): { controller: AbortController; generation: number } {
     pollController.current?.abort();
@@ -263,25 +271,25 @@ export function PairingPanel({ api, initialSnapshot, now: clock = Date.now }: Pa
     >
       <div className="grid gap-1">
         <h2 id="pairing-panel-title" className="font-heading text-title-sm font-medium">
-          Pair with ClawMessenger
+          {t('pairing.title')}
         </h2>
         <p role="status" aria-live="polite" className="text-body text-muted-foreground">
-          {STATE_COPY[displayState]}
+          {t(STATE_COPY[displayState])}
           {expires === null ? null : ` · ${expires}`}
         </p>
       </div>
 
       {displayState === 'waiting' && snapshot.qrContent !== null ? (
         <div className="grid justify-items-center gap-3 rounded-lg bg-white p-4 text-foreground sm:justify-self-start">
-          <div role="img" aria-label="Pairing QR code" className="size-56 max-w-full">
+          <div role="img" aria-label={t('pairing.qrAria')} className="size-56 max-w-full">
             <QRCode value={snapshot.qrContent} size={224} className="size-full" />
           </div>
           <p className="text-center text-body text-foreground">
-            Scan with ClawMessenger to choose platforms.
+            {t('pairing.scan')}
           </p>
           {snapshot.pairingCode === null ? null : (
-            <div className="grid justify-items-center gap-1" aria-label="Pairing code">
-              <span className="text-caption text-muted-foreground">Or enter this code</span>
+            <div className="grid justify-items-center gap-1" aria-label={t('pairing.codeAria')}>
+              <span className="text-caption text-muted-foreground">{t('pairing.enterCode')}</span>
               <strong className="font-mono text-title-lg tracking-[0.28em]">
                 {snapshot.pairingCode}
               </strong>
@@ -290,12 +298,12 @@ export function PairingPanel({ api, initialSnapshot, now: clock = Date.now }: Pa
         </div>
       ) : null}
 
-      <ul className="grid gap-2" aria-label="Detected pairing platforms">
+      <ul className="grid gap-2" aria-label={t('pairing.platformsAria')}>
         {snapshot.candidates.map((candidate) => {
           const result = resultByCandidate.get(candidate.candidateId);
           const label = PROVIDER_COPY[candidate.provider];
           const version = safeVersion(candidate.version);
-          const reason = statusReasonCopy(candidate);
+          const reason = statusReasonCopy(candidate, t);
           return (
             <li
               key={candidate.candidateId}
@@ -308,12 +316,12 @@ export function PairingPanel({ api, initialSnapshot, now: clock = Date.now }: Pa
                   {version ? <span className="ml-2 text-caption text-muted-foreground">{version}</span> : null}
                 </span>
                 <span className="text-caption font-medium text-muted-foreground">
-                  {result ? RESULT_COPY[result.status] : readinessCopy(candidate)}
+                  {result ? t(RESULT_COPY[result.status]) : readinessCopy(candidate, t)}
                 </span>
               </div>
               {reason ? <p className="text-caption text-muted-foreground">{reason}</p> : null}
               {result?.status === 'failed' ? (
-                <p className="text-caption text-destructive">Try again if this platform becomes available.</p>
+                <p className="text-caption text-destructive">{t('pairing.retryHint')}</p>
               ) : null}
             </li>
           );
@@ -322,23 +330,23 @@ export function PairingPanel({ api, initialSnapshot, now: clock = Date.now }: Pa
 
       {requestFailed ? (
         <p role="alert" className="rounded-lg border border-destructive/30 bg-destructive/8 p-3 text-body">
-          Pairing status is temporarily unavailable. Try again.
+          {t('pairing.statusUnavailable')}
         </p>
       ) : null}
 
       <div className="flex flex-wrap justify-end gap-2">
         {!TERMINAL_STATES.has(displayState) && displayState !== 'idle' ? (
           <Button type="button" variant="outline" disabled={actionBusy} onClick={() => void cancel()}>
-            Cancel pairing
+            {t('pairing.cancel')}
           </Button>
         ) : null}
         {canRetry ? (
           <Button type="button" disabled={actionBusy} onClick={() => void retry()}>
-            Retry failed platforms
+            {t('pairing.retry')}
           </Button>
         ) : null}
         <Button type="button" variant="outline" disabled={actionBusy} onClick={() => void regenerate()}>
-          Generate a new QR code
+          {t('pairing.regenerate')}
         </Button>
       </div>
     </section>

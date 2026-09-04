@@ -390,6 +390,7 @@ describe('LocalRoutes browser boundary', () => {
   });
 
   it.each([
+    ['pairing_api_unavailable', 502, 'transport', false],
     ['pairing_unauthorized', 401, 'authentication', false],
     ['pairing_rate_limited', 429, 'transport', true],
     ['pairing_response_invalid', 502, 'policy', false],

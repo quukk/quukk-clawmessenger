@@ -2,8 +2,9 @@ import '@testing-library/jest-dom/vitest';
 
 import { act, cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { BridgeApiError } from './api';
 import { App } from './app';
 import type { BridgeApi, BridgeRuntime, BridgeSettings, PairingSnapshot } from './types';
 
@@ -126,12 +127,35 @@ async function completePolicyForm(user: ReturnType<typeof userEvent.setup>) {
   );
 }
 
+beforeEach(() => {
+  window.localStorage.setItem('quukk-clawmessenger.locale', 'en');
+});
+
 afterEach(() => {
   cleanup();
+  window.localStorage.clear();
   vi.restoreAllMocks();
 });
 
 describe('runtime setup', () => {
+  it('explains when the backend has not deployed the pairing v2 API', async () => {
+    window.localStorage.clear();
+    const user = userEvent.setup();
+    const api = createApi({
+      startPairing: vi.fn().mockRejectedValue(new BridgeApiError('pairing_api_unavailable')),
+    });
+    render(<App api={api} />);
+    await screen.findByRole('heading', { name: '选择本地智能体' });
+    await user.type(screen.getByLabelText(/授权工作根目录/), 'C:\\work');
+    await user.type(screen.getByLabelText(/默认工作目录/), 'C:\\work\\project');
+    await user.click(screen.getByRole('checkbox', { name: /了解权限策略/ }));
+    await user.click(screen.getByRole('button', { name: '生成配对二维码' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      '服务器尚未部署新版配对接口',
+    );
+  });
+
   it('shows discovered agents without registration checkboxes or local identifiers', async () => {
     const api = createApi();
     const { container } = render(<App api={api} />);

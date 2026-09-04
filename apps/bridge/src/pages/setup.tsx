@@ -10,8 +10,10 @@ import {
 } from '@multica/ui/components/ui/dialog';
 import { useEffect, useRef, useState } from 'react';
 
+import { BridgeApiError } from '../api';
 import { PairingPanel } from '../components/pairing-panel';
 import { RuntimeCard } from '../components/runtime-card';
+import { useI18n, type TranslationKey } from '../i18n';
 import type { BridgeApi, BridgeRuntime, BridgeSettings, PairingSnapshot } from '../types';
 import { useRequestFence } from '../use-request-fence';
 
@@ -46,13 +48,14 @@ export function SetupPage({
   settings,
   onSettingsChange,
 }: SetupPageProps) {
+  const { t } = useI18n();
   const [authorizedRoot, setAuthorizedRoot] = useState(settings.authorizedWorkRoots[0] ?? '');
   const [defaultWorkdir, setDefaultWorkdir] = useState(settings.defaultWorkdir ?? '');
   const [policyAccepted, setPolicyAccepted] = useState(false);
   const [policyOpen, setPolicyOpen] = useState(false);
   const [savingPolicy, setSavingPolicy] = useState(false);
   const [pairing, setPairing] = useState<PairingSnapshot | null>(null);
-  const [startFailed, setStartFailed] = useState(false);
+  const [startFailure, setStartFailure] = useState<TranslationKey | null>(null);
   const pairingStartController = useRef<AbortController | undefined>(undefined);
   const requestFence = useRequestFence();
   const policyComplete =
@@ -74,7 +77,7 @@ export function SetupPage({
     const controller = new AbortController();
     pairingStartController.current = controller;
     setSavingPolicy(true);
-    setStartFailed(false);
+    setStartFailure(null);
     try {
       const nextSettings = await api.updateSettings({
         ...settings,
@@ -89,8 +92,21 @@ export function SetupPage({
       const nextPairing = await api.startPairing(controller.signal);
       if (!requestFence.isCurrent(generation)) return;
       setPairing(nextPairing);
-    } catch {
-      if (requestFence.isCurrent(generation)) setStartFailed(true);
+    } catch (error) {
+      if (requestFence.isCurrent(generation)) {
+        const code = error instanceof BridgeApiError ? error.code : '';
+        const key: TranslationKey = [
+          'session_required',
+          'pairing_api_unavailable',
+          'pairing_transport',
+          'pairing_timeout',
+          'pairing_unavailable',
+          'pairing_unauthorized',
+        ].includes(code)
+          ? (`setup.error.${code}` as TranslationKey)
+          : 'setup.error.default';
+        setStartFailure(key);
+      }
     } finally {
       if (pairingStartController.current === controller) {
         pairingStartController.current = undefined;
@@ -102,17 +118,16 @@ export function SetupPage({
   return (
     <section className="grid gap-6" aria-labelledby="setup-title">
       <header className="grid max-w-2xl gap-2">
-        <p className="text-label font-medium text-brand">Detect, authorize, pair</p>
+        <p className="text-label font-medium text-brand">{t('setup.eyebrow')}</p>
         <h1 id="setup-title" className="font-heading text-display-sm font-semibold tracking-tight">
-          Choose local agents
+          {t('setup.title')}
         </h1>
         <p className="text-body-lg text-muted-foreground">
-          Review detected platforms, authorize local work, then scan one short-lived code in
-          ClawMessenger to choose which platforms to add.
+          {t('setup.description')}
         </p>
       </header>
 
-      <div className="runtime-grid" aria-label="Detected local agents">
+      <div className="runtime-grid" aria-label={t('setup.detectedAria')}>
         {runtimes.map((runtime) => (
           <RuntimeCard key={runtime.provider} runtime={discoveryView(runtime)} />
         ))}
@@ -120,10 +135,9 @@ export function SetupPage({
 
       <div className="grid gap-4 rounded-xl border border-surface-border bg-surface p-4 sm:p-5">
         <div className="grid gap-1">
-          <h2 className="font-heading text-title-sm font-medium">Headless permission mode</h2>
+          <h2 className="font-heading text-title-sm font-medium">{t('setup.permissionTitle')}</h2>
           <p className="text-body text-muted-foreground">
-            Interactive approval is not available. Remote tasks can only use directories you
-            explicitly authorize here.
+            {t('setup.permissionDescription')}
           </p>
           <Button
             type="button"
@@ -131,13 +145,13 @@ export function SetupPage({
             className="h-auto w-fit px-0 py-1"
             onClick={() => setPolicyOpen(true)}
           >
-            Review permission details
+            {t('setup.reviewPermission')}
           </Button>
         </div>
 
         <div className="settings-grid">
           <label className="field-group" htmlFor="setup-authorized-root">
-            <span>Authorized work root</span>
+            <span>{t('setup.authorizedRoot')}</span>
             <input
               id="setup-authorized-root"
               value={authorizedRoot}
@@ -146,10 +160,10 @@ export function SetupPage({
               autoComplete="off"
               disabled={savingPolicy || pairing !== null}
             />
-            <small>Remote tasks are rejected outside this directory.</small>
+            <small>{t('setup.authorizedRootHelp')}</small>
           </label>
           <label className="field-group" htmlFor="setup-default-workdir">
-            <span>Default work directory</span>
+            <span>{t('setup.defaultWorkdir')}</span>
             <input
               id="setup-default-workdir"
               value={defaultWorkdir}
@@ -158,24 +172,24 @@ export function SetupPage({
               autoComplete="off"
               disabled={savingPolicy || pairing !== null}
             />
-            <small>Choose a real project directory inside the authorized root.</small>
+            <small>{t('setup.defaultWorkdirHelp')}</small>
           </label>
         </div>
 
         <label className="flex cursor-pointer items-start gap-3 text-body">
           <Checkbox
-            aria-label="I understand the permission policy"
+            aria-label={t('setup.policyAria')}
             checked={policyAccepted}
             disabled={savingPolicy || pairing !== null}
             onCheckedChange={(checked) => setPolicyAccepted(checked === true)}
             className="mt-0.5"
           />
-          <span>I understand the permission policy and authorize the directory above.</span>
+          <span>{t('setup.policyAccept')}</span>
         </label>
 
-        {startFailed ? (
+        {startFailure ? (
           <p role="alert" className="rounded-lg border border-destructive/30 bg-destructive/8 p-3 text-body">
-            A pairing code could not be created. Check the local service and try again.
+            {t(startFailure)}
           </p>
         ) : null}
 
@@ -187,7 +201,7 @@ export function SetupPage({
               disabled={!policyComplete || savingPolicy}
               onClick={() => void generatePairing()}
             >
-              {savingPolicy ? 'Generating pairing QR code' : 'Generate pairing QR code'}
+              {savingPolicy ? t('setup.generating') : t('setup.generate')}
             </Button>
           </div>
         ) : null}
@@ -198,20 +212,19 @@ export function SetupPage({
       <Dialog open={policyOpen} onOpenChange={setPolicyOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Permission policy</DialogTitle>
+            <DialogTitle>{t('setup.permissionDialogTitle')}</DialogTitle>
             <DialogDescription>
-              Quukk ClawMessenger invokes each provider in its existing headless mode. Card
-              actions cannot pause a running task for interactive approval.
+              {t('setup.permissionDialogDescription')}
             </DialogDescription>
           </DialogHeader>
           <div className="grid gap-2 text-body text-muted-foreground">
-            <p>Only allowlisted commands and message actions are routed.</p>
-            <p>Every task directory must resolve inside an authorized work root.</p>
-            <p>Review each provider login and local permission configuration before pairing it.</p>
+            <p>{t('setup.permissionRuleCommands')}</p>
+            <p>{t('setup.permissionRuleRoots')}</p>
+            <p>{t('setup.permissionRuleProviders')}</p>
           </div>
           <DialogFooter>
             <Button type="button" onClick={() => setPolicyOpen(false)}>
-              Understood
+              {t('setup.understood')}
             </Button>
           </DialogFooter>
         </DialogContent>

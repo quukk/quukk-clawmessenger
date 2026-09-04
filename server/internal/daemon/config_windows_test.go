@@ -18,6 +18,42 @@ import (
 	"github.com/multica-ai/multica/server/pkg/agent"
 )
 
+func TestCodexDesktopExecutablePathsDiscoversNewestWindowsAgent(t *testing.T) {
+	localAppData := t.TempDir()
+	older := filepath.Join(localAppData, "OpenAI", "Codex", "bin", "older-build", "codex.exe")
+	newer := filepath.Join(localAppData, "OpenAI", "Codex", "bin", "newer-build", "codex.exe")
+	for _, executable := range []string{older, newer} {
+		if err := os.MkdirAll(filepath.Dir(executable), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(executable, []byte("test"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	olderTime := time.Date(2026, time.September, 1, 8, 0, 0, 0, time.UTC)
+	newerTime := olderTime.Add(time.Hour)
+	if err := os.Chtimes(older, olderTime, olderTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(newer, newerTime, newerTime); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LOCALAPPDATA", localAppData)
+
+	paths := codexDesktopExecutablePaths()
+	if len(paths) != 2 {
+		t.Fatalf("codex desktop executable paths = %#v, want the two agent binaries only", paths)
+	}
+	if paths[0] != newer || paths[1] != older {
+		t.Fatalf("codex desktop executable paths = %#v, want newest agent first", paths)
+	}
+	for _, path := range paths {
+		if strings.EqualFold(filepath.Base(path), "ChatGPT.exe") {
+			t.Fatalf("desktop discovery returned the GUI executable: %q", path)
+		}
+	}
+}
+
 const (
 	longPathExecutableHelperEnv = "MULTICA_LONG_PATH_EXECUTABLE_HELPER"
 	longPathExecutableMarkerEnv = "MULTICA_LONG_PATH_EXECUTABLE_MARKER"

@@ -136,9 +136,10 @@ var probeAgentCLIs = func() map[string]AgentEntry {
 			}, true
 		}
 		if defaultCmd == "codex" && cmd == defaultCmd {
-			// Codex Desktop bundles its CLI inside the macOS app instead of
-			// installing it onto PATH.
-			for _, p := range codexDesktopAppBundlePaths() {
+			// Codex Desktop may keep its runnable agent outside PATH. Only
+			// executable agent candidates are returned here; the ChatGPT GUI
+			// itself is never treated as a headless runtime.
+			for _, p := range codexDesktopExecutablePaths() {
 				if _, err := os.Stat(p); err == nil {
 					return AgentEntry{
 						Path:    p,

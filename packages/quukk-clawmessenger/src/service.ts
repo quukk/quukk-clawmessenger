@@ -224,6 +224,7 @@ export type ServiceErrorCode =
   | 'bridge_unavailable'
   | 'runtime_not_found'
   | 'config_recovery_required'
+  | 'pairing_api_unavailable'
   | 'pairing_timeout'
   | 'pairing_transport'
   | 'pairing_unauthorized'
@@ -415,7 +416,7 @@ function normalizedServiceError(error: unknown, fallback: ServiceErrorCode): Ser
   const code = explicitCode(error);
   if (code === 'runtime_not_found') return new ServiceError('runtime_not_found');
   if (code === 'config_recovery_required') return new ServiceError('config_recovery_required');
-  if (code === 'pairing_timeout' || code === 'pairing_transport'
+  if (code === 'pairing_api_unavailable' || code === 'pairing_timeout' || code === 'pairing_transport'
     || code === 'pairing_unauthorized' || code === 'pairing_response_invalid'
     || code === 'pairing_rate_limited' || code === 'pairing_unavailable') {
     return new ServiceError(code);
