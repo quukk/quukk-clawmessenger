@@ -224,7 +224,7 @@ describe('release plan file', () => {
     );
   });
 
-  it('hashes real archives and writes deterministic publish and skip actions', async () => {
+  it('queries mixed runtime and entry versions and writes deterministic actions', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'quukk-release-plan-'));
     temporaryDirectories.push(directory);
     const manifest = join(directory, 'release-set.tsv');
@@ -238,9 +238,11 @@ describe('release plan file', () => {
     }
     await writeFile(
       manifest,
-      `${packages.map((item) => `${item.name}\t${item.archive}`).join('\n')}\n`,
+      `${packages.map((item, index) => (
+        `${item.name}\t${item.archive}\t${index < 6 ? '0.1.0-beta.6' : '0.1.0-beta.11'}`
+      )).join('\n')}\n`,
     );
-    await writeFile(versionFile, '0.1.0-beta.3\n');
+    await writeFile(versionFile, '0.1.0-beta.11\n');
 
     const firstBytes = Buffer.from('archive-0');
     const matchingDistribution = {
@@ -249,14 +251,24 @@ describe('release plan file', () => {
       integrity: `sha512-${createHash('sha512').update(firstBytes).digest('base64')}`,
     };
 
+    const queries: Array<[string, string]> = [];
     await createReleasePlan({
       manifestPath: manifest,
       versionPath: versionFile,
       outputPath: output,
       mode: 'preflight',
-      queryDistribution: (name: string) =>
-        name === runtimeNames[0] ? matchingDistribution : { state: 'missing' as const },
+      queryDistribution: (name: string, version: string) => {
+        queries.push([name, version]);
+        return name === runtimeNames[0]
+          ? matchingDistribution
+          : { state: 'missing' as const };
+      },
     });
+
+    expect(queries).toEqual([
+      ...runtimeNames.map((name) => [name, '0.1.0-beta.6']),
+      ['quukk-clawmessenger', '0.1.0-beta.11'],
+    ]);
 
     expect(await readFile(output, 'utf8')).toBe(
       `${runtimeNames[0]}\t${packages[0].archive}\truntime\tskip\n${[

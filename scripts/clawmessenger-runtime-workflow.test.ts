@@ -377,6 +377,10 @@ describe('Quukk ClawMessenger seven-package workflow', () => {
     expect(validate.run).toContain('tar -xOf "$archive" package/package.json');
     expect(validate.run).toContain('optionalDependencies');
     expect(validate.run).toContain('release-set.tsv');
+    expect(validate.run).toContain('expected_runtime_version=');
+    expect(validate.run).toContain('expected_package_version="$expected_runtime_version"');
+    expect(validate.run).toContain("printf '%s\\t%s\\t%s\\n' \"$package_name\" \"$archive\" \"$package_version\"");
+    expect(validate.run).toContain('EXPECTED_VERSION="$expected_runtime_version"');
     expect(validate.run).toContain(
       'expected_tag="refs/tags/quukk-clawmessenger-v$expected_version"',
     );
