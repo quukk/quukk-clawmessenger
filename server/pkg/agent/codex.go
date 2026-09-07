@@ -865,7 +865,10 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			holdingPins := true
 			flushHeldPins := func() {
 				for _, held := range heldPins {
-					msgCh <- held
+					select {
+					case msgCh <- held:
+					case <-ctx.Done():
+					}
 				}
 				heldPins = nil
 				holdingPins = false
@@ -878,7 +881,10 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				if holdingPins {
 					flushHeldPins()
 				}
-				msgCh <- msg
+				select {
+				case msgCh <- msg:
+				case <-ctx.Done():
+				}
 			}
 			result, ok := <-session.Result
 			if !ok {
@@ -1095,7 +1101,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 	// Result.Output is "final user-facing output selected by the backend"
 	// (agent.go), so it holds the deliverable only. finalAnswer is the text the
 	// app-server labelled `phase: "final_answer"`; lastAgentMessage is the
-	// fallback for the legacy `agent_message` protocol, which carries no phase.
+	// fallback for messages without a phase, including legacy `agent_message`.
 	// Every agent message still flows to msgCh, so the transcript is unchanged —
 	// only what the daemon forwards to a chat/channel reply narrows (GH #6006).
 	var finalAnswer, lastAgentMessage string
@@ -1126,20 +1132,30 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		},
 		onMessage: func(msg Message) {
 			logCodexAgentMessage(b.cfg.Logger, msg)
-			if msg.Type == MessageText {
-				outputMu.Lock()
-				lastAgentMessage = msg.Content
-				outputMu.Unlock()
-			}
 			activity := describeCodexSemanticActivity(msg)
 			if activity == "status:running" {
 				firstItemWait.start(time.Now())
 			}
-			trySend(msgCh, msg)
 			trySendString(semanticActivityCh, activity)
 			if activity != "" {
 				semanticObserved.Store(true)
 			}
+			if msg.Type == MessageText {
+				// Text is append-only: dropping one fragment corrupts the reply.
+				// Bound backpressure by this attempt's context so cancellation
+				// still releases the stdout reader and process cleanup.
+				select {
+				case msgCh <- msg:
+				case <-runCtx.Done():
+				}
+			} else {
+				trySend(msgCh, msg)
+			}
+		},
+		onAgentMessage: func(text string) {
+			outputMu.Lock()
+			lastAgentMessage = text
+			outputMu.Unlock()
 		},
 		onFinalAnswer: func(text string) {
 			outputMu.Lock()
@@ -1165,6 +1181,9 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		defer close(readerDone)
 		scanner := newAgentStreamScanner(stdout)
 		for scanner.Scan() {
+			if runCtx.Err() != nil {
+				break
+			}
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
 				continue
@@ -2153,6 +2172,10 @@ type codexClient struct {
 	onMessage          func(Message)
 	onSemanticActivity func(description string)
 	onTurnDone         func(aborted bool)
+	// onAgentMessage receives the whole current assistant item, independent of
+	// the text fragments sent to onMessage. Completion may revise this value.
+	onAgentMessage func(text string)
+	agentMessages  map[string]*codexAgentMessage
 	// onFinalAnswer fires only for an agent message the app-server itself
 	// labelled `phase: "final_answer"` — the turn's deliverable, as opposed to
 	// the intermediate agent messages that narrate work between tool calls.
@@ -2176,6 +2199,11 @@ type codexClient struct {
 
 	turnErrorMu sync.Mutex
 	turnError   string // captured from turn/completed status=failed or terminal error notifications
+}
+
+type codexAgentMessage struct {
+	text      string
+	completed bool
 }
 
 // codexTurnNotificationGate keeps resume-time history replay from mutating the
@@ -3019,6 +3047,9 @@ func (c *codexClient) handleEvent(msg map[string]any) {
 		}
 	case "agent_message":
 		text, _ := msg["message"].(string)
+		if text != "" && c.onAgentMessage != nil {
+			c.onAgentMessage(text)
+		}
 		if text != "" && c.onMessage != nil {
 			c.onMessage(Message{Type: MessageText, Content: text})
 		}
@@ -3186,11 +3217,38 @@ func (c *codexClient) isNotificationFromOtherThread(params map[string]any) bool 
 }
 
 func (c *codexClient) handleItemNotification(method string, params map[string]any) {
+	if c.turnCompleted {
+		return
+	}
 	item, _ := params["item"].(map[string]any)
 	itemType, _ := item["type"].(string)
 	itemID, _ := item["id"].(string)
+	if method == "item/agentMessage/delta" {
+		itemType = "agentMessage"
+		if id, _ := params["itemId"].(string); id != "" {
+			itemID = id
+		}
+	}
 	if isCodexItemProgressActivity(method) && c.onSemanticActivity != nil {
 		c.onSemanticActivity(describeCodexItemProgressActivity(method, itemType, itemID))
+	}
+	if method == "item/agentMessage/delta" {
+		delta, _ := params["delta"].(string)
+		if delta == "" || itemID == "" {
+			return
+		}
+		message := c.agentMessage(itemID)
+		if message.completed {
+			return
+		}
+		message.text += delta
+		if c.onAgentMessage != nil {
+			c.onAgentMessage(message.text)
+		}
+		if c.onMessage != nil {
+			c.onMessage(Message{Type: MessageText, Content: delta})
+		}
+		return
 	}
 	if item == nil {
 		return
@@ -3265,8 +3323,27 @@ func (c *codexClient) handleItemNotification(method string, params map[string]an
 
 	case method == "item/completed" && itemType == "agentMessage":
 		text, _ := item["text"].(string)
-		if text != "" && c.onMessage != nil {
-			c.onMessage(Message{Type: MessageText, Content: text})
+		message := c.agentMessage(itemID)
+		if message.completed {
+			return
+		}
+		message.completed = true
+		if text == "" {
+			text = message.text
+		}
+		// Completion is authoritative, but the live transcript only supports
+		// append. Emit an unseen suffix when possible; for a revision, retain
+		// the live text and reconcile only the final result via the callbacks.
+		suffix := ""
+		if strings.HasPrefix(text, message.text) {
+			suffix = strings.TrimPrefix(text, message.text)
+		}
+		message.text = text
+		if text != "" && c.onAgentMessage != nil {
+			c.onAgentMessage(text)
+		}
+		if suffix != "" && c.onMessage != nil {
+			c.onMessage(Message{Type: MessageText, Content: suffix})
 		}
 		phase, _ := item["phase"].(string)
 		if phase == "final_answer" {
@@ -3282,6 +3359,21 @@ func (c *codexClient) handleItemNotification(method string, params map[string]an
 			// deliverable, not the authoritative lifecycle boundary.
 		}
 	}
+}
+
+func (c *codexClient) agentMessage(itemID string) *codexAgentMessage {
+	// Older completion-only notifications may omit the item ID. They cannot
+	// be matched to deltas, so treat each as a separate complete message.
+	if itemID == "" {
+		return &codexAgentMessage{}
+	}
+	if c.agentMessages == nil {
+		c.agentMessages = make(map[string]*codexAgentMessage)
+	}
+	if c.agentMessages[itemID] == nil {
+		c.agentMessages[itemID] = &codexAgentMessage{}
+	}
+	return c.agentMessages[itemID]
 }
 
 func isCodexItemProgressActivity(method string) bool {
