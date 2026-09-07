@@ -214,9 +214,9 @@ describe('MessageRouter multi-binding integration', () => {
     expect(new Set(fixture.starts.map(({ conversationKey: key }) => key)).size).toBe(2);
     expect(fixture.receipts.map(({ identity }) => identity.runtimeId).sort()).toEqual([RUNTIME_A, RUNTIME_B].sort());
     expect(fixture.sent.some(({ identity, input }) => identity.runtimeId === RUNTIME_A
-      && input.messageType === 'text' && input.content === 'output-a')).toBe(true);
+      && input.messageType === 'chat_stream' && input.content.text === 'output-a')).toBe(true);
     expect(fixture.sent.some(({ identity, input }) => identity.runtimeId === RUNTIME_B
-      && input.messageType === 'text' && input.content === 'output-b')).toBe(true);
+      && input.messageType === 'chat_stream' && input.content.text === 'output-b')).toBe(true);
     expect(await fixture.state.currentSession(conversation(A))).toBe('session-a');
     expect(await fixture.state.currentSession(conversation(B))).toBe('session-b');
 
@@ -294,11 +294,11 @@ describe('MessageRouter multi-binding integration', () => {
     await Promise.all([activeA, stopA]);
     expect(fixture.cancellations).toEqual(['task_1_1']);
     expect(fixture.sent.some(({ identity, input }) => identity.runtimeId === RUNTIME_B
-      && input.messageType === 'text' && input.content === '[cancelled]')).toBe(false);
+      && input.messageType === 'chat_stream' && input.content.status === 'cancelled')).toBe(false);
     finishB();
     await activeB;
     expect(fixture.sent.some(({ identity, input }) => identity.runtimeId === RUNTIME_B
-      && input.messageType === 'text' && input.content === 'b-survived')).toBe(true);
+      && input.messageType === 'chat_stream' && input.content.text === 'b-survived')).toBe(true);
   });
 
   it('keeps device, CardKit, chatroom, and authentication failure effects on their inbound bindings', async () => {
@@ -337,9 +337,9 @@ describe('MessageRouter multi-binding integration', () => {
       fixture.router.onWorkerEvent(B, inbound(B, message('auth-b'))),
     ]);
     expect(fixture.sent.some(({ identity, input }) => identity.runtimeId === RUNTIME_A
-      && input.messageType === 'text' && input.content === '[runtime_needs_auth]')).toBe(true);
+      && input.messageType === 'chat_stream' && input.content.error_code === 'runtime_needs_auth')).toBe(true);
     expect(fixture.sent.some(({ identity, input }) => identity.runtimeId === RUNTIME_B
-      && input.messageType === 'text' && input.content === 'healthy-b')).toBe(true);
+      && input.messageType === 'chat_stream' && input.content.text === 'healthy-b')).toBe(true);
     expect(JSON.stringify(fixture.sent)).not.toContain('raw auth detail');
   });
 });

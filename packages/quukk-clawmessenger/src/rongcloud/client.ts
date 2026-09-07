@@ -71,7 +71,7 @@ export interface RongCloudClientInit {
 export interface RongCloudSendInput {
   conversationType: RongCloudConversationType;
   targetId: string;
-  messageType: 'text' | 'command' | 'command_result' | 'card_message' | 'card_update' | 'card_action' | 'chatroom_invite';
+  messageType: 'text' | 'command' | 'command_result' | 'card_message' | 'card_update' | 'card_action' | 'chatroom_invite' | 'chat_stream' | 'chat_stream_chunk' | 'chat_stop' | 'chat_stop_result';
   content: string | Record<string, unknown>;
 }
 
@@ -303,6 +303,10 @@ class SlidingWindowQueue {
 }
 
 const registrations = [
+  ['chat_stream', true, false],
+  ['chat_stream_chunk', true, false],
+  ['chat_stop', false, false],
+  ['chat_stop_result', false, false],
   ['command', false, false],
   ['command_result', false, false],
   ['card_message', true, true],

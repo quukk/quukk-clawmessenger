@@ -11,7 +11,7 @@ type SdkResult = {
 type SendInput = {
   conversationType: 1 | 3 | 4;
   targetId: string;
-  messageType: 'text' | 'command' | 'command_result' | 'card_message' | 'card_update' | 'card_action' | 'chatroom_invite';
+  messageType: 'text' | 'command' | 'command_result' | 'card_message' | 'card_update' | 'card_action' | 'chatroom_invite' | 'chat_stream' | 'chat_stream_chunk' | 'chat_stop' | 'chat_stop_result';
   content: string | Record<string, unknown>;
 };
 
@@ -254,6 +254,22 @@ async function initialize(client: ClientLike, token = 'rongcloud-token'): Promis
   await client.connect();
 }
 
+it('registers chat transport persistence and sends validated stream content through the SDK', async () => {
+  const { client, sdk, messages } = createClient();
+  await initialize(client);
+  expect(sdk.registrations).toEqual(expect.arrayContaining([
+    ['chat_stream', true, false], ['chat_stream_chunk', true, false], ['chat_stop', false, false], ['chat_stop_result', false, false],
+  ]));
+  const content = { msg_type: 'chat_stream', protocol_version: 1, stream_id: 's1', request_message_id: 'm1', requester_id: 'u1', node_id: 'opencode-node-1', conversation_type: 1, conversation_id: 'u1', seq: 0, status: 'processing', text: '' };
+  await client.send({ conversationType: 1, targetId: 'u1', messageType: 'chat_stream', content });
+  expect(sdk.sendCalls[0]?.message).toMatchObject({ kind: 'chat_stream', content });
+  const stop = { msg_type: 'chat_stop', protocol_version: 1, stream_id: 's1', request_message_id: 'm1', request_id: 'stop1', node_id: 'opencode-node-1', conversation_type: 1, conversation_id: 'u1' };
+  sdk.emit('MESSAGES', { messages: [{ messageUId: 'stopuid', senderUserId: 'u1', targetId: 'opencode-node-1', conversationType: 1, messageType: 'chat_stop', content: stop }] });
+  await flush();
+  expect(messages.at(-1)?.rawContent).toEqual(stop);
+  await client.dispose();
+});
+
 const message = (overrides: Partial<NormalizedMessage> = {}): NormalizedMessage => ({
   messageUid: 'incoming-1',
   senderId: 'sender-1',
@@ -282,6 +298,10 @@ describe('RongCloudClient lifecycle', () => {
 
     expect(sdk.callLog).toEqual([
       'init:app-key',
+      'register:chat_stream:true:false',
+      'register:chat_stream_chunk:true:false',
+      'register:chat_stop:false:false',
+      'register:chat_stop_result:false:false',
       'register:command:false:false',
       'register:command_result:false:false',
       'register:card_message:true:true',

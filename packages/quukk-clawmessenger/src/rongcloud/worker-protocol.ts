@@ -3,6 +3,7 @@ import { isProxy } from 'node:util/types';
 import { z } from 'zod';
 
 import type { NormalizedRongCloudMessage } from '../protocol/messages.js';
+import { parseChatStreamEvent, parseChatStopRequest, parseChatStopResult, validChatStreamFrame } from '../protocol/chat-stream.js';
 
 export const MAX_WORKER_IPC_BYTES = 64 * 1024;
 export const MAX_STRUCTURED_MESSAGE_BYTES = 10 * 1024;
@@ -15,6 +16,7 @@ const invalidClone = Symbol('invalid-clone');
 const oversizedClone = Symbol('oversized-clone');
 
 export const OUTBOUND_MESSAGE_TYPES = [
+  'chat_stream', 'chat_stream_chunk', 'chat_stop', 'chat_stop_result',
   'text',
   'command',
   'command_result',
@@ -234,6 +236,7 @@ const textSendSchema = z.strictObject({
 });
 
 const structuredMessageTypeSchema = z.enum([
+  'chat_stream', 'chat_stream_chunk', 'chat_stop', 'chat_stop_result',
   'command',
   'command_result',
   'card_message',
@@ -250,6 +253,14 @@ const structuredSendSchema = z.strictObject({
   messageType: structuredMessageTypeSchema,
   content: jsonObject,
 }).superRefine((value, context) => {
+  const validators = { chat_stream: parseChatStreamEvent, chat_stream_chunk: validChatStreamFrame, chat_stop: parseChatStopRequest, chat_stop_result: parseChatStopResult };
+  if (value.messageType in validators) {
+    const validator = validators[value.messageType as keyof typeof validators];
+    if (!validator(value.content) || Buffer.byteLength(JSON.stringify(value.content)) > 9000) {
+      context.addIssue({ code: 'custom', path: ['content'], message: 'invalid_chat_content' });
+    }
+    return;
+  }
   const msgType = value.content.msg_type;
   const usesWireLimit = value.messageType === 'card_message'
     || value.messageType === 'card_update'

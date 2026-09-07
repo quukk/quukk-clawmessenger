@@ -10,6 +10,7 @@ import { isProxy } from 'node:util/types';
 export const MAX_RONGCLOUD_MESSAGE_BYTES = 64 * 1024;
 
 export const EXTERNAL_MESSAGE_TYPES = [
+  'chat_stream', 'chat_stream_chunk', 'chat_stop', 'chat_stop_result',
   'create_opencode_session',
   'opencode_session_created',
   'delete_opencode_session',
@@ -93,6 +94,7 @@ type AliasResult<T> = { ok: true; value?: T } | { ok: false; code: 'invalid' | '
 
 const externalTypes = new Set<string>(EXTERNAL_MESSAGE_TYPES);
 const v2AndCardTypes = new Set<string>([
+  'chat_stream', 'chat_stream_chunk', 'chat_stop', 'chat_stop_result',
   'card_message',
   'card_update',
   'card_action',
@@ -117,6 +119,7 @@ const maxCardEnvelopeBytes = 10 * 1024;
 const controlCharacters = /[\p{Cc}\p{Cf}]/u;
 const dangerousObjectKeys = new Set(['__proto__', 'prototype', 'constructor']);
 const rawContentKeys = new Set([
+  'protocol_version', 'stream_id', 'request_message_id', 'requester_id', 'conversation_type', 'conversation_id', 'text',
   'content', 'attachments', 'msg_type', 'service', 'version', 'action', 'payload', 'timestamp',
   'request_id', 'requestId', 'source_im_id', 'sourceImId', 'destination_im_id', 'destinationImId',
   'session_id', 'sessionId', 'chatroom_id', 'chatroomId', 'origin_message_uid', 'originMessageUId',
@@ -260,7 +263,7 @@ type PassiveSnapshot =
   | { ok: true; value: unknown; bytes: number }
   | { ok: false; code: 'invalid' | 'too_large' };
 
-function passiveSnapshot(value: unknown, maxBytes = MAX_RONGCLOUD_MESSAGE_BYTES): PassiveSnapshot {
+export function passiveSnapshot(value: unknown, maxBytes = MAX_RONGCLOUD_MESSAGE_BYTES): PassiveSnapshot {
   const cloned = clonePassiveJson(value, { items: 0, textBytes: 0, maxBytes }, new Set());
   if (cloned === invalidClone) return { ok: false, code: 'invalid' };
   if (cloned === oversizedClone) return { ok: false, code: 'too_large' };

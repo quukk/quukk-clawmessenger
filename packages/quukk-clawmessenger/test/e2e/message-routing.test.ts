@@ -76,7 +76,7 @@ describe('Quukk message-routing E2E', () => {
 
       await vi.waitFor(() => expect(harness.runtime.taskStarts()).toHaveLength(2));
       await vi.waitFor(() => expect(harness.workers.outbound().filter(({ input }) =>
-        input.messageType === 'text' && String(input.content).startsWith('reply:'))).toHaveLength(2));
+        input.messageType === 'chat_stream' && String(input.content.text).startsWith('reply:'))).toHaveLength(2));
 
       const starts = harness.runtime.taskStarts();
       expect(new Set(starts.map(({ conversationKey }) => conversationKey)).size).toBe(2);
@@ -84,11 +84,11 @@ describe('Quukk message-routing E2E', () => {
       expect(harness.workers.outbound()).toEqual(expect.arrayContaining([
         expect.objectContaining({
           identity: expect.objectContaining({ runtimeId: E2E_RUNTIME_IDS.opencode }),
-          input: expect.objectContaining({ messageType: 'text', content: 'reply:opencode' }),
+          input: expect.objectContaining({ messageType: 'chat_stream', content: expect.objectContaining({ text: 'reply:opencode', status: 'completed' }) }),
         }),
         expect.objectContaining({
           identity: expect.objectContaining({ runtimeId: E2E_RUNTIME_IDS.openclaw }),
-          input: expect.objectContaining({ messageType: 'text', content: 'reply:openclaw' }),
+          input: expect.objectContaining({ messageType: 'chat_stream', content: expect.objectContaining({ text: 'reply:openclaw', status: 'completed' }) }),
         }),
       ]));
 
@@ -129,18 +129,18 @@ describe('Quukk message-routing E2E', () => {
       await vi.waitFor(() => expect(harness.runtime.reconnectRequests()).toBeGreaterThan(0));
       await vi.waitFor(() => expect(harness.workers.outbound().some(({ identity, input }) =>
         identity.runtimeId === E2E_RUNTIME_IDS.openclaw
-        && input.messageType === 'text'
-        && input.content === 'reply:openclaw')).toBe(true));
+        && input.messageType === 'chat_stream'
+        && input.content.text === 'reply:openclaw')).toBe(true));
       expect(harness.workers.outbound().some(({ identity, input }) =>
         identity.runtimeId === E2E_RUNTIME_IDS.opencode
-        && input.messageType === 'text'
-        && input.content === 'reply:opencode')).toBe(false);
+        && input.messageType === 'chat_stream'
+        && input.content.text === 'reply:opencode')).toBe(false);
 
       harness.workers.reconnect(E2E_RUNTIME_IDS.opencode);
       await vi.waitFor(() => expect(harness.workers.outbound().some(({ identity, input }) =>
         identity.runtimeId === E2E_RUNTIME_IDS.opencode
-        && input.messageType === 'text'
-        && input.content === 'reply:opencode')).toBe(true));
+        && input.messageType === 'chat_stream'
+        && input.content.text === 'reply:opencode')).toBe(true));
 
       const cancelGate = harness.runtime.holdNext('openclaw');
       harness.workers.emitMessage(E2E_RUNTIME_IDS.openclaw, message('cancel-active', 'PROMPT-CANCEL-SENTINEL'));
@@ -150,8 +150,8 @@ describe('Quukk message-routing E2E', () => {
       cancelGate.release();
       await vi.waitFor(() => expect(harness.workers.outbound().some(({ identity, input }) =>
         identity.runtimeId === E2E_RUNTIME_IDS.openclaw
-        && input.messageType === 'text'
-        && input.content === '[cancelled]')).toBe(true));
+        && input.messageType === 'chat_stream'
+        && input.content.status === 'cancelled')).toBe(true));
 
       harness.workers.emitMessage(E2E_RUNTIME_IDS.opencode, permission('permission-action'));
       await vi.waitFor(() => expect(harness.workers.outbound().some(({ identity, input }) =>

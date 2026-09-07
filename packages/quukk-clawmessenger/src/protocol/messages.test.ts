@@ -406,6 +406,7 @@ describe('parseProtocolContent', () => {
 
   it('preserves the complete external compatibility name set', () => {
     expect(EXTERNAL_MESSAGE_TYPES).toEqual([
+      'chat_stream', 'chat_stream_chunk', 'chat_stop', 'chat_stop_result',
       'create_opencode_session',
       'opencode_session_created',
       'delete_opencode_session',

@@ -48,6 +48,7 @@ import {
   type RoleRecommendationRequest,
 } from '../protocol/discussion-v2.js';
 import { DiscussionWireReassembler, encodeDiscussionWire } from '../protocol/discussion-wire.js';
+import { encodeChatStreamEvent, parseChatStopRequest, type ChatStreamStatus, type ChatStopResult } from '../protocol/chat-stream.js';
 import {
   buildLegacyEnvelope,
   parseProtocolContent,
@@ -75,11 +76,11 @@ const OUTPUT_TRUNCATED_TEXT = '[output_truncated]';
 const MAX_OUTPUT_CONTENT_BYTES = MAX_OUTPUT_BYTES - Buffer.byteLength(OUTPUT_TRUNCATED_TEXT, 'utf8');
 const OUTPUT_FLUSH_MS = 250;
 const OUTPUT_EARLY_FLUSH_BYTES = 16 * 1024;
-const OUTPUT_CHUNK_BYTES = 32 * 1024;
 const TASK_WATCHDOG_MS = 2 * 60 * 60 * 1_000 + 60_000;
 const ROLE_RECOMMENDATION_WATCHDOG_MS = 3 * 60 * 1_000;
 const MAX_BUFFERED_OUTPUT_ENTRIES = 32;
-const MAX_BUFFERED_OUTPUT_BYTES = 1024 * 1024;
+// Leave room for base64 wire framing of a maximum-size final snapshot.
+const MAX_BUFFERED_OUTPUT_BYTES = 2 * 1024 * 1024;
 const TRANSIENT_OUTPUT_CODES = new Set([
   'not_connected', 'disconnected', 'timeout', 'worker_exited',
 ]);
@@ -97,6 +98,7 @@ export type RouterWorkerSend =
       targetId: string;
       messageType:
         | 'command'
+        | 'chat_stream' | 'chat_stream_chunk' | 'chat_stop_result'
         | 'command_result'
         | 'card_message'
         | 'card_update'
@@ -259,6 +261,13 @@ interface InflightBindingOperations {
 }
 
 interface ActiveTask {
+  streamId: string;
+  requestMessageId: string;
+  streamSeq: number;
+  streamStatus: ChatStreamStatus;
+  streamError?: string;
+  stopAttempt?: Promise<boolean>;
+  snapshotPending: boolean;
   identity: WorkerIdentity;
   conversation: ConversationIdentity;
   bindingKey: string;
@@ -489,18 +498,6 @@ function utf8Prefix(value: string, maximumBytes: number): string {
   }
   if (low > 0 && /[\uD800-\uDBFF]/u.test(value[low - 1]!)) low -= 1;
   return value.slice(0, low);
-}
-
-function textChunks(value: string, maximumBytes: number): string[] {
-  const chunks: string[] = [];
-  let remaining = value;
-  while (remaining.length > 0) {
-    const chunk = utf8Prefix(remaining, maximumBytes);
-    if (chunk.length === 0) break;
-    chunks.push(chunk);
-    remaining = remaining.slice(chunk.length);
-  }
-  return chunks;
 }
 
 function serializedBytes(messages: readonly RouterWorkerSend[]): number {
@@ -805,12 +802,48 @@ export class MessageRouter {
     });
   }
 
+  async #runChatStop(identity: WorkerIdentity, message: NormalizedRongCloudMessage, value: Record<string, unknown>): Promise<void> {
+    const request = parseChatStopRequest(value);
+    if (!request || request.node_id !== identity.nodeId) return;
+    const conversation = conversationFrom(message, identity);
+    const generation = this.#bindingGeneration(identity);
+    if (request.conversation_type !== conversation.conversationType
+      || request.conversation_id !== replyTargetId(conversation)) return;
+    const bound = await this.#binding.binding(identity);
+    if (!bound || bound.nodeId !== identity.nodeId || bound.runtimeId !== identity.runtimeId
+      || !this.#bindingGenerationCurrent(identity, generation)) return;
+    const active = [...this.#active.values()].find((task) => task.streamId === request.stream_id && task.bindingKey === bindingKey(identity));
+    let code: ChatStopResult['code'] = 'no_active_task';
+    if (active && (active.conversation.senderId !== message.senderId
+      || active.conversationKey !== conversationKey(conversation))) code = 'forbidden';
+    else if (active && !active.terminal && !active.suppressed && active.generation === generation
+      && active.requestMessageId === request.request_message_id) {
+      // Capture the exact task before awaiting cancellation; a later turn cannot be selected.
+      active.stopAttempt ??= this.#task.cancelTask(active.taskId).then(() => true, () => false);
+      const attempt = active.stopAttempt;
+      const accepted = await attempt;
+      if (!accepted && active.stopAttempt === attempt) active.stopAttempt = undefined;
+      code = accepted ? 'stop_requested' : 'cancel_failed';
+    }
+    if (!this.#bindingGenerationCurrent(identity, generation)) return;
+    await this.#sendWorker(identity, {
+      conversationType: conversation.conversationType, targetId: replyTargetId(conversation), messageType: 'chat_stop_result',
+      content: { msg_type: 'chat_stop_result', protocol_version: 1, request_id: request.request_id,
+        stream_id: request.stream_id, node_id: identity.nodeId, status: code === 'stop_requested' ? 'accepted' : 'rejected', code },
+    }).catch(() => undefined);
+  }
+
   async #dispatchProtocol(
     identity: WorkerIdentity,
     message: NormalizedRongCloudMessage,
     msgType: ExternalMessageType,
     value: Record<string, unknown>,
   ): Promise<void> {
+    if (msgType === 'chat_stop') {
+      await this.#runChatStop(identity, message, value);
+      return;
+    }
+    if (msgType === 'chat_stream' || msgType === 'chat_stream_chunk' || msgType === 'chat_stop_result') return;
     if (msgType === 'discussion_wire_chunk') {
       await this.#runDiscussionWire(identity, message, value);
       return;
@@ -3235,6 +3268,11 @@ export class MessageRouter {
       let resolveDone!: () => void;
       const done = new Promise<void>((resolve) => { resolveDone = resolve; });
       const active: ActiveTask = {
+        streamId: cryptoRandomBytes(16).toString('hex'),
+        requestMessageId: candidate.effectiveMessageUid,
+        streamSeq: 0,
+        streamStatus: 'processing',
+        snapshotPending: false,
         identity: { ...identity },
         conversation: { ...candidate.conversation },
         bindingKey: bindingKey(identity),
@@ -3280,12 +3318,7 @@ export class MessageRouter {
         active.resolveDone();
         return;
       }
-      await this.#sendWorker(identity, {
-        conversationType: candidate.conversation.conversationType,
-        targetId: replyTargetId(candidate.conversation),
-        messageType: 'text',
-        content: '[processing]',
-      }).catch(() => this.#logFailure(active, 'output_dropped'));
+      await this.#queueOutput(active, () => this.#sendStreamSnapshot(active, '', 'processing'));
       if (!this.#bindingGenerationCurrent(identity, generation)) {
         active.suppressed = true;
         this.#active.delete(active.conversationKey);
@@ -3345,6 +3378,7 @@ export class MessageRouter {
         }
         if (event.type === 'completed') {
           if (event.output) this.#appendCompletedOutput(active, event.output);
+          active.streamStatus = 'completed';
           active.terminal = true;
           await this.#flushTerminal(active);
           break;
@@ -3355,13 +3389,14 @@ export class MessageRouter {
             : event.error.category === 'transport'
               ? 'runtime_transport_error'
               : 'runtime_failed';
-          this.#appendOutput(active, `[${code}]`);
+          active.streamStatus = 'failed';
+          active.streamError = code;
           active.terminal = true;
           await this.#flushTerminal(active);
           break;
         }
         if (event.type === 'cancelled') {
-          this.#appendOutput(active, '[cancelled]');
+          active.streamStatus = 'cancelled';
           active.terminal = true;
           await this.#flushTerminal(active);
           break;
@@ -3369,7 +3404,8 @@ export class MessageRouter {
       }
     } catch {
       if (!active.suppressed && !active.timedOut) {
-        this.#appendOutput(active, '[runtime_transport_error]');
+        active.streamStatus = 'failed';
+        active.streamError = 'runtime_transport_error';
         active.terminal = true;
         await this.#flushTerminal(active);
       }
@@ -3380,7 +3416,8 @@ export class MessageRouter {
       }
       if (active.watchdogPromise !== undefined) await active.watchdogPromise.catch(() => undefined);
       if (!active.terminal && !active.suppressed && !active.timedOut) {
-        this.#appendOutput(active, '[runtime_transport_error]');
+        active.streamStatus = 'failed';
+        active.streamError = 'runtime_transport_error';
         active.terminal = true;
         await this.#flushTerminal(active);
       }
@@ -3429,7 +3466,7 @@ export class MessageRouter {
         this.#clearTimeout(active.flushTimer);
         active.flushTimer = undefined;
       }
-      await this.#flushCoarse(active);
+      void this.#flushCoarse(active).catch(() => this.#logFailure(active, 'output_dropped'));
       return;
     }
     if (active.flushTimer !== undefined) return;
@@ -3454,36 +3491,47 @@ export class MessageRouter {
   }
 
   #flushCoarse(active: ActiveTask): Promise<void> {
+    if (active.snapshotPending) return Promise.resolve();
+    active.snapshotPending = true;
     return this.#queueOutput(active, async () => {
+      active.snapshotPending = false;
       if (active.suppressed
         || active.terminal
         || active.timedOut
         || !this.#bindingGenerationCurrent(active.identity, active.generation)) return;
       const safe = streamSafeContent(active.rawOutput);
-      const pending = safe.slice(active.deliveredTextCharacters);
-      const chunks = textChunks(pending, OUTPUT_CHUNK_BYTES);
-      for (let index = 0; index < chunks.length; index += 1) {
-        const chunk = chunks[index]!;
-        const message = this.#textResponse(active.conversation, chunk);
-        try {
-          await this.#sendWorker(active.identity, message);
-          active.deliveredTextCharacters += chunk.length;
-          if (!this.#bindingGenerationCurrent(active.identity, active.generation)) return;
-        } catch (error) {
-          const code = workerErrorCode(error);
-          if (code !== undefined && TRANSIENT_OUTPUT_CODES.has(code)) {
-            this.#bufferOutput(active, 'coarse', chunks.slice(index).map((content) =>
-              this.#textResponse(active.conversation, content)));
-          } else {
-            active.deliveredTextCharacters = safe.length;
-            this.#removeBufferedTask(active.bindingKey, active.taskId);
-          }
-          this.#logFailure(active, code ?? 'output_dropped');
-          return;
-        }
-      }
-      this.#removeBufferedTask(active.bindingKey, active.taskId, 'coarse');
+      if (safe.length === active.deliveredTextCharacters) return;
+      await this.#sendStreamSnapshot(active, safe, 'streaming');
+      active.deliveredTextCharacters = safe.length;
     });
+  }
+
+  #streamMessages(active: ActiveTask, text: string, status: ChatStreamStatus): RouterWorkerSend[] {
+    return encodeChatStreamEvent({
+      msg_type: 'chat_stream', protocol_version: 1, stream_id: active.streamId,
+      request_message_id: active.requestMessageId, requester_id: active.conversation.senderId,
+      node_id: active.identity.nodeId, conversation_type: active.conversation.conversationType,
+      conversation_id: replyTargetId(active.conversation), seq: active.streamSeq++, status, text,
+      ...(active.streamError === undefined ? {} : { error_code: active.streamError }),
+    }).map((frame) => ({ conversationType: active.conversation.conversationType, targetId: replyTargetId(active.conversation), ...frame }));
+  }
+
+  async #sendStreamSnapshot(active: ActiveTask, text: string, status: ChatStreamStatus): Promise<void> {
+    const messages = this.#streamMessages(active, text, status);
+    for (let index = 0; index < messages.length; index += 1) {
+      if (active.suppressed || !this.#bindingGenerationCurrent(active.identity, active.generation)) return;
+      try {
+        await this.#sendWorker(active.identity, messages[index]!);
+      } catch (error) {
+        const code = workerErrorCode(error);
+        if (code === 'queue_full' || (code !== undefined && TRANSIENT_OUTPUT_CODES.has(code))) {
+          this.#bufferOutput(active, 'coarse', messages.slice(index));
+        }
+        this.#logFailure(active, code ?? 'output_dropped');
+        return;
+      }
+    }
+    this.#removeBufferedTask(active.bindingKey, active.taskId, 'coarse');
   }
 
   #flushTerminal(active: ActiveTask): Promise<void> {
@@ -3514,9 +3562,8 @@ export class MessageRouter {
         }
       }
       const finalText = parsed.text + INVALID_CARD_MARKER_TEXT.repeat(invalidCards);
-      const text = finalText.slice(Math.min(active.deliveredTextCharacters, finalText.length));
-      const textMessages = textChunks(text, OUTPUT_CHUNK_BYTES).map((content) =>
-        this.#textResponse(active.conversation, content));
+      const textMessages = this.#streamMessages(active, finalText, active.streamStatus);
+      this.#removeBufferedTask(active.bindingKey, active.taskId, 'coarse');
       const messages = [...textMessages, ...cardMessages];
       for (let index = 0; index < messages.length; index += 1) {
         try {
@@ -3524,7 +3571,7 @@ export class MessageRouter {
           if (!this.#bindingGenerationCurrent(active.identity, active.generation)) return;
         } catch (error) {
           const code = workerErrorCode(error);
-          if (code !== undefined && TRANSIENT_OUTPUT_CODES.has(code)) {
+          if (code === 'queue_full' || (code !== undefined && TRANSIENT_OUTPUT_CODES.has(code))) {
             this.#bufferOutput(active, 'terminal', messages.slice(index));
           } else {
             this.#removeBufferedTask(active.bindingKey, active.taskId);
@@ -3546,7 +3593,8 @@ export class MessageRouter {
     if (active.iterator?.return !== undefined) {
       await active.iterator.return().catch(() => this.#logFailure(active, 'reader_close_failed'));
     }
-    this.#appendOutput(active, '[task_timeout]');
+    active.streamStatus = 'failed';
+    active.streamError = 'task_timeout';
     await this.#flushTerminal(active);
   }
 

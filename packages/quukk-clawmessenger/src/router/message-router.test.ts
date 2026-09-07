@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { BridgeTaskEvent, BridgeTaskPort } from '../go/types.js';
-import { encodeDiscussionWire } from '../protocol/discussion-wire.js';
+import { DiscussionWireReassembler, encodeDiscussionWire } from '../protocol/discussion-wire.js';
+import { parseChatStreamEvent, type ChatStreamEvent } from '../protocol/chat-stream.js';
 import type { NormalizedRongCloudMessage } from '../protocol/messages.js';
 import type { WorkerEvent } from '../rongcloud/worker-protocol.js';
 import type { WorkerIdentity } from '../rongcloud/worker-supervisor.js';
@@ -39,6 +40,20 @@ const temporaryDirectories: string[] = [];
 
 const IDENTITY_A: WorkerIdentity = { runtimeId: RUNTIME_A, nodeId: 'codex_node-a' };
 const INSTANCE_A = `rcw_${'1'.repeat(32)}`;
+
+function streamEvents(sent: RouterHarness['sent']): ChatStreamEvent[] {
+  const wire = new DiscussionWireReassembler();
+  const events: ChatStreamEvent[] = [];
+  for (const { identity, input } of sent) {
+    if (input.messageType !== 'chat_stream' && input.messageType !== 'chat_stream_chunk') continue;
+    const result = wire.accept(identity.nodeId, input.messageType === 'chat_stream_chunk'
+      ? { ...input.content, msg_type: 'discussion_wire_chunk' } : input.content);
+    if (result.status !== 'complete' && result.status !== 'passthrough') continue;
+    const event = parseChatStreamEvent(result.payload);
+    if (event) events.push(event);
+  }
+  return events;
+}
 
 function message(
   uid: string,
@@ -296,7 +311,7 @@ async function routerHarness(
   const worker: RouterWorkerPort = {
     send: async (identity, input) => {
       sent.push({ identity: { ...identity }, input: structuredClone(input) });
-      if (input.messageType === 'text' && input.content === '[processing]') order.push('processing');
+      if (input.messageType === 'chat_stream' && input.content.status === 'processing') order.push('processing');
       return 'outbound-uid';
     },
     receipt: async (identity, input) => {
@@ -859,7 +874,7 @@ describe('MessageRouter plain task admission', () => {
     expect(fixture.state.releaseCalls).toBe(1);
     expect(fixture.receipts).toEqual([]);
     expect(fixture.sent.some(({ input }) =>
-      input.messageType === 'text' && input.content === '[processing]')).toBe(false);
+      input.messageType === 'chat_stream' && input.content.status === 'processing')).toBe(false);
     expect(fixture.sent.at(-1)?.input).toMatchObject({
       messageType: 'text',
       content: '[task_start_failed]',
@@ -875,7 +890,7 @@ describe('MessageRouter plain task admission', () => {
     expect(fixture.state.releaseCalls).toBe(0);
     expect(fixture.receipts).toEqual([]);
     expect(fixture.sent.some(({ input }) =>
-      input.messageType === 'text' && input.content === '[processing]')).toBe(false);
+      input.messageType === 'chat_stream' && input.content.status === 'processing')).toBe(false);
   });
 
   it('continues the accepted task when receipt and processing delivery fail', async () => {
@@ -896,7 +911,7 @@ describe('MessageRouter plain task admission', () => {
       worker: {
         send: async (_identity, input) => {
           sends.push(input);
-          if (input.messageType === 'text' && input.content === '[processing]') {
+          if (input.messageType === 'chat_stream' && input.content.status === 'processing') {
             throw Object.assign(new Error('offline'), { code: 'protocol_error' });
           }
           return 'uid';
@@ -921,7 +936,7 @@ describe('MessageRouter plain task admission', () => {
     });
     await router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('uid-feedback-fail')));
     expect(eventConsumed).toBe(true);
-    expect(sends.some((input) => input.messageType === 'text' && input.content === 'done')).toBe(true);
+    expect(sends.some((input) => input.messageType === 'chat_stream' && input.content.text === 'done')).toBe(true);
   });
 
   it('re-authorizes workdir for every task and uses terminal session for the next lane item', async () => {
@@ -1750,6 +1765,201 @@ describe('MessageRouter session, legacy, device, and chatroom dispatch', () => {
 });
 
 describe('MessageRouter task events and reconnect behavior', () => {
+  it('does not act on a stop whose binding generation changed during validation', async () => {
+    const fixture = await routerHarness();
+    let releaseTask!: () => void;
+    let taskReady!: () => void;
+    const taskGate = new Promise<void>((resolve) => { releaseTask = resolve; });
+    const ready = new Promise<void>((resolve) => { taskReady = resolve; });
+    fixture.setEvents((taskId) => (async function* () { taskReady(); await taskGate; yield bridgeEvent(taskId, 'completed'); })());
+    const routing = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('generation-origin')));
+    await ready;
+    const stream = streamEvents(fixture.sent)[0]!;
+    let releaseBinding!: () => void;
+    let validating!: () => void;
+    const bindingGate = new Promise<void>((resolve) => { releaseBinding = resolve; });
+    const validationReady = new Promise<void>((resolve) => { validating = resolve; });
+    fixture.binding.binding = async () => { validating(); await bindingGate; return { ...IDENTITY_A, provider: 'codex', enabled: true }; };
+    const stop = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage('generation-stop', {
+      msg_type: 'chat_stop', protocol_version: 1, request_id: 'generation-stop', stream_id: stream.stream_id,
+      request_message_id: 'generation-origin', node_id: IDENTITY_A.nodeId, conversation_type: 3, conversation_id: 'group',
+    })));
+    await validationReady;
+    const disposal = fixture.router.disposeBinding(IDENTITY_A);
+    releaseTask();
+    releaseBinding();
+    await Promise.all([stop, routing, disposal]);
+    expect(fixture.cancellations).toEqual(['task_1_1']);
+    expect(fixture.sent.some(({ input }) => input.messageType === 'chat_stop_result')).toBe(false);
+  });
+
+  it('keeps completion authoritative when an accepted stop response arrives after the next turn starts', async () => {
+    const fixture = await routerHarness();
+    let releaseTask!: () => void;
+    let readyTask!: () => void;
+    const taskGate = new Promise<void>((resolve) => { releaseTask = resolve; });
+    const ready = new Promise<void>((resolve) => { readyTask = resolve; });
+    fixture.setEvents((taskId, index) => (async function* () {
+      if (index === 0) { readyTask(); await taskGate; }
+      yield bridgeEvent(taskId, 'completed', { output: `answer-${index}` });
+    })());
+    const first = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('race-first', 'hello', { conversationType: 1, targetId: IDENTITY_A.nodeId })));
+    await ready;
+    const stream = streamEvents(fixture.sent)[0]!;
+    expect(stream.conversation_id).toBe('sender');
+    let accept!: () => void;
+    let requested!: () => void;
+    const cancellation = new Promise<void>((resolve) => { accept = resolve; });
+    const cancelReady = new Promise<void>((resolve) => { requested = resolve; });
+    fixture.task.cancelTask = (id) => { fixture.cancellations.push(id); requested(); return cancellation; };
+    const stop = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage('race-stop', {
+      msg_type: 'chat_stop', protocol_version: 1, request_id: 'race-stop', stream_id: stream.stream_id,
+      request_message_id: 'race-first', node_id: IDENTITY_A.nodeId, conversation_type: 1, conversation_id: 'sender',
+    }, { conversationType: 1, targetId: IDENTITY_A.nodeId })));
+    await cancelReady;
+    const second = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('race-second', 'hello', { conversationType: 1, targetId: IDENTITY_A.nodeId })));
+    releaseTask();
+    await Promise.all([first, second]);
+    accept();
+    await stop;
+    expect(fixture.cancellations).toEqual(['task_1_1']);
+    expect(streamEvents(fixture.sent).filter((event) => event.status === 'completed').map((event) => event.text)).toEqual(['answer-0', 'answer-1']);
+    expect(fixture.sent.at(-1)?.input).toMatchObject({ targetId: 'sender', messageType: 'chat_stop_result', content: { status: 'accepted', stream_id: stream.stream_id } });
+  });
+  it('retains a maximum-size terminal snapshot across transient reconnect', async () => {
+    const fixture = await routerHarness();
+    let online = false;
+    const originalSend = fixture.worker.send.bind(fixture.worker);
+    fixture.worker.send = async (identity, input) => {
+      if (input.messageType === 'chat_stream_chunk' && !online) throw Object.assign(new Error('offline'), { code: 'not_connected' });
+      return originalSend(identity, input);
+    };
+    fixture.setEvents((taskId) => (async function* () { yield bridgeEvent(taskId, 'completed', { output: '中🌍'.repeat(160000) }); })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('max-reconnect')));
+    online = true;
+    await fixture.router.onWorkerEvent(IDENTITY_A, { type: 'connection', runtimeId: RUNTIME_A, instanceId: INSTANCE_A, state: 'online' });
+    const terminal = streamEvents(fixture.sent).find((event) => event.status === 'completed');
+    expect(terminal).toBeDefined();
+    expect(Buffer.byteLength(terminal!.text)).toBeGreaterThan(1024 * 1024 - 8);
+    expect(terminal!.text.endsWith('[output_truncated]')).toBe(true);
+  });
+  it('keeps consuming runtime events while large snapshot transport is pending and coalesces queued snapshots', async () => {
+    const fixture = await routerHarness();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let handled = false;
+    let blocked = false;
+    let entered!: () => void;
+    const transportEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const originalSend = fixture.worker.send.bind(fixture.worker);
+    fixture.worker.send = async (identity, input) => {
+      if (input.messageType === 'chat_stream_chunk' && !blocked) { blocked = true; entered(); await gate; }
+      return originalSend(identity, input);
+    };
+    fixture.setEvents((taskId) => (async function* () {
+      for (let index = 0; index < 5; index += 1) yield bridgeEvent(taskId, 'text_delta', { id: index + 1, text: '中🌍'.repeat(3000) });
+      handled = true;
+      yield bridgeEvent(taskId, 'completed', { id: 6 });
+    })());
+    const routing = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('backpressure')));
+    await transportEntered;
+    for (let index = 0; index < 5; index += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    const consumedBeforeSend = handled;
+    release();
+    await routing;
+    expect(consumedBeforeSend).toBe(true);
+    const events = streamEvents(fixture.sent);
+    expect(events.at(-1)?.text === '中🌍'.repeat(15000)).toBe(true);
+    expect(events.at(-1)?.status).toBe('completed');
+    expect(events.filter((event) => event.status === 'streaming').length).toBeLessThanOrEqual(2);
+  });
+
+  it('rejects mismatched stop scopes, retains a task on cancellation failure, and never cancels the next turn', async () => {
+    const fixture = await routerHarness();
+    const releases: Array<() => void> = [];
+    const ready: Array<() => void> = [];
+    const observed = [0, 1].map(() => new Promise<void>((resolve) => ready.push(resolve)));
+    fixture.setEvents((taskId, index) => (async function* () {
+      const gate = new Promise<void>((resolve) => { releases[index] = resolve; });
+      ready[index]!();
+      await gate;
+      yield bridgeEvent(taskId, 'completed', { output: 'partial retained' });
+    })());
+    const first = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('first')));
+    await observed[0];
+    const stream = streamEvents(fixture.sent)[0]!;
+    const stop = { msg_type: 'chat_stop', protocol_version: 1, request_id: 'stop', stream_id: stream.stream_id, request_message_id: 'first', node_id: IDENTITY_A.nodeId, conversation_type: 3, conversation_id: 'group' };
+    for (const [index, change] of [{ node_id: 'other' }, { conversation_id: 'other' }, { conversation_type: 1 }, { stream_id: 'other' }, { request_message_id: 'old' }, { task_id: 'task_2_1' }].entries()) {
+      await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(`mismatch-${index}`, { ...stop, ...change })));
+    }
+    expect(fixture.cancellations).toEqual([]);
+    fixture.task.cancelTask = async (taskId) => { fixture.cancellations.push(taskId); throw new Error('cancel failed'); };
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage('failed-stop', stop)));
+    expect(fixture.sent.at(-1)?.input).toMatchObject({ messageType: 'chat_stop_result', content: { status: 'rejected', code: 'cancel_failed' } });
+    expect(streamEvents(fixture.sent).at(-1)?.status).toBe('processing');
+    const next = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('second')));
+    releases[0]!();
+    await first;
+    await observed[1];
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage('old-stop', stop)));
+    expect(fixture.sent.at(-1)?.input).toMatchObject({ messageType: 'chat_stop_result', content: { code: 'no_active_task' } });
+    expect(fixture.cancellations).toEqual(['task_1_1']);
+    releases[1]!();
+    await next;
+    expect(streamEvents(fixture.sent).filter((event) => event.status === 'completed')).toHaveLength(2);
+  });
+
+  it.each(['empty', 'failed', 'ended'] as const)('emits an explicit terminal for %s runtime output', async (kind) => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      if (kind === 'empty') yield bridgeEvent(taskId, 'completed');
+      if (kind === 'failed') {
+        yield bridgeEvent(taskId, 'text_delta', { text: 'partial' });
+        yield bridgeEvent(taskId, 'failed', { id: 2, error: { category: 'transport' } });
+      }
+    })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message(`terminal-${kind}`)));
+    const terminal = streamEvents(fixture.sent).at(-1)!;
+    expect(terminal.status).toBe(kind === 'empty' ? 'completed' : 'failed');
+    expect(terminal.text).toBe(kind === 'failed' ? 'partial' : '');
+    if (kind !== 'empty') expect(terminal.error_code).toBe('runtime_transport_error');
+  });
+  it('emits cumulative stream snapshots before a terminal full body and targets cancellation precisely', async () => {
+    vi.useFakeTimers();
+    const fixture = await routerHarness();
+    let release!: () => void;
+    let observed!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const ready = new Promise<void>((resolve) => { observed = resolve; });
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'text_delta', { id: 1, text: '你好' });
+      observed();
+      await gate;
+      yield bridgeEvent(taskId, 'cancelled', { id: 2 });
+      yield bridgeEvent(taskId, 'text_delta', { id: 3, text: 'late' });
+    })());
+    const routing = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('stream-origin')));
+    await ready;
+    await vi.advanceTimersByTimeAsync(250);
+    const snapshots = () => fixture.sent.filter(({ input }) => input.messageType === 'chat_stream').map(({ input }) => input.content as Record<string, unknown>);
+    expect(snapshots().map((event) => event.status)).toEqual(['processing', 'streaming']);
+    expect(snapshots()[1]?.text).toBe('你好');
+    const streamId = snapshots()[0]!.stream_id;
+    const stop = { msg_type: 'chat_stop', protocol_version: 1, request_id: 'stop1', stream_id: streamId, request_message_id: 'stream-origin', node_id: IDENTITY_A.nodeId, conversation_type: 3, conversation_id: 'group' };
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage('wrong-owner', stop, { senderId: 'intruder' })));
+    expect(fixture.cancellations).toEqual([]);
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage('stop1', stop)));
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage('stop2', { ...stop, request_id: 'stop2' })));
+    expect(fixture.cancellations).toEqual(['task_1_1']);
+    expect(snapshots().at(-1)?.status).toBe('streaming');
+    release();
+    await routing;
+    expect(snapshots().map((event) => event.status)).toEqual(['processing', 'streaming', 'cancelled']);
+    expect(snapshots().at(-1)?.text).toBe('你好');
+    expect(new Set(snapshots().map((event) => event.stream_id)).size).toBe(1);
+    expect(snapshots().map((event) => event.seq)).toEqual([0, 1, 2]);
+    expect(fixture.sent.some(({ input }) => input.messageType === 'text')).toBe(false);
+  });
   it('filters mismatched and non-monotonic events and applies resume CAS atomically', async () => {
     const fixture = await routerHarness();
     const current = conversationFromForTest(IDENTITY_A);
@@ -1771,15 +1981,15 @@ describe('MessageRouter task events and reconnect behavior', () => {
     await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('events-filter')));
     expect(await fixture.state.currentSession(current)).toBe('fresh-session');
     const output = fixture.sent
-      .filter(({ input }) => input.messageType === 'text' && input.content !== '[processing]')
-      .map(({ input }) => input.content)
+      .filter(({ input }) => input.messageType === 'chat_stream' && input.content.status !== 'processing')
+      .map(({ input }) => (input.content as Record<string, unknown>).text)
       .join('');
     expect(output).toBe('accepted');
     expect(output).not.toContain('secret');
     expect(fixture.starts).toHaveLength(1);
   });
 
-  it('coalesces deltas at 250 ms, flushes early at 16 KiB, and chunks at 32 KiB', async () => {
+  it('coalesces deltas at 250 ms, flushes early at 16 KiB, and frames complete snapshots below 9000 bytes', async () => {
     vi.useFakeTimers();
     const fixture = await routerHarness();
     let release!: () => void;
@@ -1798,16 +2008,14 @@ describe('MessageRouter task events and reconnect behavior', () => {
     );
     await deltaWasHandled;
     await vi.advanceTimersByTimeAsync(249);
-    expect(fixture.sent.some(({ input }) => input.messageType === 'text' && input.content === 'small')).toBe(false);
+    expect(fixture.sent.some(({ input }) => input.messageType === 'chat_stream' && input.content.text === 'small')).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
-    expect(fixture.sent.some(({ input }) => input.messageType === 'text' && input.content === 'small')).toBe(true);
+    expect(fixture.sent.some(({ input }) => input.messageType === 'chat_stream' && input.content.text === 'small')).toBe(true);
     release();
     await vi.runAllTimersAsync();
     await routing;
-    const outputMessages = fixture.sent.filter(({ input }) =>
-      input.messageType === 'text' && input.content !== '[processing]' && input.content !== 'small');
-    expect(outputMessages.every(({ input }) => Buffer.byteLength(input.content as string, 'utf8') <= 32 * 1024)).toBe(true);
-    expect(outputMessages.map(({ input }) => input.content).join('')).toBe('x'.repeat(70 * 1024));
+    expect(fixture.sent.every(({ input }) => Buffer.byteLength(JSON.stringify(input.content), 'utf8') <= 9000)).toBe(true);
+    expect(streamEvents(fixture.sent).at(-1)?.text === `small${'x'.repeat(70 * 1024)}`).toBe(true);
 
     const early = await routerHarness();
     let releaseEarly!: () => void;
@@ -1822,8 +2030,8 @@ describe('MessageRouter task events and reconnect behavior', () => {
     })());
     const earlyRouting = early.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('early')));
     await earlyWasHandled;
-    expect(early.sent.some(({ input }) =>
-      input.messageType === 'text' && input.content === 'y'.repeat(16 * 1024))).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(streamEvents(early.sent).at(-1)?.text === 'y'.repeat(16 * 1024)).toBe(true);
     releaseEarly();
     await vi.runAllTimersAsync();
     await earlyRouting;
@@ -1847,8 +2055,8 @@ describe('MessageRouter task events and reconnect behavior', () => {
     })());
     await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('card-marker')));
     const text = fixture.sent
-      .filter(({ input }) => input.messageType === 'text' && input.content !== '[processing]')
-      .map(({ input }) => input.content)
+      .filter(({ input }) => input.messageType === 'chat_stream' && input.content.status !== 'processing')
+      .map(({ input }) => (input.content as Record<string, unknown>).text)
       .join('');
     expect(text).toBe('prefix  ');
     expect(text).not.toContain('[CAR');
@@ -1873,11 +2081,8 @@ describe('MessageRouter task events and reconnect behavior', () => {
       yield bridgeEvent(taskId, 'completed', { output: 'z'.repeat(1024 * 1024 + 100) });
     })());
     await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('truncated')));
-    const output = fixture.sent
-      .filter(({ input }) => input.messageType === 'text' && input.content !== '[processing]')
-      .map(({ input }) => input.content)
-      .join('');
-    expect(Buffer.byteLength(output, 'utf8')).toBeLessThanOrEqual(1024 * 1024 + 20);
+    const output = streamEvents(fixture.sent).at(-1)!.text;
+    expect(Buffer.byteLength(output, 'utf8')).toBeLessThanOrEqual(1024 * 1024);
     expect(output.match(/\[output_truncated\]/g)).toHaveLength(1);
   });
 
@@ -1886,7 +2091,7 @@ describe('MessageRouter task events and reconnect behavior', () => {
     const originalSend = fixture.worker.send.bind(fixture.worker);
     let online = false;
     fixture.worker.send = async (identity, input) => {
-      if (input.messageType === 'text' && input.content === 'deferred' && !online) {
+      if (input.messageType === 'chat_stream' && input.content.text === 'deferred' && !online) {
         throw Object.assign(new Error('offline details'), { code: 'not_connected' });
       }
       return originalSend(identity, input);
@@ -1895,7 +2100,7 @@ describe('MessageRouter task events and reconnect behavior', () => {
       yield bridgeEvent(taskId, 'completed', { output: 'deferred' });
     })());
     await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('buffered')));
-    expect(fixture.sent.some(({ input }) => input.messageType === 'text' && input.content === 'deferred')).toBe(false);
+    expect(fixture.sent.some(({ input }) => input.messageType === 'chat_stream' && input.content.text === 'deferred')).toBe(false);
 
     online = true;
     await fixture.router.onWorkerEvent(IDENTITY_A, {
@@ -1904,13 +2109,13 @@ describe('MessageRouter task events and reconnect behavior', () => {
       instanceId: INSTANCE_A,
       state: 'online',
     });
-    expect(fixture.sent.filter(({ input }) => input.messageType === 'text' && input.content === 'deferred')).toHaveLength(1);
+    expect(fixture.sent.filter(({ input }) => input.messageType === 'chat_stream' && input.content.text === 'deferred')).toHaveLength(1);
 
     const fatal = await routerHarness();
     let fatalOnline = false;
     const fatalSend = fatal.worker.send.bind(fatal.worker);
     fatal.worker.send = async (identity, input) => {
-      if (input.messageType === 'text' && input.content === 'drop-me' && !fatalOnline) {
+      if (input.messageType === 'chat_stream' && input.content.text === 'drop-me' && !fatalOnline) {
         throw Object.assign(new Error('bad protocol'), { code: 'protocol_error' });
       }
       return fatalSend(identity, input);
@@ -1923,7 +2128,7 @@ describe('MessageRouter task events and reconnect behavior', () => {
     await fatal.router.onWorkerEvent(IDENTITY_A, {
       type: 'connection', runtimeId: RUNTIME_A, instanceId: INSTANCE_A, state: 'online',
     });
-    expect(fatal.sent.some(({ input }) => input.messageType === 'text' && input.content === 'drop-me')).toBe(false);
+    expect(fatal.sent.some(({ input }) => input.messageType === 'chat_stream' && input.content.text === 'drop-me')).toBe(false);
   });
 
   it('bounds reconnect output to 32 entries and drops the oldest terminal first', async () => {
@@ -1931,7 +2136,7 @@ describe('MessageRouter task events and reconnect behavior', () => {
     let online = false;
     const originalSend = fixture.worker.send.bind(fixture.worker);
     fixture.worker.send = async (identity, input) => {
-      if (input.messageType === 'text' && input.content.startsWith('buffer-') && !online) {
+      if (input.messageType === 'chat_stream' && String(input.content.text).startsWith('buffer-') && !online) {
         throw Object.assign(new Error('offline'), { code: 'disconnected' });
       }
       return originalSend(identity, input);
@@ -1952,22 +2157,21 @@ describe('MessageRouter task events and reconnect behavior', () => {
     });
 
     const drained = fixture.sent
-      .filter(({ input }) => input.messageType === 'text' && input.content.startsWith('buffer-'))
-      .map(({ input }) => input.content);
+      .filter(({ input }) => input.messageType === 'chat_stream' && String(input.content.text).startsWith('buffer-'))
+      .map(({ input }) => (input.content as Record<string, unknown>).text);
     expect(drained).toHaveLength(32);
     expect(drained).not.toContain('buffer-0');
     expect(drained.at(-1)).toBe('buffer-32');
   });
 
-  it('bounds reconnect output to one MiB of serialized messages', async () => {
+  it('bounds reconnect output to two MiB of serialized frames', async () => {
     const fixture = await routerHarness();
     let online = false;
-    const largeA = `A${'a'.repeat(600 * 1024)}`;
-    const largeB = `B${'b'.repeat(600 * 1024)}`;
+    const largeA = `A${'a'.repeat(900 * 1024)}`;
+    const largeB = `B${'b'.repeat(900 * 1024)}`;
     const originalSend = fixture.worker.send.bind(fixture.worker);
     fixture.worker.send = async (identity, input) => {
-      if (input.messageType === 'text'
-        && input.content !== '[processing]'
+      if ((input.messageType === 'chat_stream_chunk' || (input.messageType === 'chat_stream' && input.content.status !== 'processing'))
         && !online) {
         throw Object.assign(new Error('offline'), { code: 'timeout' });
       }
@@ -1983,11 +2187,8 @@ describe('MessageRouter task events and reconnect behavior', () => {
     await fixture.router.onWorkerEvent(IDENTITY_A, {
       type: 'connection', runtimeId: RUNTIME_A, instanceId: INSTANCE_A, state: 'online',
     });
-    const drained = fixture.sent
-      .filter(({ input }) => input.messageType === 'text' && input.content !== '[processing]')
-      .map(({ input }) => input.content)
-      .join('');
-    expect(drained).toBe(largeB);
+    const drained = streamEvents(fixture.sent).filter((event) => event.status === 'completed').map((event) => event.text).join('');
+    expect(drained === largeB).toBe(true);
     expect(Buffer.byteLength(drained, 'utf8')).toBeLessThanOrEqual(1024 * 1024);
   });
 
@@ -1997,7 +2198,7 @@ describe('MessageRouter task events and reconnect behavior', () => {
     let drainAttempts = 0;
     const originalSend = fixture.worker.send.bind(fixture.worker);
     fixture.worker.send = async (identity, input) => {
-      if (input.messageType === 'text' && input.content === 'queue-deferred') {
+      if (input.messageType === 'chat_stream' && input.content.text === 'queue-deferred') {
         if (stage === 'offline') throw Object.assign(new Error('offline'), { code: 'worker_exited' });
         if (stage === 'full') {
           drainAttempts += 1;
@@ -2017,14 +2218,14 @@ describe('MessageRouter task events and reconnect behavior', () => {
     });
     expect(drainAttempts).toBe(1);
     expect(fixture.sent.some(({ input }) =>
-      input.messageType === 'text' && input.content === 'queue-deferred')).toBe(false);
+      input.messageType === 'chat_stream' && input.content.text === 'queue-deferred')).toBe(false);
 
     stage = 'online';
     await fixture.router.onWorkerEvent(IDENTITY_A, {
       type: 'connection', runtimeId: RUNTIME_A, instanceId: INSTANCE_A, state: 'online',
     });
     expect(fixture.sent.filter(({ input }) =>
-      input.messageType === 'text' && input.content === 'queue-deferred')).toHaveLength(1);
+      input.messageType === 'chat_stream' && input.content.text === 'queue-deferred')).toHaveLength(1);
   });
 
   it('shares one serial drain across concurrent online notifications', async () => {
@@ -2037,7 +2238,7 @@ describe('MessageRouter task events and reconnect behavior', () => {
     let drainAttempts = 0;
     const originalSend = fixture.worker.send.bind(fixture.worker);
     fixture.worker.send = async (identity, input) => {
-      if (input.messageType === 'text' && input.content === 'shared-drain') {
+      if (input.messageType === 'chat_stream' && input.content.text === 'shared-drain') {
         if (!online) throw Object.assign(new Error('offline'), { code: 'worker_exited' });
         drainAttempts += 1;
         drainEntered();
@@ -2063,7 +2264,7 @@ describe('MessageRouter task events and reconnect behavior', () => {
     releaseDrain();
     await Promise.all([first, second]);
     expect(fixture.sent.filter(({ input }) =>
-      input.messageType === 'text' && input.content === 'shared-drain')).toHaveLength(1);
+      input.messageType === 'chat_stream' && input.content.text === 'shared-drain')).toHaveLength(1);
   });
 
   it('does not let an older drain delete output buffered while that drain is pending', async () => {
@@ -2075,14 +2276,14 @@ describe('MessageRouter task events and reconnect behavior', () => {
     const drainGate = new Promise<void>((resolve) => { releaseDrain = resolve; });
     const originalSend = fixture.worker.send.bind(fixture.worker);
     fixture.worker.send = async (identity, input) => {
-      if (input.messageType === 'text' && input.content === 'old-output') {
+      if (input.messageType === 'chat_stream' && input.content.text === 'old-output') {
         if (stage === 'buffer-old') throw Object.assign(new Error('offline'), { code: 'worker_exited' });
         if (stage === 'drain-old') {
           drainEntered();
           await drainGate;
         }
       }
-      if (input.messageType === 'text' && input.content === 'new-output' && stage === 'buffer-new') {
+      if (input.messageType === 'chat_stream' && input.content.text === 'new-output' && stage === 'buffer-new') {
         throw Object.assign(new Error('offline'), { code: 'worker_exited' });
       }
       return originalSend(identity, input);
@@ -2110,9 +2311,9 @@ describe('MessageRouter task events and reconnect behavior', () => {
     await fixture.router.onWorkerEvent(IDENTITY_A, {
       type: 'connection', runtimeId: RUNTIME_A, instanceId: INSTANCE_A, state: 'online',
     });
-    expect(fixture.sent.filter(({ input }) => input.messageType === 'text'
-      && (input.content === 'old-output' || input.content === 'new-output'))
-      .map(({ input }) => input.content)).toEqual(['old-output', 'new-output']);
+    expect(fixture.sent.filter(({ input }) => input.messageType === 'chat_stream'
+      && (input.content.text === 'old-output' || input.content.text === 'new-output'))
+      .map(({ input }) => (input.content as Record<string, unknown>).text)).toEqual(['old-output', 'new-output']);
   });
 
   it('advances delivered text when a coarse replay drains so A followed by AB emits only A then B', async () => {
@@ -2125,7 +2326,7 @@ describe('MessageRouter task events and reconnect behavior', () => {
     const deltaWasObserved = new Promise<void>((resolve) => { deltaObserved = resolve; });
     const originalSend = fixture.worker.send.bind(fixture.worker);
     fixture.worker.send = async (identity, input) => {
-      if (input.messageType === 'text' && input.content === 'A' && !online) {
+      if (input.messageType === 'chat_stream' && input.content.text === 'A' && !online) {
         throw Object.assign(new Error('offline'), { code: 'worker_exited' });
       }
       return originalSend(identity, input);
@@ -2147,8 +2348,8 @@ describe('MessageRouter task events and reconnect behavior', () => {
     releaseTerminal();
     await routing;
 
-    expect(fixture.sent.filter(({ input }) => input.messageType === 'text'
-      && input.content !== '[processing]').map(({ input }) => input.content)).toEqual(['A', 'B']);
+    expect(fixture.sent.filter(({ input }) => input.messageType === 'chat_stream'
+      && input.content.status !== 'processing').map(({ input }) => (input.content as Record<string, unknown>).text)).toEqual(['A', 'AB']);
   });
 
   it('makes terminal output wait for an in-flight coarse drain before slicing its delivered prefix', async () => {
@@ -2165,7 +2366,7 @@ describe('MessageRouter task events and reconnect behavior', () => {
     const drainWasEntered = new Promise<void>((resolve) => { drainEntered = resolve; });
     const originalSend = fixture.worker.send.bind(fixture.worker);
     fixture.worker.send = async (identity, input) => {
-      if (input.messageType === 'text' && input.content === 'A') {
+      if (input.messageType === 'chat_stream' && input.content.text === 'A') {
         if (!online) throw Object.assign(new Error('offline'), { code: 'worker_exited' });
         drainEntered();
         await drainGate;
@@ -2189,13 +2390,13 @@ describe('MessageRouter task events and reconnect behavior', () => {
     await drainWasEntered;
     releaseTerminal();
     for (let index = 0; index < 5; index += 1) await Promise.resolve();
-    expect(fixture.sent.filter(({ input }) => input.messageType === 'text'
-      && input.content !== '[processing]')).toEqual([]);
+    expect(fixture.sent.filter(({ input }) => input.messageType === 'chat_stream'
+      && input.content.status !== 'processing')).toEqual([]);
     releaseDrain();
     await Promise.all([draining, routing]);
 
-    expect(fixture.sent.filter(({ input }) => input.messageType === 'text'
-      && input.content !== '[processing]').map(({ input }) => input.content)).toEqual(['A', 'B']);
+    expect(fixture.sent.filter(({ input }) => input.messageType === 'chat_stream'
+      && input.content.status !== 'processing').map(({ input }) => (input.content as Record<string, unknown>).text)).toEqual(['A', 'AB']);
   });
 
   it('watchdog cancels once, closes the reader, flushes timeout, and never releases admitted dedup', async () => {
@@ -2226,7 +2427,7 @@ describe('MessageRouter task events and reconnect behavior', () => {
     expect(returned).toBe(1);
     expect(fixture.state.releaseCalls).toBe(0);
     expect(fixture.sent.some(({ input }) =>
-      input.messageType === 'text' && input.content === '[task_timeout]')).toBe(true);
+      input.messageType === 'chat_stream' && input.content.status === 'failed' && input.content.error_code === 'task_timeout')).toBe(true);
   });
 
   it('binding teardown cancels and closes the exact active event reader', async () => {

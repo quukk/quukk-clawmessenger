@@ -53,7 +53,7 @@ describe('Quukk restart E2E', () => {
       first.workers.emitMessage(E2E_RUNTIME_IDS.openclaw, message('before-openclaw', 'PROMPT-SENTINEL-OPENCLAW'));
       await vi.waitFor(() => expect(runtime.taskStarts()).toHaveLength(2));
       await vi.waitFor(() => expect(first!.workers.outbound().filter(({ input }) =>
-        input.messageType === 'text' && String(input.content).startsWith('reply:'))).toHaveLength(2));
+        input.messageType === 'chat_stream' && String(input.content.text).startsWith('reply:'))).toHaveLength(2));
       const initialSessions = new Map(runtime.taskStarts().map(({ runtimeId, sessionId }) => [runtimeId, sessionId]));
 
       const shutdown = await first.shutdownViaControl();
@@ -76,7 +76,7 @@ describe('Quukk restart E2E', () => {
       second.workers.emitMessage(E2E_RUNTIME_IDS.openclaw, message('after-openclaw', 'PROMPT-SENTINEL-OPENCLAW'));
       await vi.waitFor(() => expect(runtime.taskStarts()).toHaveLength(4));
       await vi.waitFor(() => expect(second!.workers.outbound().filter(({ input }) =>
-        input.messageType === 'text' && String(input.content).startsWith('reply:'))).toHaveLength(2));
+        input.messageType === 'chat_stream' && String(input.content.text).startsWith('reply:'))).toHaveLength(2));
       for (const start of runtime.taskStarts().slice(2)) {
         expect(start.resumeSessionId).toBe(initialSessions.get(start.runtimeId));
         expect(start.sessionId).toBe(initialSessions.get(start.runtimeId));
