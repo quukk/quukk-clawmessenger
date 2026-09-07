@@ -833,22 +833,30 @@ func isCodexBareTomlKey(s string) bool {
 }
 
 func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error) {
-	firstSession, err := b.executeOnce(ctx, prompt, opts, 1)
+	// The public forwarding channel and the subprocess must share the same
+	// execution deadline. Child cleanup alone cannot unblock a wrapper send.
+	// Each retry gets its own budget, matching executeOnce's attempt semantics.
+	attemptCtx, cancelAttempt := runContext(ctx, opts.Timeout)
+	firstSession, err := b.executeOnce(attemptCtx, prompt, opts, 1)
 	if err != nil {
+		cancelAttempt()
 		return nil, err
 	}
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
 
 	go func() {
+		defer func() { cancelAttempt() }()
 		defer close(msgCh)
 		defer close(resCh)
 		session := firstSession
 		attemptOpts := opts
 		for attempt := 1; attempt <= 2; attempt++ {
 			if attempt > 1 {
+				cancelAttempt()
+				attemptCtx, cancelAttempt = runContext(ctx, attemptOpts.Timeout)
 				var err error
-				session, err = b.executeOnce(ctx, prompt, attemptOpts, attempt)
+				session, err = b.executeOnce(attemptCtx, prompt, attemptOpts, attempt)
 				if err != nil {
 					resCh <- Result{Status: "failed", Error: err.Error()}
 					return
@@ -867,7 +875,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				for _, held := range heldPins {
 					select {
 					case msgCh <- held:
-					case <-ctx.Done():
+					case <-attemptCtx.Done():
 					}
 				}
 				heldPins = nil
@@ -883,7 +891,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				}
 				select {
 				case msgCh <- msg:
-				case <-ctx.Done():
+				case <-attemptCtx.Done():
 				}
 			}
 			result, ok := <-session.Result

@@ -165,7 +165,7 @@ func TestCodexDeltaAppServerHelper(t *testing.T) {
 	os.Exit(0)
 }
 
-func startCodexDeltaFixture(t *testing.T, scenario string) (*Session, context.CancelFunc, string) {
+func startCodexDeltaFixture(t *testing.T, scenario string, timeout time.Duration) (*Session, context.CancelFunc, string) {
 	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
@@ -184,7 +184,7 @@ func startCodexDeltaFixture(t *testing.T, scenario string) (*Session, context.Ca
 	}}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	execution, err := backend.Execute(ctx, "fixture", ExecOptions{Timeout: 10 * time.Second})
+	execution, err := backend.Execute(ctx, "fixture", ExecOptions{Timeout: timeout})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func startCodexDeltaFixture(t *testing.T, scenario string) (*Session, context.Ca
 }
 
 func TestCodexExecuteAgentDeltasBeforeCompletion(t *testing.T) {
-	execution, _, release := startCodexDeltaFixture(t, "live")
+	execution, _, release := startCodexDeltaFixture(t, "live", 10*time.Second)
 	var fragments []string
 	deadline := time.After(3 * time.Second)
 	for len(fragments) < 2 {
@@ -233,7 +233,7 @@ func TestCodexExecuteAgentDeltaCompletion(t *testing.T) {
 		{"legacy", "Hello world", "Hello world"},
 	} {
 		t.Run(tc.scenario, func(t *testing.T) {
-			execution, _, _ := startCodexDeltaFixture(t, tc.scenario)
+			execution, _, _ := startCodexDeltaFixture(t, tc.scenario, 10*time.Second)
 			var live strings.Builder
 			for message := range execution.Messages {
 				if message.Type == MessageText {
@@ -249,7 +249,7 @@ func TestCodexExecuteAgentDeltaCompletion(t *testing.T) {
 }
 
 func TestCodexExecuteAgentDeltasSlowConsumer(t *testing.T) {
-	execution, _, _ := startCodexDeltaFixture(t, "slow")
+	execution, _, _ := startCodexDeltaFixture(t, "slow", 10*time.Second)
 	// Leave the 256-message channel full while the fixture emits 600 deltas.
 	waitForCodexDeltaBackpressure(t, execution)
 	var live strings.Builder
@@ -267,7 +267,7 @@ func TestCodexExecuteAgentDeltasSlowConsumer(t *testing.T) {
 }
 
 func TestCodexExecuteAgentDeltasCancelBlockedConsumer(t *testing.T) {
-	execution, cancel, _ := startCodexDeltaFixture(t, "cancel")
+	execution, cancel, _ := startCodexDeltaFixture(t, "cancel", 10*time.Second)
 	waitForCodexDeltaBackpressure(t, execution)
 	cancel()
 	select {
@@ -277,6 +277,21 @@ func TestCodexExecuteAgentDeltasCancelBlockedConsumer(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("cancellation did not unblock text delivery and process cleanup")
+	}
+}
+
+func TestCodexExecuteAgentDeltasTimeoutBlockedConsumer(t *testing.T) {
+	// The background caller is never cancelled during this test. Only the
+	// execution option's deadline may release the full public message buffer.
+	execution, _, _ := startCodexDeltaFixture(t, "slow", 500*time.Millisecond)
+	waitForCodexDeltaBackpressure(t, execution)
+	select {
+	case result := <-execution.Result:
+		if result.Status != "timeout" || !strings.Contains(result.Error, "timed out") {
+			t.Fatalf("execution deadline result = %+v, want timeout", result)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("execution timeout did not unblock public text delivery without caller cancellation")
 	}
 }
 
