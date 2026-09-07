@@ -24,7 +24,8 @@ export type ChatStopRequest = z.infer<typeof stopSchema>;
 export type ChatStopResult = z.infer<typeof resultSchema>;
 
 function parse<T>(schema: z.ZodType<T>, value: unknown): T | null {
-  const snapshot = passiveSnapshot(value, 1024 * 1024 + 16 * 1024);
+  // JSON can encode a single UTF-8 control byte as six ASCII bytes.
+  const snapshot = passiveSnapshot(value, 6 * 1024 * 1024 + 16 * 1024);
   if (!snapshot.ok) return null;
   const parsed = schema.safeParse(snapshot.value);
   return parsed.success ? parsed.data : null;

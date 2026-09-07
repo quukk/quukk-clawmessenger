@@ -79,8 +79,8 @@ const OUTPUT_EARLY_FLUSH_BYTES = 16 * 1024;
 const TASK_WATCHDOG_MS = 2 * 60 * 60 * 1_000 + 60_000;
 const ROLE_RECOMMENDATION_WATCHDOG_MS = 3 * 60 * 1_000;
 const MAX_BUFFERED_OUTPUT_ENTRIES = 32;
-// Leave room for base64 wire framing of a maximum-size final snapshot.
-const MAX_BUFFERED_OUTPUT_BYTES = 2 * 1024 * 1024;
+// Allow worst-case JSON escaping plus base64 framing of a legal 1 MiB body.
+const MAX_BUFFERED_OUTPUT_BYTES = 10 * 1024 * 1024;
 const TRANSIENT_OUTPUT_CODES = new Set([
   'not_connected', 'disconnected', 'timeout', 'worker_exited',
 ]);
@@ -294,6 +294,8 @@ interface ActiveTask {
 }
 
 interface BufferedOutput {
+  frameCount?: number;
+  frameCursor?: number;
   identity: WorkerIdentity;
   taskId: string;
   kind: 'coarse' | 'terminal';
@@ -3455,7 +3457,9 @@ export class MessageRouter {
       this.#appendOutput(active, output.slice(active.rawOutput.length));
       return;
     }
-    if (!active.rawOutput.startsWith(output)) this.#appendOutput(active, `\n${output}`);
+    if (!active.rawOutput.startsWith(output) && !active.rawOutput.endsWith(output)) {
+      this.#appendOutput(active, `\n${output}`);
+    }
   }
 
   async #scheduleDeltaFlush(active: ActiveTask): Promise<void> {
@@ -3572,7 +3576,8 @@ export class MessageRouter {
         } catch (error) {
           const code = workerErrorCode(error);
           if (code === 'queue_full' || (code !== undefined && TRANSIENT_OUTPUT_CODES.has(code))) {
-            this.#bufferOutput(active, 'terminal', messages.slice(index));
+            // Receiver partials may expire before reconnect, so retain the whole snapshot.
+            this.#bufferOutput(active, 'terminal', messages.slice(index < textMessages.length ? 0 : index));
           } else {
             this.#removeBufferedTask(active.bindingKey, active.taskId);
           }
@@ -3625,6 +3630,12 @@ export class MessageRouter {
       bytes: serializedBytes(messages),
       order: this.#bufferOrder++,
     };
+    const first = messages[0]!;
+    if (kind === 'terminal' && first.messageType === 'chat_stream_chunk'
+      && first.content.chunkIndex === 0 && typeof first.content.chunkCount === 'number') {
+      entry.frameCount = first.content.chunkCount;
+      entry.frameCursor = 0;
+    }
     retained.push(entry);
     let dropped = 0;
     const totalBytes = (): number => retained.reduce((total, item) => total + item.bytes, 0);
@@ -3690,7 +3701,7 @@ export class MessageRouter {
       if (!entries || entries.length === 0) return;
       const entry = entries.reduce((oldest, candidate) =>
         candidate.order < oldest.order ? candidate : oldest);
-      const message = entry.messages[0];
+      const message = entry.messages[entry.frameCursor ?? 0];
       if (!message) {
         this.#deleteBufferedEntry(bindKey, entry);
         continue;
@@ -3704,6 +3715,8 @@ export class MessageRouter {
           this.#bufferDrainTasks.delete(bindKey);
         }
         if (code === 'queue_full' || (code !== undefined && TRANSIENT_OUTPUT_CODES.has(code))) {
+          // Do not rely on receiver partial state surviving until the next retry.
+          if (entry.frameCursor !== undefined) entry.frameCursor = 0;
           return;
         }
         this.#deleteBufferedEntry(bindKey, entry);
@@ -3714,8 +3727,16 @@ export class MessageRouter {
         this.#bufferDrainTasks.delete(bindKey);
       }
       const current = this.#bufferedOutput.get(bindKey);
-      if (!current || !current.includes(entry) || entry.messages[0] !== message) continue;
-      entry.messages.shift();
+      if (!current || !current.includes(entry) || entry.messages[entry.frameCursor ?? 0] !== message) continue;
+      if (entry.frameCount !== undefined && entry.frameCursor !== undefined) {
+        entry.frameCursor += 1;
+        if (entry.frameCursor < entry.frameCount) continue;
+        entry.messages.splice(0, entry.frameCount);
+        delete entry.frameCount;
+        delete entry.frameCursor;
+      } else {
+        entry.messages.shift();
+      }
       entry.bytes = serializedBytes(entry.messages);
       if (entry.messages.length === 0) this.#deleteBufferedEntry(bindKey, entry);
     }

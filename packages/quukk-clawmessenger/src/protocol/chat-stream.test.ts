@@ -8,6 +8,20 @@ import { normalizeRongCloudMessage, parseProtocolContent } from './messages.js';
 const event = { msg_type: 'chat_stream', protocol_version: 1, stream_id: 's1', request_message_id: 'm1', requester_id: 'u1', node_id: 'codex_1', conversation_type: 1, conversation_id: 'u1', seq: 1, status: 'streaming', text: '你好' } as const;
 const stop = { msg_type: 'chat_stop', protocol_version: 1, request_id: 'r1', stream_id: 's1', request_message_id: 'm1', node_id: 'codex_1', conversation_type: 1, conversation_id: 'u1' } as const;
 describe('chat stream contract', () => {
+  it.each(['"', '\u0000'])('accepts a legal text cap despite JSON escaping of %j', (character) => {
+    const text = character.repeat(1024 * 1024);
+    const payload = { ...event, text };
+    expect(parseChatStreamEvent(payload)?.text === text).toBe(true);
+    const reassembler = new DiscussionWireReassembler();
+    let complete: Record<string, unknown> | undefined;
+    for (const frame of encodeChatStreamEvent(payload)) {
+      expect(Buffer.byteLength(JSON.stringify(frame.content))).toBeLessThanOrEqual(9000);
+      const result = reassembler.accept('codex_1', { ...frame.content, msg_type: 'discussion_wire_chunk' });
+      if (result.status === 'complete') complete = result.payload;
+    }
+    expect(complete?.text === text).toBe(true);
+    expect(parseChatStreamEvent({ ...payload, text: text + character })).toBeNull();
+  });
   it('validates strict passive envelopes and bounded identifiers', () => {
     expect(parseChatStreamEvent(event)?.text).toBe('你好');
     for (const change of [{ seq: -1 }, { seq: 1.5 }, { seq: Number.MAX_SAFE_INTEGER + 1 }, { status: 'other' }, { protocol_version: 2 }, { stream_id: '' }, { stream_id: ' s1' }, { stream_id: 's\u200b1' }, { stream_id: 'x'.repeat(257) }, { task_id: 'attack' }, { text: '中'.repeat(350000) }]) expect(parseChatStreamEvent({ ...event, ...change })).toBeNull();

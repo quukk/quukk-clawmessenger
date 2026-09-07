@@ -1765,6 +1765,68 @@ describe('MessageRouter session, legacy, device, and chatroom dispatch', () => {
 });
 
 describe('MessageRouter task events and reconnect behavior', () => {
+  it('does not duplicate an authoritative final item already emitted after narration', async () => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'text_delta', { id: 1, text: 'Let me think. ' });
+      yield bridgeEvent(taskId, 'text_delta', { id: 2, text: 'Answer' });
+      yield bridgeEvent(taskId, 'completed', { id: 3, output: 'Answer' });
+    })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('final-item')));
+    expect(streamEvents(fixture.sent).at(-1)?.text).toBe('Let me think. Answer');
+  });
+  it('retains escape-heavy maximum-size terminal output across reconnect', async () => {
+    const fixture = await routerHarness();
+    let online = false;
+    const originalSend = fixture.worker.send.bind(fixture.worker);
+    fixture.worker.send = async (identity, input) => {
+      if (input.messageType === 'chat_stream_chunk' && !online) throw Object.assign(new Error('offline'), { code: 'not_connected' });
+      return originalSend(identity, input);
+    };
+    fixture.setEvents((taskId) => (async function* () { yield bridgeEvent(taskId, 'completed', { output: '\u0000'.repeat(1024 * 1024) }); })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('escaped-reconnect')));
+    online = true;
+    await fixture.router.onWorkerEvent(IDENTITY_A, { type: 'connection', runtimeId: RUNTIME_A, instanceId: INSTANCE_A, state: 'online' });
+    const terminal = streamEvents(fixture.sent).find((event) => event.status === 'completed');
+    expect(terminal).toBeDefined();
+    expect(Buffer.byteLength(terminal!.text)).toBe(1024 * 1024);
+    expect(terminal!.text.endsWith('[output_truncated]')).toBe(true);
+    expect(terminal!.text.slice(0, -'[output_truncated]'.length).split('').every((character) => character === '\u0000')).toBe(true);
+  });
+
+  it.each([false, true])('replays a whole terminal after receiver partial expiry (drain failure: %s)', async (failDuringDrain) => {
+    const fixture = await routerHarness();
+    let now = 0;
+    const receiver = new DiscussionWireReassembler({ clock: () => now });
+    const completions: Record<string, unknown>[] = [];
+    const receivedIndexes: number[] = [];
+    let stage: 'initial' | 'drain-failure' | 'online' = 'initial';
+    fixture.worker.send = async (identity, input) => {
+      if (input.messageType === 'chat_stream_chunk') {
+        const index = Number(input.content.chunkIndex);
+        if ((stage === 'initial' && index === (failDuringDrain ? 0 : 1))
+          || (stage === 'drain-failure' && index === 1)) throw Object.assign(new Error('offline'), { code: 'not_connected' });
+        receivedIndexes.push(index);
+        const result = receiver.accept(identity.nodeId, { ...input.content, msg_type: 'discussion_wire_chunk' });
+        if (result.status === 'complete') completions.push(result.payload);
+      }
+      return 'outbound-uid';
+    };
+    const text = '你好🌍'.repeat(3000);
+    fixture.setEvents((taskId) => (async function* () { yield bridgeEvent(taskId, 'completed', { output: text }); })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('partial-expiry')));
+    const reconnect = () => fixture.router.onWorkerEvent(IDENTITY_A, { type: 'connection', runtimeId: RUNTIME_A, instanceId: INSTANCE_A, state: 'online' });
+    if (failDuringDrain) { stage = 'drain-failure'; await reconnect(); }
+    expect(receivedIndexes).toEqual([0]);
+    expect(completions).toHaveLength(0);
+    now = 10 * 60 * 1000 + 1;
+    stage = 'online';
+    await reconnect();
+    expect(completions).toHaveLength(1);
+    expect(completions[0]?.text === text).toBe(true);
+    expect(completions[0]?.status).toBe('completed');
+    expect(receivedIndexes.filter((index) => index === 0)).toHaveLength(2);
+  });
   it('does not act on a stop whose binding generation changed during validation', async () => {
     const fixture = await routerHarness();
     let releaseTask!: () => void;
@@ -2164,11 +2226,11 @@ describe('MessageRouter task events and reconnect behavior', () => {
     expect(drained.at(-1)).toBe('buffer-32');
   });
 
-  it('bounds reconnect output to two MiB of serialized frames', async () => {
+  it('bounds reconnect output to ten MiB of serialized frames', async () => {
     const fixture = await routerHarness();
     let online = false;
-    const largeA = `A${'a'.repeat(900 * 1024)}`;
-    const largeB = `B${'b'.repeat(900 * 1024)}`;
+    const largeA = `A${'\u0000'.repeat(900 * 1024)}`;
+    const largeB = `B${'\u0001'.repeat(900 * 1024)}`;
     const originalSend = fixture.worker.send.bind(fixture.worker);
     fixture.worker.send = async (identity, input) => {
       if ((input.messageType === 'chat_stream_chunk' || (input.messageType === 'chat_stream' && input.content.status !== 'processing'))
