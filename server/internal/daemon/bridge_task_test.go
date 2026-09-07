@@ -265,6 +265,7 @@ func TestBridgeTaskAgentInputsAndEventMapping(t *testing.T) {
 		t.Fatalf("prompt = %q, want exact prompt", capturedPrompt)
 	}
 	wantOpts := agent.ExecOptions{
+		StreamText:      true,
 		Cwd:             `D:\canonical`,
 		Timeout:         3 * time.Minute,
 		ResumeSessionID: "sess-old",

@@ -360,6 +360,7 @@ func (m *bridgeTaskManager) execute(ctx context.Context, task *bridgeTask, runti
 	}
 
 	opts := agent.ExecOptions{
+		StreamText:      true,
 		Cwd:             workDir,
 		Timeout:         m.deps.timeout,
 		ResumeSessionID: req.ResumeSessionID,

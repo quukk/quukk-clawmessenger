@@ -26,6 +26,9 @@ type Backend interface {
 type ExecOptions struct {
 	Cwd   string
 	Model string
+	// StreamText opts into incremental text transport. The caller must drain
+	// Messages or cancel the context to release text backpressure.
+	StreamText bool
 	// SystemPrompt carries the Multica runtime brief for the few providers
 	// that cannot pick it up from disk. The daemon leaves it empty for every
 	// other provider (see daemon.providerNeedsInlineSystemPrompt), because the
