@@ -507,13 +507,14 @@ func (m *bridgeTaskManager) execute(ctx context.Context, task *bridgeTask, runti
 	}
 
 	opts := agent.ExecOptions{
-		Model:           req.Model,
-		StreamText:      true,
-		Cwd:             workDir,
-		Timeout:         m.deps.timeout,
-		ResumeSessionID: req.ResumeSessionID,
-		ResumeExpected:  req.ResumeSessionID != "",
-		OpenclawMode:    "local",
+		RequireProcessTree: req.RequestID != "",
+		Model:              req.Model,
+		StreamText:         true,
+		Cwd:                workDir,
+		Timeout:            m.deps.timeout,
+		ResumeSessionID:    req.ResumeSessionID,
+		ResumeExpected:     req.ResumeSessionID != "",
+		OpenclawMode:       "local",
 	}
 	if runtime.Provider == "openclaw" {
 		opts.OpenclawMode = "gateway"
@@ -544,6 +545,9 @@ func (m *bridgeTaskManager) execute(ctx context.Context, task *bridgeTask, runti
 func (m *bridgeTaskManager) executeAttempt(ctx context.Context, task *bridgeTask, backend agent.Backend, prompt string, opts agent.ExecOptions) (agent.Result, int32, error) {
 	session, err := backend.Execute(ctx, prompt, opts)
 	if err != nil {
+		if errors.Is(err, agent.ErrProcessTreeStopUnconfirmed) {
+			return agent.Result{Status: "failed", CancelUnconfirmed: true}, 0, nil
+		}
 		return agent.Result{}, 0, err
 	}
 	if session == nil {
@@ -589,7 +593,7 @@ func (m *bridgeTaskManager) executeAttempt(ctx context.Context, task *bridgeTask
 
 func (m *bridgeTaskManager) finishResult(ctx context.Context, task *bridgeTask, runtimeID string, result agent.Result, terminalStatus string) {
 	if result.CancelUnconfirmed {
-		task.publish(BridgeTaskEvent{Type: BridgeEventFailed, SessionID: result.SessionID, Status: terminalStatus, Error: &BridgeError{Category: "stop_unconfirmed", Message: "The Gateway stop is unconfirmed; the run may still be active. Check the Gateway before retrying."}})
+		task.publish(BridgeTaskEvent{Type: BridgeEventFailed, SessionID: result.SessionID, Status: terminalStatus, Error: &BridgeError{Category: "stop_unconfirmed", Message: "Runtime stop is unconfirmed; the run or its tools may still be active. Check the runtime before retrying."}})
 		return
 	}
 	if ctx.Err() != nil && !(result.CompletionConfirmed && result.Status == "completed") || result.Status == "aborted" || result.Status == "cancelled" {
@@ -687,6 +691,9 @@ func bridgeTaskSafeErrorReason(reason taskfailure.Reason) *BridgeError {
 }
 
 func bridgeTaskShouldRetry(result agent.Result, originalResumeID string, toolCount int32, provider string) bool {
+	if result.CancelUnconfirmed {
+		return false
+	}
 	switch taskfailure.Classify(result.Error) {
 	case taskfailure.ReasonAgentProviderAuthOrAccess,
 		taskfailure.ReasonAgentProviderNetwork,

@@ -76,7 +76,7 @@ func TestInteractiveACPExactCancellationAndSessionResume(t *testing.T) {
 				}
 				ctx, cancel := context.WithCancel(t.Context())
 				t.Cleanup(cancel)
-				session, err := backend.Execute(ctx, "fixture", ExecOptions{StreamText: true, Cwd: dir, ResumeSessionID: name, Timeout: 10 * time.Second})
+				session, err := backend.Execute(ctx, "fixture", ExecOptions{RequireProcessTree: true, StreamText: true, Cwd: dir, ResumeSessionID: name, Timeout: 10 * time.Second})
 				if err != nil {
 					t.Fatal(err)
 				}

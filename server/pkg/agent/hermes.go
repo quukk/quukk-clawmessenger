@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -340,7 +341,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		return nil, fmt.Errorf("hermes stderr pipe: %w", err)
 	}
 
-	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
+	if err := startOwnedProcessTree(cmd, b.cfg.Logger, b.cfg.processStartOptions(opts)); err != nil {
 		cancel()
 		return nil, fmt.Errorf("start hermes: %w", err)
 	}
@@ -429,6 +430,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	go func() {
 		defer close(msgCh)
 		defer close(resCh)
+		var finalResult Result
 		defer func() {
 			stdin.Close()
 			// Cancellation must be reachable before Wait. A pathological child
@@ -436,8 +438,15 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			// process alive; waiting first would then block until the overall
 			// task timeout and make a later deferred cancel ineffective.
 			cancel()
+			if opts.RequireProcessTree {
+				signalProcessGroup(cmd, syscall.SIGKILL)
+			}
 			_ = cmd.Wait()
+			finalResult.CancelUnconfirmed = opts.RequireProcessTree && !b.cfg.processTreeStopped(cmd, time.Second)
 			releaseProcessGroup(cmd)
+			<-readerDone
+			<-stderrDone
+			resCh <- finalResult
 		}()
 
 		startTime := time.Now()
@@ -478,7 +487,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		if err != nil {
 			finalStatus = "failed"
 			finalError = fmt.Sprintf("hermes initialize failed: %v", err)
-			resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
+			finalResult = Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
 			return
 		}
 
@@ -513,7 +522,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			if err != nil {
 				finalStatus = "failed"
 				finalError = fmt.Sprintf("hermes session/resume failed: %v", err)
-				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
+				finalResult = Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
 				return
 			}
 			sessionResult = result
@@ -534,7 +543,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			if err != nil {
 				finalStatus = "failed"
 				finalError = fmt.Sprintf("hermes session/new failed: %v", err)
-				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
+				finalResult = Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
 				return
 			}
 			sessionResult = result
@@ -542,7 +551,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			if sessionID == "" {
 				finalStatus = "failed"
 				finalError = "hermes session/new returned no session ID"
-				resCh <- Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
+				finalResult = Result{Status: finalStatus, Error: finalError, DurationMs: time.Since(startTime).Milliseconds()}
 				return
 			}
 			sessionCurrentModel = extractACPCurrentModelID(result)
@@ -599,7 +608,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 					sessionID = ""
 					resumeRejected = true
 				}
-				resCh <- Result{
+				finalResult = Result{
 					Status:         finalStatus,
 					Error:          finalError,
 					DurationMs:     time.Since(startTime).Milliseconds(),
@@ -774,7 +783,7 @@ func (b *hermesBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			usageMap = map[string]TokenUsage{model: u}
 		}
 
-		resCh <- Result{
+		finalResult = Result{
 			Status:         finalStatus,
 			Output:         finalOutput,
 			Error:          finalError,

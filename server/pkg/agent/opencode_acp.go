@@ -82,7 +82,7 @@ func (b *opencodeBackend) executeACP(ctx context.Context, prompt string, opts Ex
 		cancel()
 		return nil, err
 	}
-	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
+	if err := startOwnedProcessTree(cmd, b.cfg.Logger, b.cfg.processStartOptions(opts)); err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
 		_ = stderr.Close()
@@ -242,6 +242,7 @@ func (b *opencodeBackend) executeACP(ctx context.Context, prompt string, opts Ex
 			// Reap only after readers finish, so Wait cannot truncate stdout.
 			signalProcessGroup(cmd, syscall.SIGKILL)
 			_ = cmd.Wait()
+			result.CancelUnconfirmed = opts.RequireProcessTree && !b.cfg.processTreeStopped(cmd, time.Second)
 			releaseProcessGroup(cmd)
 			if runCtx.Err() == context.Canceled {
 				result.Status = "aborted"

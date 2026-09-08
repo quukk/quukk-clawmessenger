@@ -78,6 +78,74 @@ func TestBridgeTaskRequestExpiryRejectsReplay(t *testing.T) {
 	}
 }
 
+func TestBridgeTaskInteractiveProcessPolicyAndFence(t *testing.T) {
+	for _, callerIdentity := range []bool{false, true} {
+		t.Run(fmt.Sprint(callerIdentity), func(t *testing.T) {
+			runtime := BridgeRuntime{ID: "rt-test", Provider: "hermes", Status: BridgeRuntimeReady}
+			backend := &bridgeTaskFakeBackend{execute: func(ctx context.Context, _ string, opts agent.ExecOptions) (*agent.Session, error) {
+				if opts.RequireProcessTree != callerIdentity {
+					t.Errorf("strict ownership=%v for caller identity=%v", opts.RequireProcessTree, callerIdentity)
+				}
+				result := make(chan agent.Result, 1)
+				result <- agent.Result{Status: "failed", Error: "session not found", ResumeRejected: true, CancelUnconfirmed: callerIdentity}
+				close(result)
+				return &agent.Session{Result: result}, nil
+			}}
+			manager := newBridgeTaskManager(t.Context(), bridgeTaskTestDeps(runtime, backend))
+			req := BridgeTaskRequest{RuntimeID: runtime.ID, ConversationKey: "fixture", WorkDir: `D:\work`, Prompt: "fixture", ResumeSessionID: "saved"}
+			if callerIdentity {
+				req.RequestID = fmt.Sprintf("task_%x_a", time.Now().UnixMilli())
+			}
+			id, err := manager.Start(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(time.Second)
+			for {
+				task := manager.tasks[id]
+				task.mu.Lock()
+				terminal := task.terminal
+				task.mu.Unlock()
+				if terminal {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("no terminal")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if callerIdentity {
+				if outcome, err := manager.Fence(t.Context(), id); !errors.Is(err, ErrBridgeTaskStopUnconfirmed) {
+					t.Fatalf("false stop proof: %s %v", outcome, err)
+				}
+			}
+		})
+	}
+	if bridgeTaskShouldRetry(agent.Result{Status: "failed", Error: "session not found", ResumeRejected: true, CancelUnconfirmed: true}, "saved", 0, "hermes") {
+		t.Fatal("unconfirmed task allowed fresh retry")
+	}
+}
+
+func TestBridgeTaskLaunchCleanupFailureFence(t *testing.T) {
+	runtime := BridgeRuntime{ID: "rt-test", Provider: "codex", Status: BridgeRuntimeReady}
+	entered := make(chan struct{})
+	backend := &bridgeTaskFakeBackend{execute: func(ctx context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
+		close(entered)
+		<-ctx.Done()
+		return nil, fmt.Errorf("native launch cleanup: %w", agent.ErrProcessTreeStopUnconfirmed)
+	}}
+	manager := newBridgeTaskManager(t.Context(), bridgeTaskTestDeps(runtime, backend))
+	req := BridgeTaskRequest{RequestID: fmt.Sprintf("task_%x_a", time.Now().UnixMilli()), RuntimeID: runtime.ID, ConversationKey: "fixture", WorkDir: `D:\work`, Prompt: "fixture"}
+	id, err := manager.Start(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	if result, err := manager.Fence(t.Context(), id); !errors.Is(err, ErrBridgeTaskStopUnconfirmed) {
+		t.Fatalf("failed launch falsely fenced: %s %v", result, err)
+	}
+}
+
 func TestBridgeTaskIdentityRetrySurvivesReadinessChange(t *testing.T) {
 	runtime := BridgeRuntime{ID: "rt-test", Provider: "opencode", Status: BridgeRuntimeReady}
 	deps := bridgeTaskTestDeps(runtime, &bridgeTaskFakeBackend{execute: func(context.Context, string, agent.ExecOptions) (*agent.Session, error) {

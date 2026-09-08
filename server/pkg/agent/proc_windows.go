@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os/exec"
@@ -93,7 +94,7 @@ type jobObjectBasicAccountingInformation struct {
 // confirmed when it is not.
 //
 // Legacy callers resume without ownership if assignment fails, with a warning.
-// Strict readiness probes instead kill and reap the still-suspended child and
+// Interactive launches and strict probes kill/reap the still-suspended child and
 // fail before resume. A resume failure is likewise killed/reaped for all callers.
 func startOwnedProcessTree(cmd *exec.Cmd, logger *slog.Logger, options ...processTreeStartOptions) error {
 	policy := processTreeStartOptions{}
@@ -103,6 +104,14 @@ func startOwnedProcessTree(cmd *exec.Cmd, logger *slog.Logger, options ...proces
 	takeOwnership := ownProcessTree
 	if policy.takeOwnership != nil {
 		takeOwnership = policy.takeOwnership
+	}
+	stopSuspended := stopSuspendedProcess
+	if policy.stopSuspended != nil {
+		stopSuspended = policy.stopSuspended
+	}
+	resume := resumeProcess
+	if policy.resume != nil {
+		resume = policy.resume
 	}
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
@@ -118,8 +127,9 @@ func startOwnedProcessTree(cmd *exec.Cmd, logger *slog.Logger, options ...proces
 			// No child instruction has run: only this suspended direct child
 			// exists, so kill/reap it without resuming an unowned process.
 			releaseProcessGroup(cmd)
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
+			if cleanupErr := stopSuspended(cmd); cleanupErr != nil {
+				return errors.Join(ErrProcessTreeStopUnconfirmed, fmt.Errorf("required process tree ownership: %w", err), cleanupErr)
+			}
 			return fmt.Errorf("required process tree ownership: %w", err)
 		}
 		// Deliberately fail open. Failing the launch instead would take a host
@@ -135,16 +145,34 @@ func startOwnedProcessTree(cmd *exec.Cmd, logger *slog.Logger, options ...proces
 		}
 	}
 
-	if err := resumeProcess(cmd.Process.Pid); err != nil {
-		// The child cannot run, so nothing downstream can succeed. Drop
-		// ownership first: closing the job terminates the suspended child, and
-		// Kill covers the case where ownership was never taken.
+	if err := resume(cmd.Process.Pid); err != nil {
+		// Resume may have partly succeeded. Keep ownership until the tree is
+		// killed and observed, rather than treating leader reap as proof.
+		signalProcessGroup(cmd, syscall.SIGKILL)
+		cleanupErr := stopSuspended(cmd)
+		waitStopped := waitProcessGroupGone
+		if policy.waitStopped != nil {
+			waitStopped = policy.waitStopped
+		}
+		confirmed := waitStopped(cmd, time.Second)
 		releaseProcessGroup(cmd)
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		if cleanupErr != nil || !confirmed {
+			return errors.Join(ErrProcessTreeStopUnconfirmed, fmt.Errorf("resume suspended child: %w", err), cleanupErr)
+		}
 		return fmt.Errorf("resume suspended child: %w", err)
 	}
 	return nil
+}
+
+func stopSuspendedProcess(cmd *exec.Cmd) error {
+	killErr := cmd.Process.Kill()
+	waitErr := cmd.Wait()
+	// This proves only direct-child reap. Before resume it is the entire
+	// execution; after any attempted resume the caller must also check the tree.
+	if cmd.ProcessState != nil {
+		return nil
+	}
+	return fmt.Errorf("suspended child was not reaped: %w", errors.Join(killErr, waitErr))
 }
 
 // ownProcessTree creates the Job Object and assigns the (still suspended) child

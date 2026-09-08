@@ -47,7 +47,7 @@ type opencodeBackend struct {
 }
 
 func (b *opencodeBackend) Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error) {
-	if opts.StreamText {
+	if opts.StreamText || opts.RequireProcessTree {
 		return b.executeACP(ctx, prompt, opts)
 	}
 	execPath := b.cfg.ExecutablePath

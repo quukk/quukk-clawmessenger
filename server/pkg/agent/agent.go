@@ -24,8 +24,11 @@ type Backend interface {
 
 // ExecOptions configures a single execution.
 type ExecOptions struct {
-	Cwd   string
-	Model string
+	// RequireProcessTree requires per-launch ownership and terminal cleanup proof.
+	// Set only for request-fenced interactive work; legacy callers retain defaults.
+	RequireProcessTree bool
+	Cwd                string
+	Model              string
 	// TaskModel is a canonical provider/model override for an owned OpenClaw
 	// session. Model retains its legacy OpenClaw agent-ID meaning.
 	TaskModel string
@@ -199,7 +202,7 @@ const CostUSDTicksPerUSD = 10_000_000_000
 
 // Result is the final outcome after an agent session completes.
 type Result struct {
-	// CancelUnconfirmed means a remote run may still be active after cleanup.
+	// CancelUnconfirmed means a remote run or local process tree may still be active after cleanup.
 	// Callers must preserve this failure even if their context was cancelled.
 	CancelUnconfirmed bool
 	// CompletionConfirmed means the provider's final result was received before
@@ -255,14 +258,15 @@ type Result struct {
 
 // Config configures a Backend instance.
 type Config struct {
-	ExecutablePath string            // path to CLI binary (claude, codebuddy, codex, copilot, opencode, openclaw, hermes, pi, cursor, kimi, reasonix, dsh, kiro-cli, agy, qodercli, qoderclicn, traecli, grok, qwen, qwenpaw, mcode, dim, zeroclaw)
-	CLIVersion     string            // detected version paired with ExecutablePath; observation only, never used to choose behavior
-	Env            map[string]string // extra environment variables
-	Logger         *slog.Logger
-	TaskID         string
-	RuntimeID      string
-	DaemonVersion  string
-	CodexVersion   string
+	processTreeOptions processTreeStartOptions
+	ExecutablePath     string            // path to CLI binary (claude, codebuddy, codex, copilot, opencode, openclaw, hermes, pi, cursor, kimi, reasonix, dsh, kiro-cli, agy, qodercli, qoderclicn, traecli, grok, qwen, qwenpaw, mcode, dim, zeroclaw)
+	CLIVersion         string            // detected version paired with ExecutablePath; observation only, never used to choose behavior
+	Env                map[string]string // extra environment variables
+	Logger             *slog.Logger
+	TaskID             string
+	RuntimeID          string
+	DaemonVersion      string
+	CodexVersion       string
 	// BuiltinRuntime reports that ExecutablePath is the provider's own
 	// discovered binary rather than a custom runtime profile's command. A
 	// custom profile keeps its protocol family as the provider, so the
