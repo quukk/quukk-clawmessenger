@@ -147,18 +147,6 @@ function AppContent({ api: suppliedApi }: { api?: BridgeApi }) {
       </header>
 
       <main className="app-container py-6 sm:py-8">{content}</main>
-
-      <footer className="app-container flex flex-wrap items-center justify-between gap-2 border-t border-surface-border py-5 text-caption text-muted-foreground">
-        <span>{t('shell.attribution')}</span>
-        <a
-          className="font-medium text-foreground underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
-          href="https://github.com/multica-ai/multica"
-          target="_blank"
-          rel="noreferrer"
-        >
-          {t('shell.builtOn')}
-        </a>
-      </footer>
     </div>
   );
 }
