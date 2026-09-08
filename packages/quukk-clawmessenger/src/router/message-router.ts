@@ -48,6 +48,7 @@ import {
   type RoleRecommendationRequest,
 } from '../protocol/discussion-v2.js';
 import { DiscussionWireReassembler, encodeDiscussionWire } from '../protocol/discussion-wire.js';
+import { buildDiscussionPrompt } from '../protocol/discussion-prompt.js';
 import { encodeChatStreamEvent, parseChatStopRequest, type ChatStreamStatus, type ChatStopResult } from '../protocol/chat-stream.js';
 import {
   buildLegacyEnvelope,
@@ -1505,7 +1506,7 @@ export class MessageRouter {
       await this.#recheckBinding(identity);
       this.#requireBindingGeneration(identity, generation);
       this.#requireV2Reservation(state, logicalOwner);
-      const prompt = this.#v2Prompt(parsed);
+      const prompt = buildDiscussionPrompt(parsed);
       if (!prompt || Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES) throw new Error('prompt_too_large');
       const response = await this.#task.startTask({
         runtimeId: identity.runtimeId,
@@ -1602,27 +1603,6 @@ export class MessageRouter {
         await this.#sendV2NodeError(identity, conversation, parsed, 'model_error');
       }
     }
-  }
-
-  #v2Prompt(command: DiscussionAssignment | DiscussionHostTurn): string {
-    if (command.msg_type === 'discussion_assignment') {
-      return [
-        '[discussion v2 public contribution]',
-        `Topic: ${command.topic}`,
-        `Goal: ${command.goal}`,
-        `Task: ${command.task}`,
-        ...(command.role === undefined ? [] : [`Role: ${command.role.roleInstructions}`]),
-        'Return only the public contribution.',
-      ].join('\n');
-    }
-    return [
-      '[discussion v2 host decision]',
-      `Topic: ${command.topic}`,
-      `Goal: ${command.goal}`,
-      `Event summary: ${command.eventSummary}`,
-      `Allowed decisions: ${command.allowedDecisions.join(', ')}`,
-      'Return exactly one JSON object matching an allowed public decision.',
-    ].join('\n');
   }
 
   async #consumeDiscussionV2(

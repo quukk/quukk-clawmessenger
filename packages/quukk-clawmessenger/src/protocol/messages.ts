@@ -129,6 +129,7 @@ const rawContentKeys = new Set([
   'topic', 'goal', 'roles', 'allowedDecisions', 'remainingRounds', 'eventSummary', 'currentArtifact',
   'assignmentId', 'targetId', 'task', 'mode', 'model', 'role', 'speakingOrder', 'roundFocus',
   'priorContributions', 'roundSummaries', 'userInterjections', 'attempt', 'reason', 'updateId',
+  'hostPrompt', 'configVersion', 'phase',
   'idempotencyKey', 'artifactId', 'artifactVersion', 'decision', 'seq', 'planSummary',
   'memberPositions', 'agreements', 'disagreements', 'openQuestions', 'nextFocus', 'recommendation',
   'artifactType', 'instructions', 'operation', 'baseVersion', 'isFinal', 'category', 'defaultModel',

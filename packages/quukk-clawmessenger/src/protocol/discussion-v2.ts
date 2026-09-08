@@ -18,6 +18,7 @@ export const DISCUSSION_V2_LIMITS = {
   maxTitle: 500,
   maxReason: 2_000,
   maxPlanSummary: 1_000,
+  maxHostPrompt: 32_000,
   maxPendingAcks: 128,
   maxCancelTombstones: 256,
   maxLogicalTombstones: 1_024,
@@ -69,6 +70,9 @@ export interface DiscussionHostTurn extends DiscussionV2Envelope {
   remainingRounds: number;
   eventSummary: string;
   currentArtifact: CurrentArtifact | null;
+  hostPrompt?: string;
+  configVersion?: number;
+  priorContributions?: unknown[];
   mode?: 'roundtable';
   phase?: 'round_summary' | 'final_synthesis';
   roundSummaries?: unknown[];
@@ -307,7 +311,7 @@ function parseHostTurn(value: Record<string, unknown>): DiscussionHostTurn | nul
     ...commandBaseKeys,
     'topic', 'goal', 'roles', 'allowedDecisions', 'remainingRounds', 'eventSummary', 'currentArtifact',
     ...(roundtable ? ['mode', 'phase', 'roundSummaries', 'userInterjections'] : []),
-  ])
+  ], ['hostPrompt', 'configVersion', 'priorContributions'])
     || !baseValid(value, 'discussion_host_turn')
     || !bounded(value.topic, DISCUSSION_V2_LIMITS.maxTopic)
     || !bounded(value.goal, DISCUSSION_V2_LIMITS.maxGoal, true)
@@ -321,6 +325,21 @@ function parseHostTurn(value: Record<string, unknown>): DiscussionHostTurn | nul
     || !integer(value.remainingRounds, 0)
     || !bounded(value.eventSummary, DISCUSSION_V2_LIMITS.maxContribution, true)
     || !validCurrentArtifact(value.currentArtifact)) return null;
+
+  if (Object.prototype.hasOwnProperty.call(value, 'hostPrompt')
+    || Object.prototype.hasOwnProperty.call(value, 'configVersion')) {
+    if (!bounded(value.hostPrompt, DISCUSSION_V2_LIMITS.maxHostPrompt)
+      || !value.hostPrompt.trim() || !validUtf8(value.hostPrompt)
+      || !integer(value.configVersion, 1)) return null;
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'priorContributions')
+    && (!boundedArray(value.priorContributions, 100)
+      || !value.priorContributions.every((item) => record(item)
+        && exactKeys(item, ['memberId', 'content', 'round'])
+        && boundedId(item.memberId)
+        && bounded(item.content, DISCUSSION_V2_LIMITS.maxContribution)
+        && validUtf8(item.content)
+        && integer(item.round, 0)))) return null;
 
   if (roundtable && (
     !boundedArray(value.roundSummaries, 100)
@@ -430,14 +449,16 @@ export function parseHostDecision(text: string, turn: DiscussionHostTurn): HostD
       || !exactKeys(value, [
         'action', 'memberPositions', 'agreements', 'disagreements',
         'openQuestions', 'nextFocus', 'recommendation',
-      ], optionalPlan)
+      ])
       || !Array.isArray(value.memberPositions)
       || value.memberPositions.length > 32
       || !value.memberPositions.every((position) => record(position)
         && exactKeys(position, ['memberId', 'position'])
         && boundedId(position.memberId)
         && bounded(position.position, DISCUSSION_V2_LIMITS.maxReason)
-        && (!Object.keys(turn.roles).length || Object.prototype.hasOwnProperty.call(turn.roles, position.memberId)))
+        && Object.prototype.hasOwnProperty.call(turn.roles, position.memberId)
+        && turn.roles[position.memberId]?.isHost !== true)
+      || new Set(value.memberPositions.map((position) => position.memberId)).size !== value.memberPositions.length
       || !['agreements', 'disagreements', 'openQuestions'].every((key) => {
         const items = value[key];
         return Array.isArray(items)

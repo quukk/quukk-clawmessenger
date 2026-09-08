@@ -9,6 +9,7 @@ import { BridgeClient } from '../go/client.js';
 import type { BridgeTaskEvent, BridgeTaskPort } from '../go/types.js';
 import { DiscussionWireReassembler, encodeDiscussionWire } from '../protocol/discussion-wire.js';
 import { parseChatStreamEvent, type ChatStreamEvent } from '../protocol/chat-stream.js';
+import { parseDiscussionV2Command } from '../protocol/discussion-v2.js';
 import { normalizeRongCloudMessage, type NormalizedRongCloudMessage } from '../protocol/messages.js';
 import type { WorkerEvent } from '../rongcloud/worker-protocol.js';
 import type { WorkerIdentity } from '../rongcloud/worker-supervisor.js';
@@ -2888,6 +2889,30 @@ describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
     )));
 
     expect(fixture.starts).toHaveLength(1);
+  });
+
+  it('starts a real server-shaped round summary host turn after SDK normalization', async () => {
+    const fixture = await routerHarness();
+    const turn = discussionHostTurn({
+      hostPrompt: 'Compare participant evidence before recommending the next step',
+      configVersion: 3,
+      mode: 'roundtable', phase: 'round_summary', allowedDecisions: ['checkpoint'],
+      roundSummaries: [], userInterjections: [{ content: 'Keep rollback possible' }],
+      priorContributions: [{ memberId: 'node-a', content: 'Prior member contribution', round: 1 }],
+    });
+    const roles = turn.roles as Record<string, unknown>;
+    roles['node-a'] = {
+      memberId: 'node-a', nodeId: 'node-a', nickname: 'Reviewer', roleName: 'Reviewer',
+      roleInstructions: 'Review risks', capabilities: ['discussion_participant'], isHost: false,
+    };
+    const normalized = sdkPrivateProtocolMessage('server-round-summary', turn);
+    expect(normalized.rawContent).toEqual(turn);
+    expect(parseDiscussionV2Command(normalized.rawContent)).toEqual(turn);
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, normalized));
+    expect(fixture.starts).toHaveLength(1);
+    expect(fixture.starts[0]?.prompt).toContain('memberPositions');
+    expect(fixture.starts[0]?.prompt).toContain('Prior member contribution');
+    expect(fixture.starts[0]?.prompt).toContain(turn.hostPrompt);
   });
 
   it.each([

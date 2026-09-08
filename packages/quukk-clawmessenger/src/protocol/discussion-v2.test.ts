@@ -73,6 +73,44 @@ const roleRecommendationRequest = {
 };
 
 describe('discussion v2 strict inputs', () => {
+  it('accepts paired host configuration and bounded current-round contributions', () => {
+    for (const legacy of [fixture.hostTurn, fixture.roundtableHostTurn]) {
+      const turn = { ...legacy, hostPrompt: 'Host instructions', configVersion: 2,
+        priorContributions: [{ memberId: 'member-1', content: 'Prior member contribution', round: 2 }] };
+      expect(parseDiscussionV2Command(turn)).toEqual(turn);
+      expect(parseDiscussionV2Command({ ...turn, hostPrompt: 'x'.repeat(32_000) })).not.toBeNull();
+      expect(parseDiscussionV2Command({ ...turn, priorContributions: [] })).not.toBeNull();
+    }
+  });
+
+  it('rejects malformed host configuration, contribution context and unrelated keys', () => {
+    const turn = { ...fixture.roundtableHostTurn, hostPrompt: 'Host instructions', configVersion: 2 };
+    for (const patch of [
+      { hostPrompt: '' }, { hostPrompt: ' ' }, { hostPrompt: 'x'.repeat(32_001) },
+      { hostPrompt: null }, { hostPrompt: undefined }, { configVersion: undefined },
+      { configVersion: 0 }, { configVersion: 1.5 }, { configVersion: '2' },
+      { configVersion: Number.MAX_SAFE_INTEGER + 1 }, { unrelated: true },
+      { priorContributions: null }, { priorContributions: {} },
+      { priorContributions: Array(101).fill({ memberId: 'member-1', content: 'x', round: 2 }) },
+      { priorContributions: [{ memberId: 'member-1', content: 'x'.repeat(100_001), round: 2 }] },
+      { priorContributions: [{ memberId: 'member-1', content: 'x', round: '2' }] },
+      { priorContributions: [{ memberId: 'member-1', content: 'x', round: 2, extra: true }] },
+      { roundSummaries: {} }, { userInterjections: null },
+    ]) expect(parseDiscussionV2Command({ ...turn, ...patch })).toBeNull();
+  });
+
+  it('rejects checkpoint fields and member positions the server cannot accept', () => {
+    const checkpoint = { action: 'checkpoint', memberPositions: [{ memberId: 'member-1', position: 'Proceed' }],
+      agreements: [], disagreements: [], openQuestions: [], nextFocus: '', recommendation: 'finish' };
+    const turn = { ...fixture.roundtableHostTurn, roles: fixture.hostTurn.roles };
+    expect(parseHostDecision(JSON.stringify(checkpoint), turn)).toEqual(checkpoint);
+    for (const patch of [
+      { planSummary: 'Not accepted by checkpoint envelope' },
+      { memberPositions: [{ memberId: 'host-1', position: 'Host position' }] },
+      { memberPositions: [checkpoint.memberPositions[0], checkpoint.memberPositions[0]] },
+    ]) expect(() => parseHostDecision(JSON.stringify({ ...checkpoint, ...patch }), turn)).toThrow();
+  });
+
   it('parses all four exact command fixtures', () => {
     expect(parseDiscussionV2Command(fixture.hostTurn)).toEqual(fixture.hostTurn);
     expect(parseDiscussionV2Command(fixture.roundtableHostTurn)).toEqual(fixture.roundtableHostTurn);
