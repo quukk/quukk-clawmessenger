@@ -862,6 +862,46 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 					return
 				}
 			}
+			var result Result
+			var resultOK bool
+			resultCh := session.Result
+			attemptDone := attemptCtx.Done()
+			cacheResult := func(value Result, ok bool) {
+				result, resultOK = value, ok
+				resultCh = nil
+				if ok && result.Status == "completed" {
+					// Execution has already succeeded. Its deadline must not
+					// truncate queued text while a slower caller catches up.
+					attemptDone = nil
+				}
+			}
+			forward := func(msg Message) {
+				for {
+					select {
+					case msgCh <- msg:
+						return
+					case value, ok := <-resultCh:
+						cacheResult(value, ok)
+					case <-ctx.Done():
+						return
+					case <-attemptDone:
+						// The deadline and a successful result may both be ready.
+						// Let the child classify its outcome before discarding
+						// pending text; its deadline releases any blocked reader.
+						if resultCh != nil {
+							select {
+							case value, ok := <-resultCh:
+								cacheResult(value, ok)
+							case <-ctx.Done():
+								return
+							}
+						}
+						if !resultOK || result.Status != "completed" {
+							return
+						}
+					}
+				}
+			}
 			// Hold back the leading session-pin status messages until this
 			// attempt proves it made real progress. A retry never continues the
 			// discarded attempt's thread (initialize retries fail before any
@@ -873,10 +913,7 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 			holdingPins := true
 			flushHeldPins := func() {
 				for _, held := range heldPins {
-					select {
-					case msgCh <- held:
-					case <-attemptCtx.Done():
-					}
+					forward(held)
 				}
 				heldPins = nil
 				holdingPins = false
@@ -889,13 +926,13 @@ func (b *codexBackend) Execute(ctx context.Context, prompt string, opts ExecOpti
 				if holdingPins {
 					flushHeldPins()
 				}
-				select {
-				case msgCh <- msg:
-				case <-attemptCtx.Done():
-				}
+				forward(msg)
 			}
-			result, ok := <-session.Result
-			if !ok {
+			if resultCh != nil {
+				value, ok := <-resultCh
+				cacheResult(value, ok)
+			}
+			if !resultOK {
 				flushHeldPins()
 				resCh <- Result{Status: "failed", Error: "codex attempt closed without result"}
 				return

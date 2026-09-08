@@ -120,6 +120,10 @@ func TestCodexDeltaAppServerHelper(t *testing.T) {
 		}
 		notify("turn/started", map[string]any{"turn": map[string]any{"id": "turn"}})
 		switch scenario {
+		case "completed_backpressure":
+			for i := 0; i < 300; i++ {
+				delta("answer", "x")
+			}
 		case "slow", "cancel":
 			for i := 0; i < 600; i++ {
 				delta("answer", "x")
@@ -153,6 +157,8 @@ func TestCodexDeltaAppServerHelper(t *testing.T) {
 		case "empty":
 			complete("answer", "", "final_answer")
 		case "delta_only":
+		case "completed_backpressure":
+			complete("answer", strings.Repeat("x", 300), "final_answer")
 		case "slow", "cancel":
 			complete("answer", strings.Repeat("x", 600), "final_answer")
 		case "legacy":
@@ -161,6 +167,13 @@ func TestCodexDeltaAppServerHelper(t *testing.T) {
 			complete("answer", "Hello world", "final_answer")
 		}
 		notify("turn/completed", map[string]any{"turn": map[string]any{"id": "turn", "status": "completed"}})
+	}
+	if scenario == "completed_backpressure" {
+		// EOF proves the adapter consumed turn/completed and initiated clean
+		// shutdown while the parent still has not read the public buffer.
+		if err := os.WriteFile(os.Getenv("MULTICA_CODEX_DELTA_RELEASE")+".completed", nil, 0600); err != nil {
+			os.Exit(1)
+		}
 	}
 	os.Exit(0)
 }
@@ -292,6 +305,58 @@ func TestCodexExecuteAgentDeltasTimeoutBlockedConsumer(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("execution timeout did not unblock public text delivery without caller cancellation")
+	}
+}
+
+func TestCodexExecuteAgentDeltasCompletedBeforeDeadlineKeepsQueuedText(t *testing.T) {
+	const timeout = time.Second
+	started := time.Now()
+	execution, _, release := startCodexDeltaFixture(t, "completed_backpressure", timeout)
+	resumeAt := time.Now().Add(timeout + 100*time.Millisecond)
+	waitForCodexDeltaBackpressure(t, execution)
+	waitForCodexDeltaChildCompletion(t, release, started.Add(timeout))
+	time.Sleep(time.Until(resumeAt))
+	var text strings.Builder
+	var fragments int
+	for message := range execution.Messages {
+		if message.Type == MessageText {
+			text.WriteString(message.Content)
+			fragments++
+		}
+	}
+	result := <-execution.Result
+	if result.Status != "completed" || result.Output != strings.Repeat("x", 300) || fragments != 300 || text.String() != result.Output {
+		t.Fatalf("successful child lost queued text after deadline: fragments=%d text length=%d result=%+v", fragments, text.Len(), result)
+	}
+}
+
+func TestCodexExecuteAgentDeltasCompletedChildStillAllowsCallerCancellation(t *testing.T) {
+	const timeout = time.Second
+	started := time.Now()
+	execution, cancel, release := startCodexDeltaFixture(t, "completed_backpressure", timeout)
+	waitForCodexDeltaBackpressure(t, execution)
+	waitForCodexDeltaChildCompletion(t, release, started.Add(timeout))
+	cancel()
+	select {
+	case result := <-execution.Result:
+		if result.Status != "completed" {
+			t.Fatalf("already-completed child outcome changed: %+v", result)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("caller cancellation did not release successful child's queued forwarding")
+	}
+}
+
+func waitForCodexDeltaChildCompletion(t *testing.T, release string, deadline time.Time) {
+	t.Helper()
+	for {
+		if _, err := os.Stat(release + ".completed"); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("child did not complete before the execution deadline with a full public buffer")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
