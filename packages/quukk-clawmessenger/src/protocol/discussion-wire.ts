@@ -34,6 +34,7 @@ export interface DiscussionWireOptions {
 }
 
 interface PartialMessage {
+  protocolVersion: number;
   senderId: string;
   sha256: string;
   chunkCount: number;
@@ -101,7 +102,7 @@ export function encodeDiscussionWire(payload: Record<string, unknown>): string[]
   return Array.from({ length: chunkCount }, (_, chunkIndex) => {
     const frame = JSON.stringify({
       msg_type: 'discussion_wire_chunk',
-      protocolVersion: 2,
+      protocolVersion: Object.hasOwn(payload, 'protocolVersion') ? payload.protocolVersion : 2,
       messageId,
       sha256,
       chunkIndex,
@@ -232,6 +233,7 @@ export class DiscussionWireReassembler {
       if (this.#partials.size >= this.#maxInflightMessages
         || this.#storedBytes + raw.length > this.#maxInflightBytes) return { status: 'invalid' };
       partial = {
+        protocolVersion: value.protocolVersion as number,
         senderId,
         sha256: value.sha256 as string,
         chunkCount: value.chunkCount as number,
@@ -242,6 +244,7 @@ export class DiscussionWireReassembler {
       };
       this.#partials.set(key, partial);
     } else if (partial.sha256 !== value.sha256
+      || partial.protocolVersion !== value.protocolVersion
       || partial.chunkCount !== value.chunkCount
       || partial.discussionId !== value.discussionId) {
       this.#remove(key);
@@ -284,6 +287,8 @@ export class DiscussionWireReassembler {
       return { status: 'invalid' };
     }
     if (!record(payload) || this.#completed.size >= this.#maxCompleted) return { status: 'invalid' };
+    // Existing generic v2 transport has no inner version. V3 must declare it.
+    if ((Object.hasOwn(payload, 'protocolVersion') ? payload.protocolVersion : 2) !== partial.protocolVersion) return { status: 'invalid' };
     this.#completed.set(key, now + this.#ttlMs);
     return { status: 'complete', payload, serialized };
   }
@@ -294,7 +299,7 @@ export class DiscussionWireReassembler {
     return boundedId(senderId)
       && required.every((key) => Object.prototype.hasOwnProperty.call(value, key))
       && Object.keys(value).every((key) => allowed.has(key))
-      && value.protocolVersion === 2
+      && (value.protocolVersion === 2 || value.protocolVersion === 3)
       && typeof value.sha256 === 'string'
       && /^[0-9a-f]{64}$/.test(value.sha256)
       && value.messageId === `wire_${value.sha256}`
