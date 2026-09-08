@@ -53,6 +53,9 @@ type openclawBackend struct {
 }
 
 func (b *openclawBackend) Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error) {
+	if opts.StreamText {
+		return b.executeGateway(ctx, prompt, opts)
+	}
 	execPath := b.cfg.ExecutablePath
 	if execPath == "" {
 		execPath = "openclaw"

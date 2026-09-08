@@ -196,12 +196,18 @@ const CostUSDTicksPerUSD = 10_000_000_000
 
 // Result is the final outcome after an agent session completes.
 type Result struct {
-	Status     string // "completed", "failed", "aborted", "timeout", "cancelled"
-	Output     string // final user-facing output selected by the backend
-	Error      string // error message if failed
-	DurationMs int64
-	SessionID  string
-	Usage      map[string]TokenUsage // keyed by model name
+	// CancelUnconfirmed means a remote run may still be active after cleanup.
+	// Callers must preserve this failure even if their context was cancelled.
+	CancelUnconfirmed bool
+	// CompletionConfirmed means the provider's final result was received before
+	// caller cancellation. A later cancellation must not erase that outcome.
+	CompletionConfirmed bool
+	Status              string // "completed", "failed", "aborted", "timeout", "cancelled"
+	Output              string // final user-facing output selected by the backend
+	Error               string // error message if failed
+	DurationMs          int64
+	SessionID           string
+	Usage               map[string]TokenUsage // keyed by model name
 	// ResumeRejected is positive evidence that this run's requested resume
 	// was itself refused — the transcript is gone, the session belongs to
 	// another provider account, OR the session still exists but its history

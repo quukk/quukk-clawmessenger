@@ -84,6 +84,29 @@ Detection reports whether a CLI is runnable; it does not prove that every model 
 valid. A clear authentication failure from the first task changes that runtime to `needs_auth`.
 Sign in with the provider's CLI, then rescan.
 
+OpenClaw chat streaming requires a running, token-authenticated local Gateway using
+protocol 4 (verified with OpenClaw 2026.9.2). Configure the intended Gateway through
+OpenClaw's normal setup and run `openclaw gateway run`; the bridge does not start it
+or change its authentication. The adapter connects only to a numeric loopback address,
+reads the existing token in memory, and requests `operator.read`/`operator.write`.
+Do not include tokens in prompts, command examples, or diagnostics.
+
+Existing CLI session UUIDs are resolved through the Gateway and resumed without
+resetting history; new conversations receive isolated session keys. The selected
+OpenClaw agent retains its configured model, tools, permissions and workspace.
+Stopping targets the exact run ID and checks that run's active-state removal before
+reporting cancellation. A failed confirmation is reported as `stop_unconfirmed`,
+with partial text and the session retained for recovery.
+
+This streaming adapter accepts plain JSON local token configuration (including
+`OPENCLAW_CONFIG_PATH`, local port overrides, and an explicit loopback
+`OPENCLAW_GATEWAY_URL` with its explicit environment token). Remote Gateways,
+JSON5/includes, named profiles, SecretRef/interpolated credentials, TLS/password
+authentication, custom launch prefixes, per-session MCP, service tiers and explicit
+local CLI mode fail before prompt submission. Custom arguments support `--agent`
+and `--thinking`; configure other settings through OpenClaw. Non-streaming callers
+retain the existing CLI adapter.
+
 ## CLI reference
 
 | Command | Purpose |

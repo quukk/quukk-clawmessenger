@@ -367,6 +367,9 @@ func (m *bridgeTaskManager) execute(ctx context.Context, task *bridgeTask, runti
 		ResumeExpected:  req.ResumeSessionID != "",
 		OpenclawMode:    "local",
 	}
+	if runtime.Provider == "openclaw" {
+		opts.OpenclawMode = "gateway"
+	}
 	result, tools, err := m.executeAttempt(ctx, task, backend, req.Prompt, opts)
 	if err != nil {
 		m.finishError(ctx, task, runtime.ID, err.Error(), "")
@@ -433,7 +436,11 @@ func (m *bridgeTaskManager) executeAttempt(ctx context.Context, task *bridgeTask
 }
 
 func (m *bridgeTaskManager) finishResult(ctx context.Context, task *bridgeTask, runtimeID string, result agent.Result, terminalStatus string) {
-	if ctx.Err() != nil || result.Status == "aborted" || result.Status == "cancelled" {
+	if result.CancelUnconfirmed {
+		task.publish(BridgeTaskEvent{Type: BridgeEventFailed, SessionID: result.SessionID, Status: terminalStatus, Error: &BridgeError{Category: "stop_unconfirmed", Message: "The Gateway stop is unconfirmed; the run may still be active. Check the Gateway before retrying."}})
+		return
+	}
+	if ctx.Err() != nil && !(result.CompletionConfirmed && result.Status == "completed") || result.Status == "aborted" || result.Status == "cancelled" {
 		task.publish(BridgeTaskEvent{Type: BridgeEventCancelled, SessionID: result.SessionID, Status: terminalStatus})
 		return
 	}

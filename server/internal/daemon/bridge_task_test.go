@@ -570,6 +570,47 @@ func TestBridgeTaskResumeFallbackPolicy(t *testing.T) {
 	}
 }
 
+func TestBridgeTaskOpenclawUsesGatewayStreaming(t *testing.T) {
+	runtime := BridgeRuntime{ID: "rt-openclaw", Provider: "openclaw", Path: `D:\fake\openclaw.exe`, Status: BridgeRuntimeReady}
+	var captured agent.ExecOptions
+	backend := &bridgeTaskFakeBackend{execute: func(_ context.Context, _ string, opts agent.ExecOptions) (*agent.Session, error) {
+		captured = opts
+		return bridgeTaskBufferedSession(nil, agent.Result{Status: "completed", Output: "ok"}), nil
+	}}
+	manager := newBridgeTaskManager(context.Background(), bridgeTaskTestDeps(runtime, backend))
+	id, err := manager.Start(BridgeTaskRequest{RuntimeID: runtime.ID, ConversationKey: "chat", WorkDir: `D:\work`, Prompt: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridgeTaskCollectEvents(t, manager, id, 0)
+	if !captured.StreamText || captured.OpenclawMode != "gateway" {
+		t.Fatalf("bridge did not opt into Gateway streaming: %+v", captured)
+	}
+}
+
+func TestBridgeTaskPreservesRemoteOutcomeAcrossCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		result agent.Result
+		want   BridgeEventType
+	}{
+		{agent.Result{Status: "failed", Error: "stop unconfirmed", CancelUnconfirmed: true}, BridgeEventFailed},
+		{agent.Result{Status: "completed", Output: "finished", CompletionConfirmed: true}, BridgeEventCompleted},
+		{agent.Result{Status: "failed", Error: "legacy failure"}, BridgeEventCancelled},
+	} {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		task := &bridgeTask{id: "test", cancel: cancel, now: time.Now, eventLimit: 10}
+		manager := newBridgeTaskManager(context.Background(), bridgeTaskDeps{})
+		manager.finishResult(ctx, task, "runtime", tc.result, "")
+		if len(task.events) != 1 || task.events[0].Type != tc.want {
+			t.Fatalf("events %+v; want %s", task.events, tc.want)
+		}
+		if tc.result.CancelUnconfirmed && (task.events[0].Error == nil || task.events[0].Error.Category != "stop_unconfirmed") {
+			t.Fatalf("lost actionable stop failure: %+v", task.events[0])
+		}
+	}
+}
+
 func TestBridgeTaskTerminalResultStatusMapping(t *testing.T) {
 	runtime := BridgeRuntime{ID: "rt-codex", Provider: "codex", Version: "1.2.3", Path: `D:\fake\codex.exe`, Status: BridgeRuntimeReady}
 	for _, testCase := range []struct {
