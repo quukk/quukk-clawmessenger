@@ -167,15 +167,12 @@ describe('bridge app', () => {
     expect(await screen.findByRole('heading', { name: '设置' })).toBeVisible();
   });
 
-  it('keeps Multica attribution beside the derivative product name', async () => {
+  it('shows only the clawmessenger product branding', async () => {
     render(<App api={createApi()} />);
 
-    expect(await screen.findByText('Multica')).toBeVisible();
-    expect(screen.getByText('Quukk ClawMessenger')).toBeVisible();
-    expect(screen.getByRole('link', { name: /built on multica/i })).toHaveAttribute(
-      'href',
-      'https://github.com/multica-ai/multica',
-    );
+    expect(await screen.findByText('clawmessenger')).toBeVisible();
+    expect(screen.queryByText(/multica/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('contentinfo')).not.toBeInTheDocument();
   });
 
   it('rescans, disables, and reregisters runtimes', async () => {
