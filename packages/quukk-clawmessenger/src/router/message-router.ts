@@ -1045,6 +1045,23 @@ export class MessageRouter {
     return state;
   }
 
+  async #legacyWorkIsInteractive(identity: WorkerIdentity, message: NormalizedRongCloudMessage, value: Record<string, unknown>): Promise<boolean> {
+    const payload = value.payload && typeof value.payload === 'object' && !Array.isArray(value.payload)
+      ? value.payload as Record<string, unknown> : {};
+    const roomIds = [message.conversationType === 1 ? undefined : message.targetId,
+      value.chatroomId, value.chatroom_id, payload.group_id].filter((id): id is string => typeof id === 'string');
+    const discussionId = value.discussionId ?? value.discussion_id;
+    return this.#state.isInteractiveOwnership(identity, roomIds, typeof discussionId === 'string' ? discussionId : undefined);
+  }
+
+  async #startLegacyTask(identity: WorkerIdentity, message: NormalizedRongCloudMessage,
+    value: Record<string, unknown>, input: Parameters<BridgeTaskPort['startTask']>[0]) {
+    // Recheck after queued work and authorization: ownership may have been
+    // learned since raw ingress or wire reassembly admitted this message.
+    if (await this.#legacyWorkIsInteractive(identity, message, value)) throw new Error('interactive_work_requires_v3');
+    return this.#task.startTask(input);
+  }
+
   async #dispatchDiscussion(
     identity: WorkerIdentity,
     message: NormalizedRongCloudMessage,
@@ -1073,6 +1090,7 @@ export class MessageRouter {
       await router.handle(message.senderId,command);
       return;
     }
+    if (await this.#legacyWorkIsInteractive(identity, message, value)) return;
     if (msgType === 'discussion_cancel' || msgType === 'discussion_artifact_ack') {
       await this.#runDiscussionControl(identity, message, msgType, value, physicalAdmitted);
       return;
@@ -1185,7 +1203,7 @@ export class MessageRouter {
       this.#requireBindingGeneration(identity, generation);
       const prompt = this.#v1Prompt(parsed);
       if (!prompt) throw new Error('prompt_too_large');
-      const response = await this.#task.startTask({
+      const response = await this.#startLegacyTask(identity, message, raw, {
         runtimeId: identity.runtimeId,
         conversationKey: conversationKey(conversation),
         prompt,
@@ -1554,7 +1572,7 @@ export class MessageRouter {
       this.#requireV2Reservation(state, logicalOwner);
       const prompt = buildDiscussionPrompt(parsed);
       if (!prompt || Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES) throw new Error('prompt_too_large');
-      const response = await this.#task.startTask({
+      const response = await this.#startLegacyTask(identity, message, raw, {
         runtimeId: identity.runtimeId,
         conversationKey: conversationKey(sessionConversation),
         prompt,
@@ -2308,7 +2326,7 @@ export class MessageRouter {
       this.#requireBindingGeneration(identity, generation);
       const prompt = this.#roleRecommendationPrompt(request);
       if (Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES) throw new Error('prompt_too_large');
-      const started = await this.#task.startTask({
+      const started = await this.#startLegacyTask(identity, message, value, {
         runtimeId: identity.runtimeId,
         conversationKey: interactiveSessionKey(identity.runtimeId, identity.nodeId, 'recommendation', request.requestId),
         prompt,
@@ -3367,7 +3385,7 @@ export class MessageRouter {
       this.#requireBindingGeneration(identity, generation);
       await this.#recheckBinding(identity);
       this.#requireBindingGeneration(identity, generation);
-      const response = await this.#task.startTask({
+      const response = await this.#startLegacyTask(identity, message, message.rawContent ?? {}, {
         runtimeId: identity.runtimeId,
         conversationKey: conversationKey(candidate.conversation),
         prompt: candidate.prompt,

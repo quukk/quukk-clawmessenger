@@ -276,6 +276,7 @@ class RecordingStateStore extends RouterStateStore {
 }
 
 interface RouterHarness {
+  filePath: string;
   router: MessageRouter;
   state: RecordingStateStore;
   order: string[];
@@ -296,8 +297,9 @@ interface RouterHarness {
 
 async function routerHarness(
   overrides: Partial<Pick<MessageRouterOptions, 'sleep' | 'timers' | 'interactiveAvailable'>> = {},
+  savedPath?: string,
 ): Promise<RouterHarness> {
-  const filePath = await temporaryStatePath();
+  const filePath = savedPath ?? await temporaryStatePath();
   const order: string[] = [];
   const state = new RecordingStateStore({ filePath, now: () => 100 }, order);
   await state.initialize();
@@ -386,6 +388,7 @@ async function routerHarness(
   };
   const router = new MessageRouter(options);
   return {
+    filePath,
     router,
     state,
     order,
@@ -423,6 +426,67 @@ it('dispatches authenticated v3 through the interactive runtime using a durable 
  }
  await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,{...protocolMessage('relay-opinion',{msg_type:'chatroom_message',chatroom_id:command.chatroomId,content:'relayed opinion'}),conversationType:4,targetId:command.chatroomId}));
  expect(h.starts).toHaveLength(1);
+});
+
+it.each(['token', 'assignment', 'host'] as const)('rejects raw and framed legacy %s work after interactive ownership recovery', async kind => {
+  const first = await routerHarness();
+  const event = {msg_type:'discussion_event',protocolVersion:3,discussionId:'owned-discussion',chatroomId:'group',requestId:'event-1',stateVersion:1,round:0,roundRevision:0,timestamp:100,seq:1,eventType:'discussion_progress',actorId:null,targetId:null,data:{}};
+  await first.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, sdkPrivateProtocolMessage('learn', event)));
+  await first.router.dispose();
+  const h = await routerHarness({}, first.filePath);
+  const work = kind === 'token' ? discussionV1({discussion_id:'owned-discussion'})
+    : kind === 'host' ? discussionHostTurn({discussionId:'owned-discussion',eventSummary:'x'.repeat(12000)})
+    : discussionAssignment({discussionId:'owned-discussion',task:'x'.repeat(12000)});
+  if (kind === 'token') (work.payload as Record<string, unknown>).originator_text = 'x'.repeat(12000);
+  for (const senderId of ['human', 'system']) {
+    for (const framed of [false, true]) {
+      const frames = framed ? encodeDiscussionWire(work).map(frame => JSON.parse(frame) as Record<string, unknown>) : [work];
+      if (framed) expect(frames.length).toBeGreaterThan(1);
+      for (const [index, frame] of frames.entries()) {
+        await h.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(`${senderId}-${framed}-${index}`, frame, {senderId, targetId:'group', conversationType:4})));
+      }
+    }
+  }
+  // A delayed trusted private command cannot evade policy by changing its room.
+  if (kind !== 'token') await h.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, sdkPrivateProtocolMessage('private', {...work,chatroomId:'other-room'})));
+  expect(h.starts).toHaveLength(0);
+  await h.router.dispose();
+  const legacy = await routerHarness();
+  await legacy.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage('legacy', work, {senderId:'human',targetId:'group',conversationType:4})));
+  expect(legacy.starts).toHaveLength(1);
+  expect(legacy.starts[0]?.requestId).toBeUndefined();
+  await legacy.router.dispose();
+});
+
+it('rechecks interactive ownership after queued legacy work authorizes its directory', async () => {
+  const h = await routerHarness();
+  h.binding.authorizeDefaultWorkdir = async () => {
+    await h.state.rememberInteractiveRoom(IDENTITY_A, 'group', 'discussion-v2');
+    return AUTHORIZED_WORKDIR;
+  };
+  await h.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage('queued', discussionAssignment(), {conversationType:4})));
+  expect(h.starts).toHaveLength(0);
+});
+
+it('keeps active v3 work isolated from delayed legacy work in its room', async () => {
+  const h = await routerHarness({interactiveAvailable:async()=>true});
+  Object.assign(h.task,{health:async()=>({instance_id:`br_${'a'.repeat(32)}`}),fenceTask:async()=> 'not_started'});
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  h.setStart(async input => { h.starts.push(input); return {taskId:input.requestId!,eventsUrl:'/fake'}; });
+  h.setEvents(taskId => (async function*() { await gate; yield bridgeEvent(taskId,'completed',{output:'v3 completed'}); })());
+  const command = {...discussionAssignment(),protocolVersion:3,roundRevision:0,timestamp:100,mode:'roundtable',model:null,role:{roleName:'Reviewer',roleInstructions:'Evaluate'},speakingOrder:0,roundFocus:'Migration',priorContributions:[],roundSummaries:[],userInterjections:[],attempt:1};
+  const active = h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,sdkPrivateProtocolMessage('v3-active',command)));
+  await vi.waitFor(() => expect(h.starts).toHaveLength(1));
+  try {
+    await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,protocolMessage('human-legacy',discussionAssignment(),{senderId:'human',conversationType:4})));
+    for (const [index, frame] of encodeDiscussionWire(discussionHostTurn({discussionId:command.discussionId,eventSummary:'x'.repeat(12000)})).entries()) {
+      await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,sdkPrivateProtocolMessage(`delayed-${index}`,JSON.parse(frame))));
+    }
+    expect(h.starts).toHaveLength(1);
+    expect(h.cancellations).toEqual([]);
+  } finally { release(); await active; await h.router.dispose(); }
+  expect(h.sent.some(({input}) => input.content.msg_type === 'discussion_contribution_completed' && input.content.protocolVersion === 3)).toBe(true);
 });
 
 it('learns room ownership from authenticated v3 public events without running a task',async()=>{

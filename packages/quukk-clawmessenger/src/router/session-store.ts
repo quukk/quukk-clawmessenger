@@ -337,6 +337,15 @@ export class RouterStateStore {
     return this.#read(state => Object.hasOwn(state.interactiveRooms,interactiveSessionKey(identity.runtimeId,identity.nodeId,'chatroom',roomId)));
   }
 
+  isInteractiveOwnership(identity: {runtimeId:string;nodeId:string}, roomIds: readonly string[], discussionId?: string): Promise<boolean> {
+    return this.#read(state => roomIds.some(roomId => Object.hasOwn(state.interactiveRooms,
+      interactiveSessionKey(identity.runtimeId, identity.nodeId, 'chatroom', roomId)))
+      || (discussionId !== undefined && Object.entries(state.interactiveRooms).some(([key, owner]) => {
+        const [runtimeId, nodeId] = JSON.parse(key) as string[];
+        return owner === discussionId && runtimeId === identity.runtimeId && nodeId === identity.nodeId;
+      })));
+  }
+
   interactiveSession(key: string): Promise<string | undefined> {
     return this.#read(state => state.interactiveSessions[key]);
   }
