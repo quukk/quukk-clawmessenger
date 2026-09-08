@@ -1,5 +1,12 @@
 {
   "valid": {
+    "roundBeyondLegacyCap": {
+      "msg_type": "discussion_event", "protocolVersion": 3,
+      "discussionId": "discussion-1", "chatroomId": "room-1", "requestId": "continue-104",
+      "stateVersion": 905, "round": 104, "roundRevision": 2, "timestamp": 1723950002000,
+      "seq": 1007, "eventType": "round_started", "actorId": "owner-1", "targetId": null,
+      "data": {"round": 104, "roundFocus": "Continue without a total-round cap"}
+    },
     "whitespaceDelta": {
       "msg_type": "discussion_contribution_delta", "protocolVersion": 3,
       "discussionId": "discussion-1", "chatroomId": "room-1", "requestId": "request-1",

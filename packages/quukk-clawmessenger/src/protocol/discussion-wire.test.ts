@@ -25,7 +25,7 @@ interface WireFixture {
 }
 
 const fixtureSource = readFileSync(
-  new URL('./fixtures/discussion-wire-cross-runtime.json', import.meta.url),
+  process.env.CLAWMESSENGER_DISCUSSION_WIRE_CONTRACT || new URL('./fixtures/discussion-wire-cross-runtime.json', import.meta.url),
   'utf8',
 );
 const fixture = JSON.parse(fixtureSource) as WireFixture;
