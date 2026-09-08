@@ -3422,6 +3422,46 @@ describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
       && Array.isArray(input.content.roles))).toBe(true);
   });
 
+  it.each([false, true])('executes role-only recommendation and replies without device assignments (framed=%s)', async (framed) => {
+    const fixture = await routerHarness();
+    const roles = [{ role_name: 'Reviewer', role_prompt: 'Check risks', speaking_order: 0 }];
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', { output: JSON.stringify({ roles }) });
+    })());
+    const request = roleRecommendationRequest({ recommendation_prompt: framed ? 'P'.repeat(10_000) : 'Plan roles' });
+    delete request.candidates;
+    const frames = encodeDiscussionWire(request);
+    expect(frames.length > 1).toBe(framed);
+    for (const [index, frame] of frames.entries()) {
+      await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+        `role-only-${index}`, JSON.parse(frame),
+        { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+      )));
+    }
+    expect(fixture.starts).toHaveLength(1);
+    expect(fixture.starts[0]!.prompt).toContain('role_name, role_prompt, speaking_order');
+    expect(fixture.starts[0]!.prompt).not.toContain('Use each node_id at most once');
+    expect(fixture.sent.find(({ input }) => input.messageType === 'command_result'
+      && input.content.msg_type === 'discussion_role_recommendation_response')?.input.content).toEqual({
+      msg_type: 'discussion_role_recommendation_response', request_id: 'recommend-1', roles,
+    });
+  });
+
+  it.each([false, true])('never executes role recommendation sent by a non-system user (framed=%s)', async (framed) => {
+    const fixture = await routerHarness();
+    const request = roleRecommendationRequest({ recommendation_prompt: framed ? 'P'.repeat(10_000) : 'Plan roles' });
+    delete request.candidates;
+    for (const [index, frame] of encodeDiscussionWire(request).entries()) {
+      await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+        `untrusted-role-${index}`, JSON.parse(frame),
+        { senderId: 'ordinary-user', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+      )));
+    }
+    expect(fixture.starts).toHaveLength(0);
+    expect(fixture.sent.some(({ input }) => input.messageType === 'command_result'
+      && input.content.msg_type === 'discussion_role_recommendation_response')).toBe(false);
+  });
+
   it.each([
     ['Markdown-wrapped output', '```json\n{"roles":[]}\n```'],
     ['unknown candidate', JSON.stringify({ roles: [{

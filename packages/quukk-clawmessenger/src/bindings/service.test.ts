@@ -77,7 +77,9 @@ class FakeRegistrationClient {
   readonly appKeyCalls: string[] = [];
   readonly registerCalls: RegistrationInput[] = [];
   readonly refreshCalls: RefreshInput[] = [];
-  getAppKeyImplementation: (serverUrl: string) => Promise<string> = async () => 'public-app-key';
+  readonly appKeySignals: Array<AbortSignal | undefined> = [];
+  readonly refreshSignals: Array<AbortSignal | undefined> = [];
+  getAppKeyImplementation: (serverUrl: string, signal?: AbortSignal) => Promise<string> = async () => 'public-app-key';
   registerImplementation: (input: RegistrationInput) => Promise<RegistrationResult> = async (
     input,
   ) => ({
@@ -85,15 +87,16 @@ class FakeRegistrationClient {
     nodeName: input.nodeName,
     token: `${input.provider}-token`,
   });
-  refreshImplementation: (input: RefreshInput) => Promise<RegistrationResult> = async (input) => ({
+  refreshImplementation: (input: RefreshInput, signal?: AbortSignal) => Promise<RegistrationResult> = async (input) => ({
     nodeId: input.nodeId,
     nodeName: input.nodeName,
     token: `${input.provider}-refreshed-token`,
   });
 
-  async getAppKey(serverUrl: string): Promise<string> {
+  async getAppKey(serverUrl: string, signal?: AbortSignal): Promise<string> {
     this.appKeyCalls.push(serverUrl);
-    return this.getAppKeyImplementation(serverUrl);
+    this.appKeySignals.push(signal);
+    return this.getAppKeyImplementation(serverUrl, signal);
   }
 
   async register(input: RegistrationInput): Promise<RegistrationResult> {
@@ -101,9 +104,10 @@ class FakeRegistrationClient {
     return this.registerImplementation(input);
   }
 
-  async refreshToken(input: RefreshInput): Promise<RegistrationResult> {
+  async refreshToken(input: RefreshInput, signal?: AbortSignal): Promise<RegistrationResult> {
     this.refreshCalls.push({ ...input });
-    return this.refreshImplementation(input);
+    this.refreshSignals.push(signal);
+    return this.refreshImplementation(input, signal);
   }
 }
 
@@ -779,7 +783,7 @@ describe('BindingService', () => {
     expect(reopened.registration.refreshCalls).toEqual([]);
   });
 
-  it('reregisters only the chosen binding through refresh and credentials-first swap', async () => {
+  it('authenticates only the chosen same-server binding refresh with its current token before swapping credentials', async () => {
     const codex = runtime('codex');
     const hermes = runtime('hermes');
     const fixture = await harness([codex, hermes]);
@@ -795,8 +799,8 @@ describe('BindingService', () => {
       runtimeId: codex.id,
       nodeId: old.nodeId,
       provider: 'codex',
+      existingNodeToken: 'old-rongcloud-token',
     });
-    expect(reopened.registration.refreshCalls[0]).not.toHaveProperty('existingNodeToken');
     const current = result.ok ? result.binding : undefined;
     expect(current?.tokenRef).not.toBe(old.tokenRef);
     expect(current?.registrationState).toBe('offline');
@@ -947,6 +951,114 @@ describe('BindingService', () => {
     expect(reopened.service.list()[0]?.tokenRef).toBe(old.tokenRef);
     expect(reopened.store.credential(old.tokenRef!)?.token).toBe('old-rongcloud-token');
   });
+
+  it('forwards reregister cancellation through token refresh and retains the existing identity', async () => {
+    const selected = runtime('codex');
+    const fixture = await harness([selected]);
+    const old = await seedBinding(fixture.store, selected);
+    const registration = new FakeRegistrationClient();
+    registration.refreshImplementation = (_input, signal) => new Promise((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(
+        new RegistrationError('registration_cancelled', 'transport', false),
+      ), { once: true });
+    });
+    const reopened = await harness([selected], { home: fixture.home, registration });
+    const controller = new AbortController();
+
+    const refreshing = reopened.service.reregister(selected.id, {
+      signal: controller.signal,
+      preserveNodeIdentity: true,
+    });
+    await vi.waitFor(() => expect(registration.refreshCalls).toHaveLength(1));
+    controller.abort();
+
+    await expect(refreshing).resolves.toEqual({
+      runtimeId: selected.id,
+      ok: false,
+      errorCode: 'registration_cancelled',
+    });
+    expect(registration.appKeySignals).toEqual([controller.signal]);
+    expect(registration.refreshSignals).toEqual([controller.signal]);
+    expect(reopened.service.list()[0]).toMatchObject({
+      nodeId: old.nodeId,
+      tokenRef: old.tokenRef,
+      enabled: old.enabled,
+    });
+    expect(reopened.store.credential(old.tokenRef!)?.token).toBe('old-rongcloud-token');
+  });
+
+  it('does not replace an existing node when identity-preserving refresh sees a changed server', async () => {
+    const selected = runtime('codex');
+    const fixture = await harness([selected]);
+    const old = await seedBinding(fixture.store, selected, {
+      serverUrl: 'https://old.example/im',
+      nodeId: 'codex_existing',
+    });
+    await fixture.store.saveConfig({
+      ...DEFAULT_CONFIG,
+      serverUrl: 'https://new.example/im',
+    });
+    const registration = new FakeRegistrationClient();
+    const reopened = await harness([selected], { home: fixture.home, registration });
+
+    await expect(reopened.service.reregister(selected.id, {
+      preserveNodeIdentity: true,
+    })).resolves.toEqual({
+      runtimeId: selected.id,
+      ok: false,
+      errorCode: 'server_identity_changed',
+    });
+
+    expect(registration.appKeyCalls).toEqual([]);
+    expect(registration.registerCalls).toEqual([]);
+    expect(registration.refreshCalls).toEqual([]);
+    expect(reopened.service.list()[0]).toEqual(old);
+    expect(reopened.store.credential(old.tokenRef!)).toMatchObject({
+      nodeId: old.nodeId,
+      serverUrl: 'https://old.example/im',
+      token: 'old-rongcloud-token',
+    });
+  });
+
+  it.each([
+    ['missing', []],
+    ['not ready', [runtime('codex', { status: 'needs_auth' })]],
+  ] as const)(
+    'rejects changed-server identity-preserving refresh before runtime discovery when runtime is %s',
+    async (_name, runtimes) => {
+      const selected = runtime('codex');
+      const fixture = await harness([selected]);
+      const old = await seedBinding(fixture.store, selected, {
+        serverUrl: 'https://old.example/im',
+        nodeId: 'codex_existing',
+      });
+      await fixture.store.saveConfig({
+        ...DEFAULT_CONFIG,
+        serverUrl: 'https://new.example/im',
+      });
+      const registration = new FakeRegistrationClient();
+      const reopened = await harness(runtimes, { home: fixture.home, registration });
+
+      await expect(reopened.service.reregister(selected.id, {
+        preserveNodeIdentity: true,
+      })).resolves.toEqual({
+        runtimeId: selected.id,
+        ok: false,
+        errorCode: 'server_identity_changed',
+      });
+
+      expect(reopened.source.calls).toBe(0);
+      expect(registration.appKeyCalls).toEqual([]);
+      expect(registration.registerCalls).toEqual([]);
+      expect(registration.refreshCalls).toEqual([]);
+      expect(reopened.service.list()[0]).toEqual(old);
+      expect(reopened.store.credential(old.tokenRef!)).toMatchObject({
+        nodeId: old.nodeId,
+        serverUrl: 'https://old.example/im',
+        token: 'old-rongcloud-token',
+      });
+    },
+  );
 
   it('unregisters local state idempotently without any remote-delete request', async () => {
     const selected = runtime('codex');

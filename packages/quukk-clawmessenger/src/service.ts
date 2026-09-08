@@ -1158,7 +1158,68 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
     const running = await this.#bridge.ensureStarted({ signal: this.#lifecycle.signal });
     this.#assertStarting();
     if (running.client !== this.#runtimesPort) throw new ServiceError('operation_unavailable');
-    const restored = this.#bindings.list();
+    let restored = this.#bindings.list();
+    const synchronized = new Map<string, RuntimeBinding>();
+    const excluded = new Set<string>();
+    await Promise.all(restored.filter(completeEnabledBinding).map(async (binding) => {
+      try {
+        const result = await this.#bindings.reregister(binding.runtimeId, {
+          signal: this.#lifecycle.signal,
+          preserveNodeIdentity: true,
+        });
+        if (!result.ok) {
+          if (result.errorCode === 'server_identity_changed') excluded.add(binding.runtimeId);
+          safeLog(this.#logger, 'warn', {
+            event: 'binding_capability_sync_failed',
+            runtimeId: binding.runtimeId,
+            nodeId: binding.nodeId,
+            errorCode: result.errorCode,
+          });
+          return;
+        }
+        if (
+          result.runtimeId !== binding.runtimeId
+          || result.binding.runtimeId !== binding.runtimeId
+          || result.binding.nodeId !== binding.nodeId
+          || !completeEnabledBinding(result.binding)
+        ) {
+          excluded.add(binding.runtimeId);
+          safeLog(this.#logger, 'warn', {
+            event: 'binding_capability_sync_failed',
+            runtimeId: binding.runtimeId,
+            nodeId: binding.nodeId,
+            errorCode: 'operation_unavailable',
+          });
+          return;
+        }
+        synchronized.set(binding.runtimeId, result.binding);
+      } catch (error) {
+        if (!this.#lifecycle.signal.aborted) {
+          safeLog(this.#logger, 'warn', {
+            event: 'binding_capability_sync_failed',
+            runtimeId: binding.runtimeId,
+            nodeId: binding.nodeId,
+            errorCode: explicitCode(error) ?? 'operation_unavailable',
+          });
+        }
+      }
+    }));
+    this.#assertStarting();
+    restored = this.#bindings.list();
+    for (const [runtimeId, expected] of synchronized) {
+      const current = restored.find((binding) => binding.runtimeId === runtimeId);
+      if (current !== undefined && completeEnabledBinding(current) && exactBinding(current, expected)) {
+        continue;
+      }
+      excluded.add(runtimeId);
+      safeLog(this.#logger, 'warn', {
+        event: 'binding_capability_sync_failed',
+        runtimeId,
+        nodeId: expected.nodeId,
+        errorCode: 'operation_unavailable',
+      });
+    }
+    restored = restored.filter((binding) => !excluded.has(binding.runtimeId));
     for (const binding of restored) {
       if (!completeEnabledBinding(binding)) continue;
       await ensureProtectedStorage(this.#storageRoot, binding.runtimeId);

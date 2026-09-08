@@ -529,6 +529,23 @@ describe('RongCloudClient lifecycle', () => {
 });
 
 describe('RongCloudClient sends and queue', () => {
+  it.each([
+    'discussion_role_recommendation_response',
+    'discussion_model_catalog_response',
+    'discussion_host_decision',
+    'discussion_contribution_delta',
+    'discussion_contribution_completed',
+    'discussion_artifact_update',
+    'discussion_node_error',
+    'discussion_wire_chunk',
+  ])('sends %s through the server command callback carrier', async (msgType) => {
+    const { client, sdk } = createClient();
+    await initialize(client);
+    const content = { msg_type: msgType, request_id: 'wire-request' };
+    await client.send(send(1, { messageType: 'command_result', content }));
+    expect(sdk.sendCalls[0]?.message).toMatchObject({ kind: 'command', content });
+  });
+
   it('uses the text constructor and all six registered constructors with numeric conversations', async () => {
     const { client, sdk } = createClient();
     await initialize(client);

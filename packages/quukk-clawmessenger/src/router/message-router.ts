@@ -1021,6 +1021,7 @@ export class MessageRouter {
         'discussion_cancel',
         'discussion_artifact_ack',
         'discussion_model_catalog_request',
+        'discussion_role_recommendation_request',
       ].includes(innerType)) return;
     await this.#dispatchDiscussion(
       identity,
@@ -2227,8 +2228,7 @@ export class MessageRouter {
         roles: roles.map((role) => ({
           role_name: role.roleName,
           role_prompt: role.rolePrompt,
-          node_id: role.nodeId,
-          model: role.model,
+          ...(role.nodeId === undefined ? {} : { node_id: role.nodeId, model: role.model }),
           speaking_order: role.speakingOrder,
         })),
       });
@@ -2265,9 +2265,13 @@ export class MessageRouter {
       `Topic: ${request.topic}`,
       `Goal: ${request.goal}`,
       `Maximum roles: ${request.maxRoles}`,
-      `Candidates: ${JSON.stringify(request.candidates)}`,
+      ...(request.candidates.length === 0 ? [] : [`Candidates: ${JSON.stringify(request.candidates)}`]),
       `Host instructions: ${request.recommendationPrompt}`,
-      'Return exactly one JSON object with a roles array. Use each node_id at most once, use only listed models or null, and use contiguous speaking_order values beginning at 0. Do not wrap the JSON in Markdown.',
+      'Return exactly one JSON object with a roles array.',
+      request.candidates.length === 0
+        ? 'Each role must contain exactly role_name, role_prompt, speaking_order. Do not assign devices or models.'
+        : 'Each role must contain exactly role_name, role_prompt, node_id, model, speaking_order. Use each node_id at most once, use only listed models or null.',
+      'Use distinct nonempty role names and actionable role prompts, and contiguous speaking_order values beginning at 0. Do not wrap the JSON in Markdown.',
     ].join('\n');
   }
 

@@ -120,6 +120,34 @@ describe('discussion v2 strict inputs', () => {
 });
 
 describe('discussion role recommendation protocol', () => {
+  it('accepts role-only admin requests without weakening candidate validation', () => {
+    const { candidates: _candidates, ...roleOnly } = roleRecommendationRequest;
+    expect(parseRoleRecommendationRequest(roleOnly)).toMatchObject({
+      requestId: 'request-demo-001', maxRoles: 2, candidates: [],
+    });
+    for (const candidates of [null, [], undefined, 'invalid']) {
+      expect(parseRoleRecommendationRequest({ ...roleOnly, candidates })).toBeNull();
+    }
+  });
+
+  it('returns roles without inventing node or model assignments for role-only requests', () => {
+    const { candidates: _candidates, ...roleOnly } = roleRecommendationRequest;
+    const request = parseRoleRecommendationRequest(roleOnly);
+    expect(request).not.toBeNull();
+    if (!request) return;
+    const role = { role_name: 'Reviewer', role_prompt: 'Check risks', speaking_order: 0 };
+    expect(parseRoleRecommendationResponse({ roles: [role] }, request)).toEqual([
+      { roleName: 'Reviewer', rolePrompt: 'Check risks', speakingOrder: 0 },
+    ]);
+    for (const roles of [
+      [], [role, { ...role, speaking_order: 1 }], [{ ...role, speaking_order: 1 }],
+      [{ ...role, node_id: 'invented', model: null }], [{ ...role, extra: true }],
+      [{ ...role, role_name: ' ' }], [{ ...role, role_prompt: ' ' }],
+    ]) {
+      expect(parseRoleRecommendationResponse({ roles }, request)).toBeNull();
+    }
+  });
+
   it('parses exact candidate assignments and normalizes wire field names', () => {
     expect(parseRoleRecommendationRequest(roleRecommendationRequest)).toMatchObject({
       msgType: 'discussion_role_recommendation_request',

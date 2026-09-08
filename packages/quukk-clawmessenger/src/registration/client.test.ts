@@ -409,9 +409,14 @@ describe('RegistrationClient', () => {
     const transport = fakeFetch(jsonResponse(successEnvelope('codex', 'codex_a-b')));
     const client = new RegistrationClient({ fetch: transport.fetch });
 
-    const result = await client.refreshToken(refreshInput({ nodeId: 'codex_a-b' }));
+    const result = await client.refreshToken(refreshInput({
+      nodeId: 'codex_a-b',
+      existingNodeToken: 'SENTINEL_OLD_TOKEN',
+    }));
 
     expect(transport.calls[0]?.url).toBe('https://example.test/im/api/claw/refresh-token/codex_a-b');
+    expect(new Headers(transport.calls[0]!.init.headers).get('Authorization'))
+      .toBe('Bearer SENTINEL_OLD_TOKEN');
     expect(body(transport.calls[0]!)).toEqual({
       name: 'fixture-host · Codex',
       capabilities: [...CAPABILITIES],

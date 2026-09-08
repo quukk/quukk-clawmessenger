@@ -316,6 +316,17 @@ const registrations = [
 ] as const;
 
 const authenticationCodes = new Set([1002, 31004, 31020, 31029]);
+// The server routes discussion callbacks by objectName=command, not command_result.
+const discussionCommandReplies = new Set([
+  'discussion_role_recommendation_response',
+  'discussion_model_catalog_response',
+  'discussion_host_decision',
+  'discussion_contribution_delta',
+  'discussion_contribution_completed',
+  'discussion_artifact_update',
+  'discussion_node_error',
+  'discussion_wire_chunk',
+]);
 const sentUidLimit = 2_048;
 const inboundMessageLimit = 1_024;
 
@@ -535,7 +546,12 @@ export class RongCloudClient {
         if (input.content === null || typeof input.content !== 'object' || Array.isArray(input.content)) {
           return Promise.reject(failure('invalid_request'));
         }
-        const Constructor = this.#constructors.get(input.messageType);
+        const wireType = input.messageType === 'command_result'
+          && typeof input.content.msg_type === 'string'
+          && discussionCommandReplies.has(input.content.msg_type)
+          ? 'command'
+          : input.messageType;
+        const Constructor = this.#constructors.get(wireType);
         if (!Constructor) return Promise.reject(failure('invalid_request'));
         message = new Constructor(input.content);
       }

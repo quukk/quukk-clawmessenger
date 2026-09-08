@@ -246,7 +246,14 @@ class FakeRuntime implements ServiceRuntimePort {
 class FakeBindings implements ServiceBindingPort {
   values: RuntimeBinding[] = [];
   enableHook?: (runtimeIds: readonly string[]) => Promise<readonly EnableResult[]>;
-  reregisterHook?: (runtimeId: string) => Promise<EnableResult>;
+  readonly reregisterOptions: Array<{
+    signal?: AbortSignal;
+    preserveNodeIdentity?: boolean;
+  }> = [];
+  reregisterHook?: (
+    runtimeId: string,
+    options?: { signal?: AbortSignal; preserveNodeIdentity?: boolean },
+  ) => Promise<EnableResult>;
   disableHook?: (runtimeId: string) => Promise<RuntimeBinding>;
   readonly trace: string[];
 
@@ -278,9 +285,13 @@ class FakeBindings implements ServiceBindingPort {
     return disabled;
   }
 
-  async reregister(runtimeId: string): Promise<EnableResult> {
+  async reregister(
+    runtimeId: string,
+    options: { signal?: AbortSignal; preserveNodeIdentity?: boolean } = {},
+  ): Promise<EnableResult> {
     this.trace.push(`bindings.reregister:${runtimeId}`);
-    if (this.reregisterHook) return this.reregisterHook(runtimeId);
+    this.reregisterOptions.push(options);
+    if (this.reregisterHook) return this.reregisterHook(runtimeId, options);
     const binding = this.values.find((candidate) => candidate.runtimeId === runtimeId);
     return binding
       ? { runtimeId, ok: true, binding: { ...binding } }
@@ -635,11 +646,19 @@ describe('QuukkService lifecycle', () => {
     await f.service.stop();
   });
 
-  it('starts once, activates restored bindings only after protected storage exists, and returns one ready identity', async () => {
+  it('refreshes restored bindings once and starts workers with the refreshed credential without rebinding identities', async () => {
     const root = await temporaryDirectory();
-    const binding = completeBinding('opencode', root);
-    const f = await fixture({ bindings: [binding] });
+    const bindings = [completeBinding('opencode', root), completeBinding('codex', root)];
+    const f = await fixture({ bindings });
     f.runtime.catalog = runtimeCatalog(root);
+    f.bindings.reregisterHook = async (runtimeId) => {
+      const previous = f.bindings.values.find((binding) => binding.runtimeId === runtimeId)!;
+      const refreshed = { ...previous, tokenRef: `rc_${runtimeId.slice(3)}` };
+      f.bindings.values = f.bindings.values.map((binding) =>
+        binding.runtimeId === runtimeId ? refreshed : binding,
+      );
+      return { runtimeId, ok: true, binding: refreshed };
+    };
     f.router.activateHook = async (identity) => {
       const details = await stat(join(f.storageRoot, identity.runtimeId));
       expect(details.isDirectory()).toBe(true);
@@ -649,22 +668,138 @@ describe('QuukkService lifecycle', () => {
     const second = f.service.start();
     expect(second).toBe(first);
     await expect(first).resolves.toEqual(READY);
-    expect(f.trace).toEqual([
-      'bridge.start',
-      'bindings.list',
-      `router.activate:${binding.runtimeId}:${binding.nodeId}`,
-      'workers.reconcile',
-      'http.start',
-      'identity.ready:127.0.0.1:43111',
-    ]);
-    expect(f.workers.reconciliations[0]).toEqual([{
+    for (const binding of bindings) {
+      expect(f.trace.filter((entry) => entry === `bindings.reregister:${binding.runtimeId}`))
+        .toHaveLength(1);
+      expect(f.trace).toContain(`router.activate:${binding.runtimeId}:${binding.nodeId}`);
+      expect(f.trace).not.toContain(`bindings.enable:${binding.runtimeId}`);
+    }
+    expect(f.bindings.reregisterOptions).toHaveLength(2);
+    expect(f.bindings.reregisterOptions.every((options) =>
+      options.signal instanceof AbortSignal && options.preserveNodeIdentity === true,
+    )).toBe(true);
+    expect(f.trace.indexOf(`bindings.reregister:${bindings[0]!.runtimeId}`))
+      .toBeLessThan(f.trace.indexOf(`router.activate:${bindings[0]!.runtimeId}:${bindings[0]!.nodeId}`));
+    expect(f.workers.reconciliations[0]).toEqual(bindings.map((binding) => ({
       runtimeId: binding.runtimeId,
       nodeId: binding.nodeId,
       enabled: true,
-      tokenRef: binding.tokenRef,
+      tokenRef: `rc_${binding.runtimeId.slice(3)}`,
       storageDir: join(f.storageRoot, binding.runtimeId),
-    }]);
+    })));
     await f.service.stop();
+  });
+
+  it('isolates restored-binding refresh failures and keeps the saved identity available', async () => {
+    const root = await temporaryDirectory();
+    const failed = completeBinding('opencode', root);
+    const successful = completeBinding('codex', root);
+    const f = await fixture({ bindings: [failed, successful] });
+    f.bindings.reregisterHook = async (runtimeId) => {
+      if (runtimeId === failed.runtimeId) {
+        return { runtimeId, ok: false, errorCode: 'registration_transport' };
+      }
+      const refreshed = { ...successful, tokenRef: `rc_${'f'.repeat(32)}` };
+      f.bindings.values = [failed, refreshed];
+      return { runtimeId, ok: true, binding: refreshed };
+    };
+
+    await expect(f.service.start()).resolves.toEqual(READY);
+
+    expect(f.trace).toEqual(expect.arrayContaining([
+      `bindings.reregister:${failed.runtimeId}`,
+      `bindings.reregister:${successful.runtimeId}`,
+      `router.activate:${failed.runtimeId}:${failed.nodeId}`,
+      `router.activate:${successful.runtimeId}:${successful.nodeId}`,
+      'workers.reconcile',
+    ]));
+    expect(f.workers.reconciliations[0]).toEqual([
+      expect.objectContaining({
+        runtimeId: failed.runtimeId,
+        nodeId: failed.nodeId,
+        tokenRef: failed.tokenRef,
+      }),
+      expect.objectContaining({
+        runtimeId: successful.runtimeId,
+        nodeId: successful.nodeId,
+        tokenRef: `rc_${'f'.repeat(32)}`,
+      }),
+    ]);
+    expect(f.logger.records).toContainEqual(expect.objectContaining({
+      level: 'warn',
+      event: expect.objectContaining({
+        event: 'binding_capability_sync_failed',
+        runtimeId: failed.runtimeId,
+        nodeId: failed.nodeId,
+        errorCode: 'registration_transport',
+      }),
+    }));
+    await f.service.stop();
+  });
+
+  it('does not activate stale credentials when refresh reports success without persisting them', async () => {
+    const root = await temporaryDirectory();
+    const binding = completeBinding('opencode', root);
+    const f = await fixture({ bindings: [binding] });
+    f.bindings.reregisterHook = async (runtimeId) => ({
+      runtimeId,
+      ok: true,
+      binding: { ...binding, tokenRef: `rc_${'e'.repeat(32)}` },
+    });
+
+    await expect(f.service.start()).resolves.toEqual(READY);
+
+    expect(f.trace).not.toContain(`router.activate:${binding.runtimeId}:${binding.nodeId}`);
+    expect(f.workers.reconciliations).toEqual([[]]);
+    expect(f.logger.records).toContainEqual(expect.objectContaining({
+      level: 'warn',
+      event: expect.objectContaining({
+        event: 'binding_capability_sync_failed',
+        runtimeId: binding.runtimeId,
+        nodeId: binding.nodeId,
+        errorCode: 'operation_unavailable',
+      }),
+    }));
+    await f.service.stop();
+  });
+
+  it('keeps a cross-server binding saved but does not activate it during identity-preserving startup', async () => {
+    const root = await temporaryDirectory();
+    const binding = completeBinding('opencode', root);
+    const f = await fixture({ bindings: [binding] });
+    f.bindings.reregisterHook = async (runtimeId) => ({
+      runtimeId,
+      ok: false,
+      errorCode: 'server_identity_changed',
+    });
+
+    await expect(f.service.start()).resolves.toEqual(READY);
+
+    expect(f.bindings.values).toEqual([binding]);
+    expect(f.trace).not.toContain(`router.activate:${binding.runtimeId}:${binding.nodeId}`);
+    expect(f.workers.reconciliations).toEqual([[]]);
+    await f.service.stop();
+  });
+
+  it('aborts restored-binding refresh before activation when startup is stopped', async () => {
+    const root = await temporaryDirectory();
+    const binding = completeBinding('opencode', root);
+    const f = await fixture({ bindings: [binding] });
+    f.bindings.reregisterHook = (_runtimeId, options) => new Promise((_resolve, reject) => {
+      options?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), {
+        once: true,
+      });
+    });
+
+    const starting = f.service.start();
+    await vi.waitFor(() => expect(f.trace).toContain(`bindings.reregister:${binding.runtimeId}`));
+    await f.service.stop();
+
+    await expect(starting).rejects.toMatchObject({ code: 'operation_unavailable' });
+    expect(f.trace).not.toContain(`router.activate:${binding.runtimeId}:${binding.nodeId}`);
+    expect(f.trace.filter((entry) => entry === 'workers.reconcile')).toHaveLength(0);
+    expect(f.http.closeCalls).toBe(0);
+    expect(f.identityStore.removed).toEqual([STARTING]);
   });
 
   it('accepts a canonical Windows storage alias after checking the configured path for reparses', async () => {

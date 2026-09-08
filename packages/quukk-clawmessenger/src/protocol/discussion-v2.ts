@@ -185,8 +185,8 @@ export interface RoleRecommendationRequest {
 export interface RecommendedAssignment {
   roleName: string;
   rolePrompt: string;
-  nodeId: string;
-  model: string | null;
+  nodeId?: string;
+  model?: string | null;
   speakingOrder: number;
 }
 
@@ -500,24 +500,26 @@ function validNativeModel(value: unknown): value is string {
 export function parseRoleRecommendationRequest(value: unknown): RoleRecommendationRequest | null {
   if (!record(value)
     || !exactKeys(value, [
-      'msg_type', 'request_id', 'topic', 'goal', 'max_roles', 'candidates',
+      'msg_type', 'request_id', 'topic', 'goal', 'max_roles',
       'recommendation_prompt', 'config_version',
-    ])
+    ], ['candidates'])
     || value.msg_type !== 'discussion_role_recommendation_request'
     || !boundedId(value.request_id)
     || !bounded(value.topic, DISCUSSION_V2_LIMITS.maxTopic)
     || !bounded(value.goal, DISCUSSION_V2_LIMITS.maxGoal, true)
     || !integer(value.max_roles, 1)
     || value.max_roles > 8
-    || !Array.isArray(value.candidates)
-    || value.candidates.length < value.max_roles
-    || value.candidates.length > 8
     || !bounded(value.recommendation_prompt, 32_000, true)
     || !integer(value.config_version, 0)) return null;
 
+  const hasCandidates = Object.prototype.hasOwnProperty.call(value, 'candidates');
+  if (hasCandidates && (!Array.isArray(value.candidates)
+    || value.candidates.length < value.max_roles || value.candidates.length > 8)) return null;
+  // An absent list means role planning only; an explicitly empty list remains invalid.
+  const wireCandidates = hasCandidates ? value.candidates as unknown[] : [];
   const candidates: RoleRecommendationCandidate[] = [];
   const nodeIds = new Set<string>();
-  for (const candidate of value.candidates) {
+  for (const candidate of wireCandidates) {
     if (!record(candidate)
       || !exactKeys(candidate, [
         'node_id', 'display_name', 'runtime_type', 'capabilities',
@@ -568,30 +570,38 @@ export function parseRoleRecommendationResponse(
   if (!record(value) || !exactKeys(value, ['roles']) || !Array.isArray(value.roles)
     || value.roles.length < 1 || value.roles.length > request.maxRoles) return null;
   const candidates = new Map(request.candidates.map((candidate) => [candidate.nodeId, candidate]));
+  const assignDevices = candidates.size > 0;
   const names = new Set<string>();
   const nodes = new Set<string>();
   const orders: number[] = [];
   const roles: RecommendedAssignment[] = [];
   for (const role of value.roles) {
     if (!record(role)
-      || !exactKeys(role, ['role_name', 'role_prompt', 'node_id', 'model', 'speaking_order'])
+      || !exactKeys(role, assignDevices
+        ? ['role_name', 'role_prompt', 'node_id', 'model', 'speaking_order']
+        : ['role_name', 'role_prompt', 'speaking_order'])
       || !bounded(role.role_name, 80)
       || !bounded(role.role_prompt, 8_000)
-      || !boundedId(role.node_id)
+      || role.role_name.trim().length === 0 || role.role_prompt.trim().length === 0
       || !integer(role.speaking_order, 0)) return null;
-    const candidate = candidates.get(role.node_id);
-    const normalizedName = role.role_name.normalize('NFKC').toLocaleLowerCase();
-    if (!candidate || names.has(normalizedName) || nodes.has(role.node_id)
-      || (role.model !== null
-        && (!modelRoute(role.model) || !candidate.models.includes(role.model)))) return null;
+    const normalizedName = role.role_name.trim().normalize('NFKC').toLocaleLowerCase();
+    if (names.has(normalizedName)) return null;
+    let assignment: Pick<RecommendedAssignment, 'nodeId' | 'model'> = {};
+    if (assignDevices) {
+      if (!boundedId(role.node_id)) return null;
+      const candidate = candidates.get(role.node_id);
+      if (!candidate || nodes.has(role.node_id)
+        || (role.model !== null
+          && (!modelRoute(role.model) || !candidate.models.includes(role.model)))) return null;
+      nodes.add(role.node_id);
+      assignment = { nodeId: role.node_id, model: role.model };
+    }
     names.add(normalizedName);
-    nodes.add(role.node_id);
     orders.push(role.speaking_order);
     roles.push({
       roleName: role.role_name.trim(),
       rolePrompt: role.role_prompt.trim(),
-      nodeId: role.node_id,
-      model: role.model,
+      ...assignment,
       speakingOrder: role.speaking_order,
     });
   }

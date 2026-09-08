@@ -31,6 +31,11 @@ export type PairingSelectionInput = {
   authorization: PairingRegistrationAuthorization;
 };
 
+export type ReregisterOptions = {
+  signal?: AbortSignal;
+  preserveNodeIdentity?: boolean;
+};
+
 type RegistrationPort = Pick<RegistrationClient, 'getAppKey' | 'register' | 'refreshToken'>;
 
 export type BindingConfigSnapshotContext = {
@@ -482,7 +487,8 @@ export class BindingService {
     });
   }
 
-  async reregister(runtimeId: string): Promise<EnableResult> {
+  async reregister(runtimeId: string, options: ReregisterOptions = {}): Promise<EnableResult> {
+    const { signal, preserveNodeIdentity = false } = options;
     try {
       this.#store.assertExternalMutationAllowed();
     } catch (error) {
@@ -501,6 +507,9 @@ export class BindingService {
         ({ config } = await this.#configSnapshot());
       } catch {
         return failure(runtimeId, 'runtime_identity_changed');
+      }
+      if (preserveNodeIdentity && credential.serverUrl !== config.serverUrl) {
+        return failure(runtimeId, 'server_identity_changed');
       }
       try {
         catalog = await this.#runtimeSource.runtimes();
@@ -532,7 +541,7 @@ export class BindingService {
       try {
         await this.#store.saveBinding(pending);
         this.#replace(pending);
-        const applicationKey = await this.#registrationClient.getAppKey(config.serverUrl);
+        const applicationKey = await this.#registrationClient.getAppKey(config.serverUrl, signal);
         const identity = this.#store.bridgeIdentity();
         const input: RefreshInput = {
           serverUrl: config.serverUrl,
@@ -541,8 +550,9 @@ export class BindingService {
           provider: previous.provider,
           nodeId: previous.nodeId,
           nodeName: previous.nodeName,
+          existingNodeToken: credential.token,
         };
-        const refreshed = await this.#registrationClient.refreshToken(input);
+        const refreshed = await this.#registrationClient.refreshToken(input, signal);
         const committed = await this.#store.commitRegistration(
           {
             ...previous,
