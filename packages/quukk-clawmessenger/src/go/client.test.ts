@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { TextEncoder } from 'node:util';
 
 import { describe, expect, it, vi } from 'vitest';
@@ -368,6 +369,36 @@ describe('BridgeClient trust boundary', () => {
 });
 
 describe('BridgeClient SSE lifecycle', () => {
+  it('accepts the serialized Go stop_unconfirmed failed terminal without losing its session', async () => {
+    // Captured from json.Marshal(daemon.BridgeTaskEvent) and the exact
+    // bridge_http.go SSE format, using synthetic IDs/time and no provider data.
+    // Kept as wire text so TypeScript builders cannot hide a boundary mismatch.
+    const body = 'id: 3\nevent: failed\ndata: {"id":3,"type":"failed","task_id":"task_a_b","time":"2026-09-08T03:00:00Z","session_id":"agent:main:clawmessenger:test-session","error":{"category":"stop_unconfirmed","message":"The Gateway stop is unconfirmed; the run may still be active. Check the Gateway before retrying."}}\n\n';
+    const events = collect(clientWith(vi.fn(async () => sseResponse(body))).events(taskId, 2));
+    await expect(events).resolves.toEqual([{
+      id: 3,
+      type: 'failed',
+      task_id: taskId,
+      time: '2026-09-08T03:00:00Z',
+      session_id: 'agent:main:clawmessenger:test-session',
+      error: {
+        category: 'stop_unconfirmed',
+        message: 'The Gateway stop is unconfirmed; the run may still be active. Check the Gateway before retrying.',
+      },
+    }]);
+  });
+
+  it('still rejects unrecognized error categories without exposing wire messages', async () => {
+    const body = `id: 1\nevent: failed\ndata: ${JSON.stringify({
+      id: 1, type: 'failed', task_id: taskId, time: eventTime,
+      error: { category: 'provider_specific_unknown', message: secret },
+    })}\n\n`;
+    const error: unknown = await collect(clientWith(vi.fn(async () => sseResponse(body))).events(taskId))
+      .catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: 'sse_protocol_error' });
+    expect(String(error)).not.toContain(secret);
+  });
+
   it('validates event identity and preserves session/resume terminals', async () => {
     const offsetStarted = { ...started(), time: '2026-08-26T16:00:00+08:00' };
     const body = eventFrame(offsetStarted) + eventFrame(completed());

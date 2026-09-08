@@ -106,7 +106,7 @@ export const BridgeHealthSchema = z.strictObject({
 export type BridgeHealth = z.infer<typeof BridgeHealthSchema>;
 
 export const BridgeSafeErrorSchema = z.strictObject({
-  category: z.enum(['authentication', 'transport', 'runtime']),
+  category: z.enum(['authentication', 'transport', 'runtime', 'stop_unconfirmed']),
   message: nonEmptyString(512),
 });
 export type BridgeSafeError = z.infer<typeof BridgeSafeErrorSchema>;

@@ -1,9 +1,11 @@
+// @vitest-environment node
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { BridgeClient } from '../go/client.js';
 import type { BridgeTaskEvent, BridgeTaskPort } from '../go/types.js';
 import { DiscussionWireReassembler, encodeDiscussionWire } from '../protocol/discussion-wire.js';
 import { parseChatStreamEvent, type ChatStreamEvent } from '../protocol/chat-stream.js';
@@ -2227,6 +2229,43 @@ describe('MessageRouter task events and reconnect behavior', () => {
     expect(terminal.text).toBe(kind === 'failed' ? 'partial' : '');
     if (kind !== 'empty') expect(terminal.error_code).toBe('runtime_transport_error');
   });
+  it('preserves stop_unconfirmed from serialized SSE as one failed partial with the terminal session', async () => {
+    const fixture = await routerHarness();
+    const current = conversationFromForTest(IDENTITY_A);
+    await fixture.state.applyEventSession({ conversation: current, authoritativeSessionId: 'old-session' });
+    const providerMessage = 'raw-provider-error-secret-sentinel';
+    fixture.setEvents((taskId) => {
+      const frames = [
+        { id: 1, type: 'text_delta', task_id: taskId, time: '2026-09-08T08:00:00Z', text: 'partial answer' },
+        {
+          id: 2, type: 'failed', task_id: taskId, time: '2026-09-08T08:00:00Z',
+          session_id: 'agent:main:explicit:legacy-session', status: 'failed',
+          error: { category: 'stop_unconfirmed', message: providerMessage },
+        },
+        { id: 3, type: 'text_delta', task_id: taskId, time: '2026-09-08T08:00:00Z', text: 'late text' },
+        { id: 4, type: 'cancelled', task_id: taskId, time: '2026-09-08T08:00:00Z', session_id: 'late-session' },
+        { id: 5, type: 'completed', task_id: taskId, time: '2026-09-08T08:00:00Z', output: 'late final' },
+      ];
+      const body = frames.map((event) => `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join('');
+      const client = new BridgeClient({
+        baseUrl: 'http://127.0.0.1:49152', secret: 'test-only-bridge-secret',
+        fetch: async () => new Response(body, {
+          headers: { 'cache-control': 'no-store', 'content-type': 'text/event-stream' },
+        }),
+      });
+      return client.events(taskId);
+    });
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('unconfirmed-stop')));
+    const events = streamEvents(fixture.sent);
+    const terminals = events.filter((event) => !['processing', 'streaming'].includes(event.status));
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]).toMatchObject({ status: 'failed', error_code: 'stop_unconfirmed', text: 'partial answer' });
+    await expect(fixture.state.currentSession(current)).resolves.toBe('agent:main:explicit:legacy-session');
+    expect(JSON.stringify(fixture.sent)).not.toContain(providerMessage);
+    expect(JSON.stringify(fixture.sent)).not.toContain('late text');
+    expect(JSON.stringify(fixture.sent)).not.toContain('late final');
+  });
+
   it('emits cumulative stream snapshots before a terminal full body and targets cancellation precisely', async () => {
     vi.useFakeTimers();
     const fixture = await routerHarness();

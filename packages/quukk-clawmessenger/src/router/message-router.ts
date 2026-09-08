@@ -3391,7 +3391,9 @@ export class MessageRouter {
             ? 'runtime_needs_auth'
             : event.error.category === 'transport'
               ? 'runtime_transport_error'
-              : 'runtime_failed';
+              : event.error.category === 'stop_unconfirmed'
+                ? 'stop_unconfirmed'
+                : 'runtime_failed';
           active.streamStatus = 'failed';
           active.streamError = code;
           active.terminal = true;
