@@ -125,7 +125,7 @@ export function parseDiscussionV3(value: unknown): DiscussionV3Message | null {
         break;
       case 'discussion_contribution_delta':
       case 'discussion_contribution_completed':
-        valid = shape({ ...base, assignmentId: id, content: nonblank(L.maxContribution), idempotencyKey: id, ...(v.msg_type === 'discussion_contribution_delta' ? { seq: integer(0) } : {}) })(v);
+        valid = shape({ ...base, assignmentId: id, content: v.msg_type === 'discussion_contribution_delta' ? text(L.maxContribution) : nonblank(L.maxContribution), idempotencyKey: id, ...(v.msg_type === 'discussion_contribution_delta' ? { seq: integer(0) } : {}) })(v);
         break;
       case 'discussion_node_error':
         valid = shape({ ...base, category: choice('invalid_response', 'model_error', 'timeout'), message: text(L.maxReason), idempotencyKey: id }, { assignmentId: id })(v);

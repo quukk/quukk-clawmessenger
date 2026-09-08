@@ -7,7 +7,7 @@ import { DiscussionV3Router } from './discussion-v3-router.js';
 import { RouterStateStore } from './session-store.js';
 import { interactiveSessionKey } from './conversation.js';
 import type { BridgeTaskEvent, BridgeTaskStartInput } from '../go/types.js';
-import type { DiscussionV3Assignment, DiscussionV3Cancel, DiscussionV3Message } from '../protocol/discussion-v3.js';
+import { parseDiscussionV3, type DiscussionV3Assignment, type DiscussionV3Cancel, type DiscussionV3Message } from '../protocol/discussion-v3.js';
 const runtimeId = `rt_${'a'.repeat(32)}`;
 const identity = { runtimeId, nodeId: 'physical-node-1' };
 const now = 1788854400000;
@@ -27,6 +27,7 @@ function cancel(work = assignment()): DiscussionV3Cancel {
   return { protocolVersion: 3, msg_type: 'discussion_cancel', discussionId, chatroomId, stateVersion, round, roundRevision, timestamp: now, requestId: `cancel-${work.requestId}`, targetRequestId: work.requestId, targetMemberId: 'member-1', reason: 'Interjection' };
 }
 class FakeRuntime {
+  processedEvents = 0;
   instanceId = `br_${'a'.repeat(32)}`;
   starts: BridgeTaskStartInput[] = [];
   queues = new Map<string, {
@@ -74,6 +75,7 @@ class FakeRuntime {
         await new Promise<void>(resolve => { queue.wake = resolve; });
       const event = queue.events[index++]!;
       yield event;
+      this.processedEvents += 1;
       if (['completed', 'failed', 'cancelled'].includes(event.type))
         return;
     }
@@ -96,6 +98,50 @@ async function until(predicate: () => boolean) {
   for (let n = 0; n < 200 && !predicate(); n++)
     await new Promise(resolve => setTimeout(resolve, 2)); expect(predicate()).toBe(true);
 }
+it('acknowledges failed when terminal proof persistence fails and retries safely', async () => {
+  const h = await setup(); h.runtime.loseResponse = true;
+  await h.router.handle('system', assignment());
+  const update = h.state.updateInteractive.bind(h.state);
+  let fail = true;
+  h.state.updateInteractive = async (key, changes, sessionId) => {
+    if (fail && changes.status === 'terminal') { fail = false; throw new Error('injected disk failure'); }
+    return update(key, changes, sessionId);
+  };
+  await h.router.handle('system', cancel());
+  expect(h.sent.at(-1)).toMatchObject({ msg_type: 'discussion_cancel_ack', result: 'failed' });
+  expect((await h.state.interactiveRequests(identity))[0]).toMatchObject({ status: 'unconfirmed', cancelResult: 'failed' });
+  await h.router.handle('system', { ...assignment('replacement'), roundRevision: 1 });
+  expect(h.runtime.starts).toHaveLength(1);
+  const restarted = await setup(h.runtime, h.filePath);
+  await restarted.router.handle('system', cancel());
+  expect(restarted.sent.at(-1)).toMatchObject({ result: 'cancelled' });
+  expect((await restarted.state.interactiveRequests(identity))[0]).toMatchObject({ status: 'terminal', cancelResult: 'cancelled' });
+});
+it('never reports cancelled when terminal session proof conflicts with another owner', async () => {
+  const h = await setup(); h.runtime.loseResponse = true;
+  await h.router.handle('system', assignment());
+  await h.state.applyEventSession({ conversation: { ...identity, conversationType: 1, targetId: 'human', senderId: 'human' }, authoritativeSessionId: 'other-owned-session' });
+  Object.assign(h.runtime, { fenceTask: async () => ({ result: 'cancelled', session_id: 'other-owned-session' }) });
+  await h.router.handle('system', cancel());
+  expect(h.sent.at(-1)).toMatchObject({ result: 'failed' });
+  await h.router.handle('system', cancel());
+  expect(h.sent.at(-1)).toMatchObject({ result: 'failed' });
+  expect((await h.state.interactiveRequests(identity))[0]).toMatchObject({ status: 'unconfirmed', cancelResult: 'failed' });
+  await h.router.handle('system', { ...assignment('replacement'), roundRevision: 1 });
+  expect(h.runtime.starts).toHaveLength(1);
+});
+it('preserves every whitespace delta through an interrupted partial contribution', async () => {
+  const h = await setup(); const running = h.router.handle('system', assignment());
+  await until(() => h.runtime.starts.length === 1);
+  const chunks = ['Hello', ' ', 'world', '\n', 'Next', '  '];
+  for (const text of chunks) h.runtime.emit(h.runtime.starts[0]!.requestId!, { type: 'text_delta', text });
+  await until(() => h.runtime.processedEvents === chunks.length);
+  await h.router.handle('system', cancel()); await running;
+  const deltas = h.sent.filter(event => event.msg_type === 'discussion_contribution_delta');
+  expect(deltas.map(event => event.content)).toEqual(chunks);
+  expect(deltas.every(event => parseDiscussionV3(event) !== null)).toBe(true);
+  expect(h.sent.some(event => event.msg_type === 'discussion_contribution_completed')).toBe(false);
+});
 it('replays a proven terminal response while runtime is unavailable', async () => {
   const h = await setup();
   const work = assignment();

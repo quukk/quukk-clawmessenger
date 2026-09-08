@@ -3,13 +3,19 @@ import { readFileSync } from 'node:fs';
 const fixture = JSON.parse(readFileSync(new URL('./fixtures/discussion-v3-messages.json', import.meta.url), 'utf8'));
 import { parseDiscussionV3, matchesDiscussionV3CancelAck } from './discussion-v3.js';
 import { createHash } from 'node:crypto';
+it('accepts nonempty whitespace deltas while completed contributions remain nonblank',()=>{
+  for (const content of [' ', '\n', '\t  ']) {
+    expect(parseDiscussionV3({...fixture.valid.delta,content})).not.toBeNull();
+    expect(parseDiscussionV3({...fixture.valid.completed,content})).toBeNull();
+  }
+  expect(parseDiscussionV3({...fixture.valid.delta,content:''})).toBeNull();
+});
 const runtimeFixture = JSON.parse(readFileSync(new URL('./fixtures/discussion-wire-cross-runtime.json', import.meta.url), 'utf8'));
 for (const bucket of ['valid','invalid'] as const) {
   for (const event of runtimeFixture.v3EventContracts[bucket]) {
     it(`validates public v3 ${event.eventType} (${bucket})`,()=>{
       const message = {...fixture.valid.event,...event};
-      if(event.eventType==='request_interrupted') message.requestId=event.data.targetRequestId;
-      if(event.eventType==='interjection_applied') message.requestId=event.data.replacementRequestId;
+      if(event.requestId !== undefined) message.requestId=event.requestId;
       expect(parseDiscussionV3(message)!==null).toBe(bucket==='valid');
     });
   }

@@ -43,6 +43,24 @@ it('rejects a runtime session already owned by another discussion', async () => 
   await h.state.reserveInteractive(b);
   await expect(h.state.updateInteractive(b.key, { status: 'terminal' }, 'session-one')).rejects.toMatchObject({ code: 'session_conflict' });
 });
+it('rejects ordinary adoption of an interactive-owned runtime session', async () => {
+  const h = await setup(); const a = record();
+  await h.state.reserveInteractive(a); await h.state.updateInteractive(a.key, { status: 'terminal' }, 'owned');
+  await expect(h.state.applyEventSession({ conversation: { runtimeId, nodeId: 'n', conversationType: 1, senderId: 'human', targetId: 'human' }, authoritativeSessionId: 'owned' })).rejects.toMatchObject({ code: 'session_conflict' });
+});
+it('rejects persisted ordinary-interactive and interactive-interactive session collisions', async () => {
+  const h = await setup(); const a = record();
+  await h.state.reserveInteractive(a); await h.state.updateInteractive(a.key, { status: 'terminal' }, 'owned');
+  await h.state.applyEventSession({ conversation: { runtimeId, nodeId: 'n', conversationType: 1, senderId: 'human', targetId: 'human' }, authoritativeSessionId: 'ordinary' });
+  const state = JSON.parse(await readFile(h.filePath, 'utf8'));
+  for (const collision of [
+    { ...state, interactiveSessions: { [a.sessionKey]: 'ordinary' } },
+    { ...state, interactiveSessions: { ...state.interactiveSessions, [interactiveSessionKey(runtimeId, 'other', 'discussion', 'other')]: 'owned' } },
+  ]) {
+    await writeFile(h.filePath, JSON.stringify(collision));
+    await expect(new RouterStateStore({ filePath: h.filePath }).initialize()).rejects.toMatchObject({ code: 'router_state_invalid' });
+  }
+});
 it('retains trusted room classification across restart and terminal request expiry', async () => {
   const h = await setup();
   await h.state.rememberInteractiveRoom({ runtimeId, nodeId: 'n' }, 'room', 'd');

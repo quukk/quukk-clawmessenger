@@ -1821,6 +1821,7 @@ const hermesDiscoveryTimeout = 40 * time.Second
 // `--acp`), and what to label temporary work directories so they're
 // easy to identify in logs.
 type acpDiscoveryProvider struct {
+	processStartOptions processTreeStartOptions
 	// initializeOnly reads protocol capabilities without opening a model session.
 	initializeOnly   bool
 	defaultBin       string
@@ -1922,7 +1923,11 @@ func discoverACPModels(ctx context.Context, runtimeCmd Command, p acpDiscoveryPr
 	// Discard stderr; noisy logs here don't help us and we don't
 	// want them bleeding into the daemon log every 60s.
 	cmd.Stderr = io.Discard
-	if err := startOwnedProcessTree(cmd, runtimeCmd.logger); err != nil {
+	startOptions := p.processStartOptions
+	startOptions.requireOwnership = p.initializeOnly
+	if err := startOwnedProcessTree(cmd, runtimeCmd.logger, startOptions); err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
 		return fail("process start", err)
 	}
 	// Ensure the child process and everything it spawned are always reaped.

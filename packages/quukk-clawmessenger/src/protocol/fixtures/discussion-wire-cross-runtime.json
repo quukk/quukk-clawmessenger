@@ -20,8 +20,8 @@
   ],
   "v3EventContracts": {
     "valid": [
-      {"eventType":"request_interrupted","data":{"targetRequestId":"task-1","targetMemberId":"member-1","reason":"user_interjection","partialPreserved":true}},
-      {"eventType":"interjection_applied","data":{"messageUid":"opinion-1","targetRequestId":null,"replacementRequestId":"task-2"}},
+      {"eventType":"request_interrupted","requestId":"task-1","data":{"targetRequestId":"task-1","targetMemberId":"member-1","reason":"user_interjection","partialPreserved":true}},
+      {"eventType":"interjection_applied","requestId":"task-2","data":{"messageUid":"opinion-1","targetRequestId":null,"replacementRequestId":"task-2"}},
       {"eventType":"interruption_failed","data":{"targetRequestId":"task-1","targetMemberId":"member-1","reason":"cancel_unconfirmed","retryable":true}},
       {"eventType":"discussion_started","data":{"roundPolicy":"user_confirmed"}},
       {"eventType":"discussion_completed","data":{"reason":"user_finished"}},
@@ -30,6 +30,8 @@
       {"eventType":"discussion_progress","data":{}}
     ],
     "invalid": [
+      {"eventType":"request_interrupted","requestId":"wrong-task","data":{"targetRequestId":"task-1","targetMemberId":"member-1","reason":"user_interjection","partialPreserved":true}},
+      {"eventType":"interjection_applied","requestId":"wrong-task","data":{"messageUid":"opinion-1","targetRequestId":null,"replacementRequestId":"task-2"}},
       {"eventType":"request_interrupted","data":{"targetRequestId":"task-1","targetMemberId":"member-1","reason":"user_interjection","partialPreserved":false}},
       {"eventType":"discussion_progress","data":{"privatePrompt":"must-not-leak"}},
       {"eventType":"discussion_failed","data":{"reason":"cancel_timeout","retryable":true}}

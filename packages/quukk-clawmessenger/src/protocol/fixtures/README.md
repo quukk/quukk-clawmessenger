@@ -33,6 +33,8 @@ All fixtures in this directory are offline protocol data. They contain no creden
 
 ## `discussion-wire-cross-runtime.json`
 
+- Task 5 review correction: canonical S LF fixture now includes explicit event envelope request IDs and mismatched-envelope invalid cases; SHA-256 `5f5611703cde12c4f0077d4fa418fcf4d8c44d90229ff8d9c027aa9d9239ebec`, 35839 bytes. The paired `discussion-v3-messages.json` adds nonempty whitespace delta/empty delta cases; SHA-256 `03064be2d394f48c0627db6cb77339f5e2f9ca86602601ddadadb4cf1a45cb9c`. Completed contributions and host summaries remain nonblank.
+
 - Interactive-round extension synchronized from S commit `b3c91ef` on 2026-09-08: `v3EventContracts.valid/invalid` adds the public interruption/lifecycle/progress schema cases. Canonical LF SHA-256: `819f2a3f9673638ee219508dbe17c22f7cd1af6e233e73bcae9ee3ab813bf103`; Git blob `8f334032239bf203d006af4b0ae7cefe84009792`. The historical provenance below describes the unchanged original wire-frame portion.
 
 - Original generator/server repository: https://github.com/quukk/clawmessenger-server

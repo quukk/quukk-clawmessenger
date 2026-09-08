@@ -409,11 +409,15 @@ it('dispatches authenticated v3 through the interactive runtime using a durable 
  const h=await routerHarness({interactiveAvailable:async()=>true});
  Object.assign(h.task,{health:async()=>({instance_id:`br_${'a'.repeat(32)}`}),fenceTask:async()=> 'not_started'});
  h.setStart(async input=>{h.starts.push(input);return {taskId:input.requestId!,eventsUrl:`/v1/tasks/${input.requestId}/events`};});
- h.setEvents(taskId=>(async function*(){yield bridgeEvent(taskId,'completed',{output:'Interactive contribution'});})());
+ h.setEvents(taskId=>(async function*(){
+  for (const text of ['Hello', ' ', 'world', '\n', '  ']) yield bridgeEvent(taskId,'text_delta',{text});
+  yield bridgeEvent(taskId,'completed',{output:'Interactive contribution'});
+ })());
  const command={...discussionAssignment(),protocolVersion:3,roundRevision:0,timestamp:100,mode:'roundtable',model:null,role:{roleName:'Reviewer',roleInstructions:'Evaluate'},speakingOrder:0,roundFocus:'Migration',priorContributions:[],roundSummaries:[],userInterjections:[],attempt:1};
  await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,sdkPrivateProtocolMessage('v3-inbound',command)));
  expect(h.starts).toHaveLength(1);expect(h.starts[0]?.requestId).toMatch(/^task_/);
  expect(h.sent.some(({input})=>input.messageType==='command_result'&&input.content.protocolVersion===3&&input.content.msg_type==='discussion_contribution_completed')).toBe(true);
+ expect(h.sent.filter(({input})=>input.content.msg_type==='discussion_contribution_delta').map(({input})=>input.content.content)).toEqual(['Hello', ' ', 'world', '\n', '  ']);
  for(const [uid,text] of [['plain-opinion','My opinion'],['slash-opinion','/new']]) {
   await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,message(uid!,text!,{conversationType:4,targetId:command.chatroomId})));
  }

@@ -191,7 +191,7 @@ export class DiscussionV3Router {
           output += event.text;
           if (output.length > 100000)
             throw new Error('output_too_large');
-          if (command.msg_type === 'discussion_assignment' && event.text.trim())
+          if (command.msg_type === 'discussion_assignment')
             await this.#options.send({ ...discussionV3Identity(command), msg_type: 'discussion_contribution_delta', assignmentId: command.assignmentId, content: event.text, seq: seq++, idempotencyKey: discussionV3ResponseKey(command.requestId, `delta:${seq}`) });
         }
         if (event.type === 'completed' || event.type === 'failed' || event.type === 'cancelled') {
@@ -231,6 +231,8 @@ export class DiscussionV3Router {
     let result: CancelResult = 'failed';
     let record: InteractiveRequest | undefined;
     try {
+      let confirmedResult: CancelResult;
+      let sessionId: string | undefined;
       const key = this.#key(sender, command.discussionId, command.targetRequestId);
       record = await state.interactiveRequest(key);
       if (!record)
@@ -239,23 +241,26 @@ export class DiscussionV3Router {
         || command.stateVersion < record.stateVersion || command.roundRevision < record.roundRevision)
         return;
       if (record.cancelResult && record.cancelResult !== 'failed')
-        result = record.cancelResult;
+        confirmedResult = record.cancelResult;
       else if (record.status === 'terminal')
-        result = 'already_terminal';
+        confirmedResult = 'already_terminal';
       else {
         await state.updateInteractive(record.key, { status: 'cancel_pending' });
         if ((await task.health()).instance_id !== record.instanceId)
           throw new Error('instance_changed');
         const proof = await this.#fence(record.taskId);
-        result = proof.result;
-        if (proof.session_id)
-          await state.updateInteractive(record.key, {}, proof.session_id);
+        confirmedResult = proof.result;
+        sessionId = proof.session_id;
       }
-      await state.updateInteractive(record.key, { status: 'terminal', cancelResult: result });
+      await state.updateInteractive(record.key, { status: 'terminal', cancelResult: confirmedResult }, sessionId);
+      result = confirmedResult;
     }
     catch {
-      if (record)
-        await state.updateInteractive(record.key, { status: 'unconfirmed', cancelResult: 'failed' });
+      result = 'failed';
+      if (record) {
+        try { await state.updateInteractive(record.key, { status: 'unconfirmed', cancelResult: 'failed' }); }
+        catch { /* The existing durable reservation still prevents unsafe replacement. */ }
+      }
     }
     await this.#options.send({ ...discussionV3Identity(command), msg_type: 'discussion_cancel_ack', targetRequestId: command.targetRequestId, targetMemberId: command.targetMemberId, result });
   }

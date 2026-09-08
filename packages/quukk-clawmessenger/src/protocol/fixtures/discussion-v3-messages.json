@@ -1,5 +1,11 @@
 {
   "valid": {
+    "whitespaceDelta": {
+      "msg_type": "discussion_contribution_delta", "protocolVersion": 3,
+      "discussionId": "discussion-1", "chatroomId": "room-1", "requestId": "request-1",
+      "stateVersion": 4, "round": 1, "roundRevision": 0, "timestamp": 1723950002000,
+      "assignmentId": "assignment-1", "content": " \n\t", "seq": 0, "idempotencyKey": "whitespace-delta"
+    },
     "summaryNextLine": {
       "protocolVersion": 3,
       "discussionId": "discussion-1",
@@ -444,6 +450,15 @@
     }
   },
   "invalid": [
+    {
+      "name": "empty delta",
+      "message": {
+        "msg_type": "discussion_contribution_delta", "protocolVersion": 3,
+        "discussionId": "discussion-1", "chatroomId": "room-1", "requestId": "request-1",
+        "stateVersion": 4, "round": 1, "roundRevision": 0, "timestamp": 1723950002000,
+        "assignmentId": "assignment-1", "content": "", "seq": 0, "idempotencyKey": "empty-delta"
+      }
+    },
     {
       "name": "summary BOM is whitespace",
       "message": {

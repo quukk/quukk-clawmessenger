@@ -13,6 +13,10 @@ import (
 // ACP probes initialize only; Gateway probes authenticate only. Neither creates
 // a session, sends a prompt, or requests model output.
 func ProbeInteractiveRuntime(ctx context.Context, provider string, command Command, version string) (bool, error) {
+	return probeInteractiveRuntime(ctx, provider, command, version, processTreeStartOptions{})
+}
+
+func probeInteractiveRuntime(ctx context.Context, provider string, command Command, version string, startOptions processTreeStartOptions) (bool, error) {
 	if !filepath.IsAbs(command.Path) {
 		return false, errors.New("interactive probe requires an explicit executable")
 	}
@@ -26,7 +30,8 @@ func ProbeInteractiveRuntime(ctx context.Context, provider string, command Comma
 	case "opencode", "hermes":
 		supported := false
 		_, err := discoverACPModels(ctx, command, acpDiscoveryProvider{
-			defaultBin: provider, clientName: "bridge-capability-probe", tmpdirPrefix: "bridge-probe-", strictErrors: true, initializeOnly: true, timeout: 5 * time.Second,
+			processStartOptions: startOptions,
+			defaultBin:          provider, clientName: "bridge-capability-probe", tmpdirPrefix: "bridge-probe-", strictErrors: true, initializeOnly: true, timeout: 5 * time.Second,
 			inspectInit: func(raw json.RawMessage) {
 				var result struct {
 					ProtocolVersion   int `json:"protocolVersion"`

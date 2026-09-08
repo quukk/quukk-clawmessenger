@@ -15,6 +15,9 @@ func init() {
 	if os.Getenv("MULTICA_INTERACTIVE_PROBE_FIXTURE") != "1" {
 		return
 	}
+	if marker := os.Getenv("MULTICA_INTERACTIVE_PROBE_STARTED_MARKER"); marker != "" {
+		_ = os.WriteFile(marker, []byte("executed"), 0600)
+	}
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		var request struct {

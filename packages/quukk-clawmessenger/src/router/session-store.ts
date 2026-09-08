@@ -187,6 +187,12 @@ function validateState(value: unknown): RouterState {
   }
 
   const dedupKeys = new Set<string>();
+  for (const [key, sessionId] of Object.entries(state.interactiveSessions)) {
+    const owner = parseInteractiveSessionOwner(key);
+    const ownerKey = JSON.stringify([owner[0], sessionId]);
+    if (sessionOwners.has(ownerKey)) throw new RouterStateError('router_state_invalid');
+    sessionOwners.add(ownerKey);
+  }
   for (const entry of state.dedup) {
     if (entry.key !== dedupKey(entry.runtimeId, entry.messageUid)
       || dedupKeys.has(entry.key)
@@ -225,6 +231,9 @@ function assertSessionAvailable(
   sessionId: string,
 ): void {
   const expectedOwner = conversationKey(identity);
+  if (Object.entries(state.interactiveSessions).some(([key, owned]) => owned === sessionId && parseInteractiveSessionOwner(key)[0] === identity.runtimeId)) {
+    throw new RouterStateError('session_conflict');
+  }
   for (const entry of state.sessions) {
     if (entry.runtimeId === identity.runtimeId
       && entry.conversationKey !== expectedOwner
@@ -232,6 +241,16 @@ function assertSessionAvailable(
       throw new RouterStateError('session_conflict');
     }
   }
+}
+
+function parseInteractiveSessionOwner(key: string): [string, string, 'discussion', string] {
+  try {
+    const owner: unknown = JSON.parse(key);
+    if (!Array.isArray(owner) || owner.length !== 4 || !runtimeId.safeParse(owner[0]).success
+      || !identifier(137).safeParse(owner[1]).success || owner[2] !== 'discussion'
+      || !identifier(256).safeParse(owner[3]).success || JSON.stringify(owner) !== key) throw new Error('invalid owner');
+    return owner as [string, string, 'discussion', string];
+  } catch { throw new RouterStateError('router_state_invalid'); }
 }
 
 function acceptAuthoritative(entry: SessionEntry, sessionId: string, now: number): void {
@@ -353,7 +372,7 @@ export class RouterStateStore {
       if (!entry) throw new RouterStateError('router_state_invalid');
       Object.assign(entry, changes);
       if (sessionId !== undefined && state.interactiveHeads[entry.sessionKey]?.key === key) {
-        if (Object.entries(state.interactiveSessions).some(([owner,owned]) => owned === sessionId && owner !== entry.sessionKey && JSON.parse(owner)[0] === entry.runtimeId)
+        if (Object.entries(state.interactiveSessions).some(([owner,owned]) => owned === sessionId && owner !== entry.sessionKey && parseInteractiveSessionOwner(owner)[0] === entry.runtimeId)
           || state.sessions.some(owner => owner.runtimeId === entry.runtimeId && owner.knownSessions.some(known => known.sessionId === sessionId))) throw new RouterStateError('session_conflict');
         state.interactiveSessions[entry.sessionKey] = this.#sessionId(sessionId);
       }

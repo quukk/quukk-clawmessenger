@@ -92,12 +92,18 @@ type jobObjectBasicAccountingInformation struct {
 // the escaped app-server is still running, and cleanup would be reported as
 // confirmed when it is not.
 //
-// The child is never left suspended. If ownership cannot be taken it is resumed
-// anyway and runs unowned, exactly as it did before Job Objects, with the reason
-// logged. Only a failure to resume is unrecoverable: that child is killed and
-// the error returned, so the caller fails the launch instead of waiting forever
-// on a process that will never run.
-func startOwnedProcessTree(cmd *exec.Cmd, logger *slog.Logger) error {
+// Legacy callers resume without ownership if assignment fails, with a warning.
+// Strict readiness probes instead kill and reap the still-suspended child and
+// fail before resume. A resume failure is likewise killed/reaped for all callers.
+func startOwnedProcessTree(cmd *exec.Cmd, logger *slog.Logger, options ...processTreeStartOptions) error {
+	policy := processTreeStartOptions{}
+	if len(options) > 0 {
+		policy = options[0]
+	}
+	takeOwnership := ownProcessTree
+	if policy.takeOwnership != nil {
+		takeOwnership = policy.takeOwnership
+	}
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
@@ -107,16 +113,26 @@ func startOwnedProcessTree(cmd *exec.Cmd, logger *slog.Logger) error {
 		return err
 	}
 
-	if err := ownProcessTree(cmd); err != nil && logger != nil {
+	if err := takeOwnership(cmd); err != nil {
+		if policy.requireOwnership {
+			// No child instruction has run: only this suspended direct child
+			// exists, so kill/reap it without resuming an unowned process.
+			releaseProcessGroup(cmd)
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return fmt.Errorf("required process tree ownership: %w", err)
+		}
 		// Deliberately fail open. Failing the launch instead would take a host
 		// down entirely rather than degrade it, and the realistic causes are
 		// environmental — an outer job that forbids assignment, or a hardened
 		// policy denying PROCESS_SET_QUOTA — not per-task. The consequence is
 		// named in the message because it is the only signal an operator gets
 		// that cancellation on this host is back to killing the leader alone.
-		logger.Warn("could not take ownership of the agent process tree; cancelling or timing out this "+
-			"process will kill only the direct child and can leave its descendants running",
-			"error", err, "pid", cmd.Process.Pid, "executable", cmd.Path)
+		if logger != nil {
+			logger.Warn("could not take ownership of the agent process tree; cancelling or timing out this "+
+				"process will kill only the direct child and can leave its descendants running",
+				"error", err, "pid", cmd.Process.Pid, "executable", cmd.Path)
+		}
 	}
 
 	if err := resumeProcess(cmd.Process.Pid); err != nil {

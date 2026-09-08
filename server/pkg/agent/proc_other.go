@@ -38,7 +38,9 @@ func configureProcessGroup(cmd *exec.Cmd) {
 //
 // It is still the only way this package starts a long-lived runtime process,
 // so the two platforms share one call site per backend.
-func startOwnedProcessTree(cmd *exec.Cmd, _ *slog.Logger) error { return cmd.Start() }
+func startOwnedProcessTree(cmd *exec.Cmd, _ *slog.Logger, _ ...processTreeStartOptions) error {
+	return cmd.Start()
+}
 
 // releaseProcessGroup is a no-op on non-Windows platforms: a process group needs
 // no handle and is gone once its members are.
