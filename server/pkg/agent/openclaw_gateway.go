@@ -594,15 +594,28 @@ func (b *openclawBackend) executeGateway(ctx context.Context, prompt string, opt
 	return &Session{Messages: msgCh, Result: resCh}, nil
 }
 
-// chat.abort acknowledges a targeted cancellation request, not final teardown.
-// history's active-run projection includes terminal persistence. Require an
-// explicit absence of this exact run before reporting stopped; other run IDs
-// may remain active and are never cancelled by this adapter.
+// A send may still be in asynchronous pre-admission when cancellation arrives.
+// A no-op abort and history absence are not a fence against later admission.
+// Require a positive abort acknowledgement naming this exact run, then its
+// absence from history's active-run projection (including terminal persistence).
+// Until that fence exists, retry only the targeted abort within the stop budget.
 func (c *openclawGatewayClient) confirmStop(ctx context.Context, key, agentID, runID string) error {
-	if _, err := c.request(ctx, "chat.abort", map[string]any{"sessionKey": key, "agentId": agentID, "runId": runID}); err != nil {
-		return err
-	}
+	abortConfirmed := false
 	for {
+		if !abortConfirmed {
+			raw, err := c.request(ctx, "chat.abort", map[string]any{"sessionKey": key, "agentId": agentID, "runId": runID})
+			if err != nil {
+				return err
+			}
+			var acknowledgement struct {
+				Aborted bool     `json:"aborted"`
+				RunIDs  []string `json:"runIds"`
+			}
+			if json.Unmarshal(raw, &acknowledgement) != nil {
+				return errors.New("invalid Gateway abort acknowledgement")
+			}
+			abortConfirmed = acknowledgement.Aborted && slices.Contains(acknowledgement.RunIDs, runID)
+		}
 		raw, err := c.request(ctx, "chat.history", map[string]any{"sessionKey": key, "agentId": agentID, "limit": 1})
 		if err != nil {
 			return err
@@ -617,7 +630,7 @@ func (c *openclawGatewayClient) confirmStop(ctx context.Context, key, agentID, r
 			return errors.New("invalid Gateway stop confirmation")
 		}
 		info := history.SessionInfo
-		if info.HasActiveRun != nil && !*info.HasActiveRun || info.ActiveRunIDs != nil && !slices.Contains(*info.ActiveRunIDs, runID) {
+		if abortConfirmed && (info.HasActiveRun != nil && !*info.HasActiveRun || info.ActiveRunIDs != nil && !slices.Contains(*info.ActiveRunIDs, runID)) {
 			return nil
 		}
 		timer := time.NewTimer(100 * time.Millisecond)

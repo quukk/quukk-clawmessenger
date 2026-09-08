@@ -37,13 +37,14 @@ type openclawGatewayFixture struct {
 	}
 	release  chan struct{}
 	aborted  chan struct{}
+	received chan struct{}
 	config   string
 	run, key string
 }
 
 func newOpenclawGatewayFixture(t *testing.T, mode string) *openclawGatewayFixture {
 	t.Helper()
-	f := &openclawGatewayFixture{t: t, mode: mode, release: make(chan struct{}), aborted: make(chan struct{})}
+	f := &openclawGatewayFixture{t: t, mode: mode, release: make(chan struct{}), aborted: make(chan struct{}), received: make(chan struct{})}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
 		if err != nil {
@@ -57,6 +58,7 @@ func newOpenclawGatewayFixture(t *testing.T, mode string) *openclawGatewayFixtur
 		run, key := f.run, f.key
 		f.mu.Unlock()
 		var historyChecks int
+		var admitted, abortConfirmed bool
 		for {
 			var req struct {
 				ID     string         `json:"id"`
@@ -119,6 +121,11 @@ func newOpenclawGatewayFixture(t *testing.T, mode string) *openclawGatewayFixtur
 					fail()
 					continue
 				}
+				close(f.received)
+				if strings.HasPrefix(f.mode, "preadmission-") {
+					// Receipt is not admission: no ack, text, or abortable run yet.
+					continue
+				}
 				if f.mode == "send-error" {
 					fail()
 					continue
@@ -135,6 +142,7 @@ func newOpenclawGatewayFixture(t *testing.T, mode string) *openclawGatewayFixtur
 					reply(map[string]any{"runId": run, "status": "started"})
 				}
 				chunk("foreign-run", "final", "foreign text")
+				send(map[string]any{"type": "event", "event": "chat", "payload": map[string]any{"runId": run, "sessionKey": "agent:other:unrelated", "state": "final", "message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "wrong session text"}}}}})
 				chunk(run, "delta", "Hello ")
 				if f.mode == "eof" {
 					return
@@ -172,6 +180,17 @@ func newOpenclawGatewayFixture(t *testing.T, mode string) *openclawGatewayFixtur
 					fail()
 					continue
 				}
+				if strings.HasPrefix(f.mode, "preadmission-") && !admitted {
+					ids := []string{}
+					if f.mode == "preadmission-wrong-run" {
+						ids = []string{"other-running-turn"}
+					} else if f.mode == "preadmission-false-owned" {
+						ids = []string{run}
+					}
+					reply(map[string]any{"ok": true, "aborted": f.mode == "preadmission-wrong-run", "runIds": ids})
+					continue
+				}
+				abortConfirmed = true
 				select {
 				case <-f.aborted:
 				default:
@@ -182,10 +201,20 @@ func newOpenclawGatewayFixture(t *testing.T, mode string) *openclawGatewayFixtur
 			case "chat.history":
 				historyChecks++
 				ids := []string{"other-running-turn"}
-				if historyChecks == 1 || f.mode == "unconfirmed" {
+				if strings.HasPrefix(f.mode, "preadmission-") {
+					if f.mode == "preadmission-visible" && !abortConfirmed {
+						// Admission completes between the first no-op abort and history.
+						admitted = true
+						ids = append(ids, run)
+					}
+				} else if historyChecks == 1 || f.mode == "unconfirmed" {
 					ids = append(ids, run)
 				}
 				reply(map[string]any{"sessionKey": key, "sessionInfo": map[string]any{"hasActiveRun": true, "activeRunIds": ids}, "messages": []any{map[string]any{"role": "assistant", "content": "OLD HISTORY"}}})
+				if f.mode == "preadmission-absent" {
+					// The first absence predates admission. It cannot fence the send.
+					admitted = true
+				}
 			default:
 				fail()
 			}
@@ -351,6 +380,81 @@ func TestOpenclawGatewayCancellationRequiresExactRunConfirmation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestOpenclawGatewayCancellationFencesDelayedAdmission(t *testing.T) {
+	for _, mode := range []string{"preadmission-absent", "preadmission-visible", "preadmission-never", "preadmission-wrong-run", "preadmission-false-owned"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newOpenclawGatewayFixture(t, mode)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			s, err := f.execute(t, ctx, ExecOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-f.received:
+			case <-time.After(3 * time.Second):
+				t.Fatal("Gateway did not receive send")
+			}
+			started := time.Now()
+			cancel()
+			r := openCodeACPResult(t, s)
+			if time.Since(started) > openclawGatewayStopBudget+time.Second {
+				t.Fatal("cleanup exceeded bounded stop budget")
+			}
+			if mode != "preadmission-absent" && mode != "preadmission-visible" {
+				if r.Status != "failed" || !r.CancelUnconfirmed || !strings.Contains(r.Error, "stop unconfirmed") {
+					t.Fatalf("absence without admission fence falsely confirmed: %+v", r)
+				}
+			} else {
+				if r.Status != "aborted" || r.CancelUnconfirmed {
+					t.Fatalf("later-admitted run was not stopped: %+v", r)
+				}
+				select {
+				case <-f.aborted:
+				default:
+					t.Fatal("accepted absence before later admission without a positive exact abort")
+				}
+			}
+			if r.SessionID == "" || r.Output != "" || strings.Contains(r.Error, "secret-token") {
+				t.Fatalf("lost session or leaked history/credentials: %+v", r)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			aborts := 0
+			for _, req := range f.requests {
+				if req.Method == "chat.abort" {
+					aborts++
+					if req.Params["runId"] != f.run || req.Params["sessionKey"] != f.key {
+						t.Fatalf("non-targeted cleanup: %+v", req)
+					}
+				}
+			}
+			if aborts < 2 {
+				t.Fatalf("did not retry initial no-op abort: %d", aborts)
+			}
+		})
+	}
+}
+
+func TestOpenclawGatewayCompletedResultSurvivesCancelledHandoff(t *testing.T) {
+	f := newOpenclawGatewayFixture(t, "normal")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, err := f.execute(t, ctx, ExecOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range s.Messages {
+	}
+	// Final processing has closed the stream. Cancel before accepting the
+	// buffered result, as a bridge caller can do during the result handoff.
+	cancel()
+	r := openCodeACPResult(t, s)
+	if r.Status != "completed" || !r.CompletionConfirmed || r.CancelUnconfirmed || r.Output != "Hello world!" {
+		t.Fatalf("recognized final lost at cancelled handoff: %+v", r)
 	}
 }
 
