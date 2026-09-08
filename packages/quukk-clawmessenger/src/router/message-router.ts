@@ -7,7 +7,7 @@ import {
   type CardActionRoute,
 } from '../cardkit/action-router.js';
 import { buildCardMessage, buildCardUpdate } from '../cardkit/builders.js';
-import { INVALID_CARD_MARKER_TEXT, parseCardMarkers, streamSafeContent } from '../cardkit/parse-marker.js';
+import { INVALID_CARD_MARKER_TEXT, MAX_CARD_MARKERS, parseCardMarkers, streamSafeContent } from '../cardkit/parse-marker.js';
 import type { CardModel } from '../cardkit/schema.js';
 import { validateCard } from '../cardkit/validate.js';
 import type { Provider } from '../config/schema.js';
@@ -281,6 +281,7 @@ interface ActiveTask {
   timedOut: boolean;
   rawOutput: string;
   rawOutputBytes: number;
+  completedOutput?: ReturnType<typeof parseCardMarkers>;
   deliveredTextCharacters: number;
   sawTextDelta: boolean;
   outputTruncated: boolean;
@@ -3457,9 +3458,38 @@ export class MessageRouter {
       this.#appendOutput(active, output.slice(active.rawOutput.length));
       return;
     }
-    if (!active.rawOutput.startsWith(output) && !active.rawOutput.endsWith(output)) {
-      this.#appendOutput(active, `\n${output}`);
+    if (active.rawOutput.endsWith(output)) return;
+
+    const previous = parseCardMarkers(active.rawOutput);
+    active.rawOutput = '';
+    active.rawOutputBytes = 0;
+    active.outputTruncated = false;
+    this.#appendOutput(active, output);
+    const completed = parseCardMarkers(active.rawOutput);
+    // Completed replies may revise earlier deltas. Without item boundaries only
+    // an unchanged visible suffix can preserve the preceding narration safely.
+    if (previous.text.endsWith(completed.text)) completed.text = previous.text;
+
+    // Carry cards across text corrections without reconstructing marker syntax.
+    // A completed card with the same ID replaces its streamed representation.
+    const cards = new Map<string, Record<string, unknown>>();
+    for (const rawCard of [...previous.cards, ...completed.cards]) {
+      const validated = validateCard(rawCard);
+      if (validated.ok) cards.set(validated.value.id, rawCard);
     }
+    const invalidFinalCards = completed.cards.filter((card) => !validateCard(card).ok).length;
+    const combinedCards = [...cards.values()];
+    completed.cards = combinedCards.slice(0, MAX_CARD_MARKERS);
+    completed.text += INVALID_CARD_MARKER_TEXT.repeat(invalidFinalCards + Math.max(0, combinedCards.length - MAX_CARD_MARKERS));
+
+    // Retained cards share the existing output budget with the corrected text.
+    const cardBytes = completed.cards.reduce((bytes, card) => bytes + Buffer.byteLength(JSON.stringify(card), 'utf8'), 0);
+    const textLimit = MAX_OUTPUT_BYTES - cardBytes;
+    if (Buffer.byteLength(completed.text, 'utf8') > textLimit) {
+      completed.text = utf8Prefix(completed.text, textLimit - Buffer.byteLength(OUTPUT_TRUNCATED_TEXT, 'utf8'))
+        + OUTPUT_TRUNCATED_TEXT;
+    }
+    active.completedOutput = completed;
   }
 
   async #scheduleDeltaFlush(active: ActiveTask): Promise<void> {
@@ -3546,7 +3576,7 @@ export class MessageRouter {
     return this.#queueOutput(active, async () => {
       if ((active.suppressed && !active.timedOut)
         || !this.#bindingGenerationCurrent(active.identity, active.generation)) return;
-      const parsed = parseCardMarkers(active.rawOutput);
+      const parsed = active.completedOutput ?? parseCardMarkers(active.rawOutput);
       const cardMessages: RouterWorkerSend[] = [];
       let invalidCards = 0;
       for (const rawCard of parsed.cards) {

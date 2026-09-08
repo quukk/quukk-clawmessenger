@@ -1765,6 +1765,145 @@ describe('MessageRouter session, legacy, device, and chatroom dispatch', () => {
 });
 
 describe('MessageRouter task events and reconnect behavior', () => {
+  it('replaces obsolete streamed text with one authoritative terminal reply on the same stream', async () => {
+    vi.useFakeTimers();
+    const fixture = await routerHarness();
+    let release!: () => void;
+    let observed!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const ready = new Promise<void>((resolve) => { observed = resolve; });
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'text_delta', { id: 1, text: 'Hello world' });
+      observed();
+      await gate;
+      yield bridgeEvent(taskId, 'completed', { id: 2, output: 'Corrected answer' });
+    })());
+    const routing = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('corrected-final')));
+    await ready;
+    await vi.advanceTimersByTimeAsync(250);
+    expect(streamEvents(fixture.sent).map(({ status, text }) => ({ status, text }))).toEqual([
+      { status: 'processing', text: '' },
+      { status: 'streaming', text: 'Hello world' },
+    ]);
+    release();
+    await routing;
+    const events = streamEvents(fixture.sent);
+    expect(new Set(events.map((event) => event.stream_id)).size).toBe(1);
+    expect(events.map((event) => event.seq)).toEqual([0, 1, 2]);
+    expect(events.filter((event) => event.status === 'completed')).toEqual([
+      expect.objectContaining({ text: 'Corrected answer', request_message_id: 'corrected-final' }),
+    ]);
+  });
+
+  it.each([
+    { delta: 'Partial answer', output: '', expected: 'Partial answer' },
+    { delta: 'Hello', output: 'Hello world', expected: 'Hello world' },
+    { delta: 'Hello world', output: 'Hello', expected: 'Hello' },
+    { delta: 'Let me think. Wrong answer', output: 'Corrected answer', expected: 'Corrected answer' },
+  ])('reconciles completed reply $output after $delta', async ({ delta, output, expected }) => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'text_delta', { id: 1, text: delta });
+      yield bridgeEvent(taskId, 'completed', { id: 2, output });
+    })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('reconciled-final')));
+    expect(streamEvents(fixture.sent).at(-1)).toMatchObject({ status: 'completed', text: expected });
+  });
+
+  it.each([false, true])('retains streamed cards once during correction (final repeats card: %s)', async (repeatCard) => {
+    const fixture = await routerHarness();
+    const card = { schema: '1.0.0', id: 'retained-card', header: { title: 'Safe card' }, sections: [] };
+    const marker = `[CARD][${JSON.stringify(card)}]`;
+    const finalCard = { ...card, header: { title: 'Updated safe card' } };
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'text_delta', { id: 1, text: 'Hello world[CAR' });
+      yield bridgeEvent(taskId, 'text_delta', { id: 2, text: marker.slice(4) });
+      yield bridgeEvent(taskId, 'completed', { id: 3, output: `Corrected answer${repeatCard ? `[CARD][${JSON.stringify(finalCard)}]` : ''}` });
+    })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('corrected-card')));
+    expect(streamEvents(fixture.sent).at(-1)?.text).toBe('Corrected answer');
+    const cards = fixture.sent.filter(({ input }) => input.messageType === 'card_message');
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.input.content).toMatchObject({ card: repeatCard ? finalCard : card });
+  });
+
+  it('keeps invalid-card notices inside the corrected terminal byte limit', async () => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'text_delta', { id: 1, text: 'obsolete' });
+      yield bridgeEvent(taskId, 'completed', { id: 2, output: 'x'.repeat(1_048_350) + '[CARD][{}]'.repeat(16) });
+    })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('corrected-invalid-card-cap')));
+    const terminal = streamEvents(fixture.sent).at(-1)!;
+    expect(terminal.status).toBe('completed');
+    expect(Buffer.byteLength(terminal.text, 'utf8')).toBeLessThanOrEqual(1024 * 1024);
+    expect(terminal.text.endsWith('[output_truncated]')).toBe(true);
+    expect(fixture.sent.some(({ input }) => input.messageType === 'card_message')).toBe(false);
+  });
+
+  it('shares the corrected output byte budget with retained structured cards', async () => {
+    const fixture = await routerHarness();
+    const card = { schema: '1.0.0', id: 'bounded-card', header: { title: 'Safe card' }, sections: [] };
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'text_delta', { id: 1, text: `obsolete[CARD][${JSON.stringify(card)}]` });
+      yield bridgeEvent(taskId, 'completed', { id: 2, output: '🌍'.repeat(300_000) });
+    })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('corrected-retained-card-cap')));
+    const terminal = streamEvents(fixture.sent).at(-1)!;
+    expect(terminal.status).toBe('completed');
+    expect(terminal.text.startsWith('🌍')).toBe(true);
+    expect(terminal.text.endsWith('[output_truncated]')).toBe(true);
+    expect(terminal.text).not.toContain('\uFFFD');
+    const cards = fixture.sent.filter(({ input }) => input.messageType === 'card_message');
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.input.content).toMatchObject({ card });
+    expect(Buffer.byteLength(terminal.text, 'utf8') + Buffer.byteLength(JSON.stringify(card), 'utf8'))
+      .toBeLessThanOrEqual(1024 * 1024);
+  });
+
+  it('preserves the card-count limit when a correction adds more cards', async () => {
+    const fixture = await routerHarness();
+    const cards = Array.from({ length: 17 }, (_, index) => ({
+      schema: '1.0.0', id: `bounded-card-${index}`, header: { title: 'Safe card' }, sections: [],
+    }));
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'text_delta', {
+        id: 1, text: 'obsolete' + cards.slice(0, 16).map((card) => `[CARD][${JSON.stringify(card)}]`).join(''),
+      });
+      yield bridgeEvent(taskId, 'completed', { id: 2, output: `Corrected answer[CARD][${JSON.stringify(cards[16])}]` });
+    })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('corrected-card-count')));
+    expect(streamEvents(fixture.sent).at(-1)?.text).toBe('Corrected answer[invalid card marker]');
+    const delivered = fixture.sent.filter(({ input }) => input.messageType === 'card_message');
+    expect(delivered).toHaveLength(16);
+    for (const [index, entry] of delivered.entries()) expect(entry.input.content).toMatchObject({ card: cards[index] });
+  });
+
+  it.each([false, true])('reapplies the UTF-8 output cap after correction (partial already truncated: %s)', async (truncated) => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'text_delta', { id: 1, text: truncated ? 'x'.repeat(1024 * 1024 + 100) : 'obsolete' });
+      yield bridgeEvent(taskId, 'completed', { id: 2, output: '🌍'.repeat(300_000) });
+    })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('corrected-cap')));
+    const terminal = streamEvents(fixture.sent).at(-1)!;
+    expect(terminal.status).toBe('completed');
+    expect(terminal.text === '🌍'.repeat(262_139) + '[output_truncated]').toBe(true);
+    expect(Buffer.byteLength(terminal.text, 'utf8')).toBeLessThanOrEqual(1024 * 1024);
+  });
+
+  it('preserves narration for an unchanged visible suffix beside a streamed card', async () => {
+    const fixture = await routerHarness();
+    const card = { schema: '1.0.0', id: 'suffix-card', header: { title: 'Safe card' }, sections: [] };
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'text_delta', { id: 1, text: `Let me think. Answer[CARD][${JSON.stringify(card)}]` });
+      yield bridgeEvent(taskId, 'completed', { id: 2, output: 'Answer' });
+    })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('suffix-card')));
+    expect(streamEvents(fixture.sent).at(-1)?.text).toBe('Let me think. Answer');
+    expect(fixture.sent.filter(({ input }) => input.messageType === 'card_message')).toHaveLength(1);
+  });
+
   it('does not duplicate an authoritative final item already emitted after narration', async () => {
     const fixture = await routerHarness();
     fixture.setEvents((taskId) => (async function* () {
