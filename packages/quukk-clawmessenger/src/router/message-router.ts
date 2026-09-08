@@ -308,6 +308,7 @@ interface BufferedOutput {
 interface DiscussionActive {
   identity: WorkerIdentity;
   conversation: ConversationIdentity;
+  sessionConversation: ConversationIdentity;
   bindingKey: string;
   logicalKey: string;
   taskId: string;
@@ -343,6 +344,7 @@ interface V2LogicalOwner {
   logicalKey: string;
   senderId: string;
   discussionId: string;
+  chatroomId: string;
   stateVersion: number;
   round: number;
   state: 'prestart' | 'committing' | 'active' | 'terminal';
@@ -352,6 +354,7 @@ interface V2LogicalOwner {
 interface V2Cancellation {
   senderId: string;
   discussionId: string;
+  chatroomId: string;
   stateVersion: number;
   round: number;
 }
@@ -380,6 +383,7 @@ interface BindingDiscussionState {
   identity: WorkerIdentity;
   guard: DiscussionV2Guard;
   wire: DiscussionWireReassembler;
+  systemPrivateWire: DiscussionWireReassembler;
   active: Map<string, DiscussionActive>;
   v1: Map<string, V1Owner>;
   logicalV2: Map<string, V2LogicalOwner>;
@@ -476,6 +480,43 @@ function conversationFrom(message: NormalizedRongCloudMessage, identity: WorkerI
     targetId: message.targetId,
     senderId: message.senderId,
   };
+}
+
+function discussionTransportMatches(
+  identity: WorkerIdentity,
+  message: NormalizedRongCloudMessage,
+  chatroomId: string,
+): boolean {
+  return message.conversationType === 1
+    ? message.senderId === 'system' && message.targetId === identity.nodeId
+    : message.targetId === chatroomId;
+}
+
+function discussionSessionConversation(
+  conversation: ConversationIdentity,
+  discussionId: string,
+): ConversationIdentity {
+  return conversation.conversationType === 1
+    ? { ...conversation, targetId: discussionId }
+    : conversation;
+}
+
+function authorizedDiscussionWorkCommand(
+  identity: WorkerIdentity,
+  message: NormalizedRongCloudMessage,
+  value: Record<string, unknown>,
+): DiscussionAssignment | DiscussionHostTurn | null {
+  const parsed = parseDiscussionV2Command(value);
+  if (!parsed
+    || (parsed.msg_type !== 'discussion_assignment' && parsed.msg_type !== 'discussion_host_turn')
+    || !discussionTransportMatches(identity, message, parsed.chatroomId)
+    || identity.nodeId.length > DISCUSSION_V2_LIMITS.maxId
+    || message.senderId.length > DISCUSSION_V2_LIMITS.maxId
+    || (parsed.msg_type === 'discussion_assignment' && parsed.targetId !== identity.nodeId)
+    || (parsed.msg_type === 'discussion_host_turn'
+      && !Object.values(parsed.roles).some((role) =>
+        role.nodeId === identity.nodeId && role.isHost === true))) return null;
+  return parsed;
 }
 
 function hashConversation(key: string): string {
@@ -701,6 +742,7 @@ export class MessageRouter {
     if (discussion) {
       discussion.guard.dispose();
       discussion.wire.dispose();
+      discussion.systemPrivateWire.dispose();
       for (const active of discussion.active.values()) {
         if (active.cleanupPromise !== undefined) {
           cancellations.push(active.cleanupPromise);
@@ -955,6 +997,7 @@ export class MessageRouter {
         identity: { ...identity },
         guard: new DiscussionV2Guard({ clock: this.#clock }),
         wire: new DiscussionWireReassembler({ clock: this.#clock }),
+        systemPrivateWire: new DiscussionWireReassembler({ clock: this.#clock }),
         active: new Map(),
         v1: new Map(),
         logicalV2: new Map(),
@@ -989,8 +1032,14 @@ export class MessageRouter {
     if (msgType !== 'discussion_token'
       && msgType !== 'discussion_host_turn'
       && msgType !== 'discussion_assignment') return;
-    this.#logValidated(identity, conversation);
-    await this.#enqueue(identity, conversation, () => msgType === 'discussion_token'
+    const command = msgType === 'discussion_token'
+      ? null
+      : authorizedDiscussionWorkCommand(identity, message, value);
+    const laneConversation = command === null
+      ? conversation
+      : discussionSessionConversation(conversation, command.discussionId);
+    this.#logValidated(identity, laneConversation);
+    await this.#enqueue(identity, laneConversation, () => msgType === 'discussion_token'
       ? this.#runDiscussionV1(identity, message, value, physicalAdmitted)
       : this.#runDiscussionV2(identity, message, value, physicalAdmitted));
   }
@@ -1004,7 +1053,12 @@ export class MessageRouter {
     const conversation = conversationFrom(message, identity);
     const claim = await this.#claimLocal(identity, message.messageUid, conversation, generation);
     if (!claim) return;
-    const result = this.#discussionState(identity).wire.accept(message.senderId, value);
+    const state = this.#discussionState(identity);
+    const systemPrivate = message.conversationType === 1
+      && message.senderId === 'system'
+      && message.targetId === identity.nodeId;
+    const result = (systemPrivate ? state.systemPrivateWire : state.wire)
+      .accept(message.senderId, value);
     const admitted = await this.#admitOnly(identity, message, claim, generation, true);
     if (!admitted
       || !this.#bindingGenerationCurrent(identity, generation)
@@ -1281,12 +1335,13 @@ export class MessageRouter {
     return JSON.stringify([
       cancellation.senderId,
       cancellation.discussionId,
+      cancellation.chatroomId,
       cancellation.stateVersion,
       cancellation.round,
     ]);
   }
 
-  #v2CancellationMatches(
+  #v2CancellationApplies(
     cancellation: V2Cancellation,
     value: Pick<V2LogicalOwner, 'senderId' | 'discussionId' | 'stateVersion' | 'round'>,
   ): boolean {
@@ -1296,20 +1351,28 @@ export class MessageRouter {
         || (cancellation.stateVersion === value.stateVersion && cancellation.round === value.round));
   }
 
-  #recordV2Cancellation(state: BindingDiscussionState, cancellation: V2Cancellation): void {
+  #v2CancellationMatches(
+    cancellation: V2Cancellation,
+    value: Pick<V2LogicalOwner, 'senderId' | 'discussionId' | 'chatroomId' | 'stateVersion' | 'round'>,
+  ): boolean {
+    return cancellation.chatroomId === value.chatroomId
+      && this.#v2CancellationApplies(cancellation, value);
+  }
+
+  #recordV2Cancellation(state: BindingDiscussionState, cancellation: V2Cancellation): boolean {
     const key = this.#v2CancellationKey(cancellation);
-    if (!state.v2Cancellations.has(key)) {
-      if (state.v2Cancellations.size >= DISCUSSION_V2_LIMITS.maxCancelTombstones) {
-        const oldest = state.v2Cancellations.keys().next().value;
-        if (oldest !== undefined) state.v2Cancellations.delete(oldest);
-      }
-      state.v2Cancellations.set(key, cancellation);
+    if (state.v2Cancellations.has(key)) return false;
+    if (state.v2Cancellations.size >= DISCUSSION_V2_LIMITS.maxCancelTombstones) {
+      const oldest = state.v2Cancellations.keys().next().value;
+      if (oldest !== undefined) state.v2Cancellations.delete(oldest);
     }
+    state.v2Cancellations.set(key, cancellation);
     for (const owner of state.logicalV2.values()) {
       if (owner.state === 'prestart' && this.#v2CancellationMatches(cancellation, owner)) {
         this.#terminalV2Reservation(state, owner);
       }
     }
+    return true;
   }
 
   #v2Cancelled(state: BindingDiscussionState, owner: V2LogicalOwner): boolean {
@@ -1394,22 +1457,12 @@ export class MessageRouter {
       ? undefined
       : await this.#claimLocal(identity, message.messageUid, conversation, generation);
     if (!physicalAdmitted && !claim) return;
-    const parsed = parseDiscussionV2Command(raw);
-    if (!parsed
-      || (parsed.msg_type !== 'discussion_assignment' && parsed.msg_type !== 'discussion_host_turn')
-      || parsed.chatroomId !== message.targetId
-      || identity.nodeId.length > DISCUSSION_V2_LIMITS.maxId
-      || message.senderId.length > DISCUSSION_V2_LIMITS.maxId
-      || (parsed.msg_type === 'discussion_assignment' && parsed.targetId !== identity.nodeId)) {
+    const parsed = authorizedDiscussionWorkCommand(identity, message, raw);
+    if (!parsed) {
       if (claim) await this.#admitOnly(identity, message, claim, generation);
       return;
     }
-    if (parsed.msg_type === 'discussion_host_turn'
-      && !Object.values(parsed.roles).some((role) =>
-        role.nodeId === identity.nodeId && role.isHost === true)) {
-      if (claim) await this.#admitOnly(identity, message, claim, generation);
-      return;
-    }
+    const sessionConversation = discussionSessionConversation(conversation, parsed.discussionId);
     const state = this.#discussionState(identity);
     this.#pruneV2Reservations(state);
     const logicalKey = discussionV2LogicalKey(message.senderId, parsed);
@@ -1417,6 +1470,7 @@ export class MessageRouter {
       logicalKey,
       senderId: message.senderId,
       discussionId: parsed.discussionId,
+      chatroomId: parsed.chatroomId,
       stateVersion: parsed.stateVersion,
       round: parsed.round,
       state: 'prestart',
@@ -1435,7 +1489,7 @@ export class MessageRouter {
       await this.#recheckBinding(identity);
       this.#requireBindingGeneration(identity, generation);
       this.#requireV2Reservation(state, logicalOwner);
-      const submittedResumeSessionId = await this.#state.currentSession(conversation);
+      const submittedResumeSessionId = await this.#state.currentSession(sessionConversation);
       this.#requireBindingGeneration(identity, generation);
       this.#requireV2Reservation(state, logicalOwner);
       const workdir = await this.#binding.authorizeDefaultWorkdir(identity);
@@ -1448,7 +1502,7 @@ export class MessageRouter {
       if (!prompt || Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES) throw new Error('prompt_too_large');
       const response = await this.#task.startTask({
         runtimeId: identity.runtimeId,
-        conversationKey: conversationKey(conversation),
+        conversationKey: conversationKey(sessionConversation),
         prompt,
         workdir,
         ...(submittedResumeSessionId === undefined ? {} : { resumeSessionId: submittedResumeSessionId }),
@@ -1473,6 +1527,7 @@ export class MessageRouter {
       const active: DiscussionActive = {
         identity: { ...identity },
         conversation: { ...conversation },
+        sessionConversation: { ...sessionConversation },
         bindingKey: bindingKey(identity),
         logicalKey,
         taskId: response.taskId,
@@ -2042,35 +2097,50 @@ export class MessageRouter {
     const state = this.#discussionState(identity);
     let mutationAccepted = false;
     if (msgType === 'discussion_cancel') {
-      const result = state.guard.cancel(message.senderId, value);
-      if (result.status === 'accepted') {
-        mutationAccepted = true;
-        const parsed = parseDiscussionV2Command(value);
-        if (parsed?.msg_type === 'discussion_cancel') {
-          this.#recordV2Cancellation(state, {
+      const parsed = parseDiscussionV2Command(value);
+      if (parsed?.msg_type === 'discussion_cancel'
+        && discussionTransportMatches(identity, message, parsed.chatroomId)
+        && message.senderId.length <= DISCUSSION_V2_LIMITS.maxId) {
+        this.#pruneV2Reservations(state);
+        const conflictsWithKnownRoom = [...state.logicalV2.values()].some((owner) =>
+          owner.senderId === message.senderId
+          && owner.discussionId === parsed.discussionId
+          && owner.chatroomId !== parsed.chatroomId);
+        if (!conflictsWithKnownRoom) {
+          const cancellation: V2Cancellation = {
             senderId: message.senderId,
             discussionId: parsed.discussionId,
+            chatroomId: parsed.chatroomId,
             stateVersion: parsed.stateVersion,
             round: parsed.round,
-          });
+          };
+          const hasActiveDiscussion = [...state.active.values()].some((active) =>
+            active.logicalOwner?.senderId === message.senderId
+            && active.logicalOwner.discussionId === parsed.discussionId
+            && active.logicalOwner.chatroomId === parsed.chatroomId);
+          const result = hasActiveDiscussion
+            ? state.guard.cancel(message.senderId, parsed)
+            : { status: 'accepted' as const, abortedKeys: [] as string[] };
+          const recorded = result.status === 'accepted'
+            && this.#recordV2Cancellation(state, cancellation);
+          if (result.status === 'accepted' && (recorded || hasActiveDiscussion)) {
+            mutationAccepted = true;
+            state.wire.clearDiscussion(message.senderId, parsed.discussionId);
+            state.systemPrivateWire.clearDiscussion(message.senderId, parsed.discussionId);
+            await Promise.all(result.abortedKeys.map((key) => {
+              const active = state.active.get(key);
+              return active === undefined
+                ? Promise.resolve()
+                : this.#cancelDiscussionV2Active(state, active);
+            }));
+            if (!this.#bindingGenerationCurrent(identity, generation) && !claim) return;
+          }
         }
-        state.wire.clearDiscussion(result.clearSenderId, result.clearDiscussionId);
-        await Promise.all(result.abortedKeys.map((key) => {
-          const active = state.active.get(key);
-          return active === undefined
-            ? Promise.resolve()
-            : this.#cancelDiscussionV2Active(state, active);
-        }));
-        if (!this.#bindingGenerationCurrent(identity, generation) && !claim) return;
       }
     } else {
       const parsed = parseDiscussionV2Command(value);
-      const accepted = parsed?.msg_type === 'discussion_artifact_ack'
-        && parsed.chatroomId === message.targetId
-        ? state.guard.acceptArtifactAck(message.senderId, parsed)
-        : { status: 'invalid' as const };
-      if (accepted.status === 'accepted' && parsed?.msg_type === 'discussion_artifact_ack') {
-        mutationAccepted = true;
+      if (parsed?.msg_type === 'discussion_artifact_ack'
+        && discussionTransportMatches(identity, message, parsed.chatroomId)) {
         const key = this.#artifactAckKey({
           senderId: message.senderId,
           discussionId: parsed.discussionId,
@@ -2080,7 +2150,12 @@ export class MessageRouter {
           updateId: parsed.updateId,
         });
         const waiter = state.ackWaiters.get(key);
-        if (waiter) {
+        const active = waiter === undefined ? undefined : state.active.get(waiter.logicalKey);
+        const accepted = active?.command.chatroomId === parsed.chatroomId
+          ? state.guard.acceptArtifactAck(message.senderId, parsed)
+          : { status: 'invalid' as const };
+        if (accepted.status === 'accepted' && waiter) {
+          mutationAccepted = true;
           state.ackWaiters.delete(key);
           this.#clearTimeout(waiter.timer);
           waiter.resolve({ artifactId: parsed.artifactId, artifactVersion: parsed.artifactVersion });
@@ -2469,14 +2544,14 @@ export class MessageRouter {
   }
 
   async #applyDiscussionSession(
-    active: Pick<DiscussionActive | V1Active,
-      'conversation' | 'submittedResumeSessionId'>,
+    active: Pick<DiscussionActive, 'sessionConversation' | 'submittedResumeSessionId'>
+      | Pick<V1Active, 'conversation' | 'submittedResumeSessionId'>,
     event: BridgeTaskEvent,
   ): Promise<void> {
     const status = 'status' in event ? event.status : undefined;
     if (event.session_id === undefined && status !== 'resume_invalidated') return;
     await this.#state.applyEventSession({
-      conversation: active.conversation,
+      conversation: 'sessionConversation' in active ? active.sessionConversation : active.conversation,
       submittedResumeSessionId: active.submittedResumeSessionId,
       ...(status === undefined ? {} : { status }),
       ...(event.session_id === undefined ? {} : { authoritativeSessionId: event.session_id }),

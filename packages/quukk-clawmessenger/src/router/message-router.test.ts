@@ -2836,6 +2836,175 @@ describe('MessageRouter task events and reconnect behavior', () => {
 });
 
 describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
+  it('runs a system-private roundtable assignment whose logical chatroom differs from the node envelope target', async () => {
+    const fixture = await routerHarness();
+    const payload = discussionAssignment({
+      discussionId: 'private-roundtable',
+      chatroomId: 'room-roundtable',
+      mode: 'roundtable',
+      model: 'openai/gpt-5',
+      role: { roleName: 'Engineer', roleInstructions: 'Assess the delivery plan' },
+      speakingOrder: 0,
+      roundFocus: 'Identify the critical path',
+      priorContributions: [],
+      roundSummaries: [],
+      userInterjections: [],
+      attempt: 1,
+    });
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'private-roundtable-assignment',
+      payload,
+      { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+    )));
+
+    expect(fixture.starts).toHaveLength(1);
+    expect(fixture.starts[0]?.prompt).toContain('Assess the delivery plan');
+  });
+
+  it.each([
+    ['non-system sender', { senderId: 'ordinary-user', targetId: IDENTITY_A.nodeId }, {}],
+    ['wrong envelope target', { senderId: 'system', targetId: 'codex_node-other' }, {}],
+    ['wrong assignment target', { senderId: 'system', targetId: IDENTITY_A.nodeId }, { targetId: 'codex_node-other' }],
+  ] as const)('rejects a system-private assignment with a %s', async (
+    _case,
+    envelope,
+    payloadOverride,
+  ) => {
+    const fixture = await routerHarness();
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      `private-assignment-${_case}`,
+      discussionAssignment({ chatroomId: 'room-roundtable', ...payloadOverride }),
+      { ...envelope, conversationType: 1 },
+    )));
+
+    expect(fixture.starts).toEqual([]);
+  });
+
+  it('keeps chatroom assignments bound to the envelope chatroom', async () => {
+    const fixture = await routerHarness();
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'chatroom-assignment-right-room',
+      discussionAssignment({ discussionId: 'right-room' }),
+    )));
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'chatroom-assignment-wrong-room',
+      discussionAssignment({ discussionId: 'wrong-room', chatroomId: 'other-room' }),
+    )));
+
+    expect(fixture.starts).toHaveLength(1);
+  });
+
+  it('isolates private system resume sessions by discussion while retaining same-discussion continuity', async () => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId, index) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', {
+        output: `contribution-${index}`,
+        ...(index < 2 ? { session_id: `session-${index + 1}` } : {}),
+      });
+    })());
+    const envelope = { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 as const };
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'discussion-one-first',
+      discussionAssignment({ discussionId: 'discussion-one', chatroomId: 'room-one', requestId: 'request-one-first' }),
+      envelope,
+    )));
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'discussion-two-first',
+      discussionAssignment({ discussionId: 'discussion-two', chatroomId: 'room-two', requestId: 'request-two-first' }),
+      envelope,
+    )));
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'discussion-one-second',
+      discussionAssignment({
+        discussionId: 'discussion-one', chatroomId: 'room-one', requestId: 'request-one-second',
+        assignmentId: 'assignment-one-second', stateVersion: 2, round: 2,
+      }),
+      envelope,
+    )));
+
+    expect(fixture.starts).toHaveLength(3);
+    expect(fixture.starts[0]?.resumeSessionId).toBeUndefined();
+    expect(fixture.starts[1]?.resumeSessionId).toBeUndefined();
+    expect(fixture.starts[2]?.resumeSessionId).toBe('session-1');
+    expect(fixture.starts[0]?.conversationKey).toBe(fixture.starts[2]?.conversationKey);
+    expect(fixture.starts[1]?.conversationKey).not.toBe(fixture.starts[0]?.conversationKey);
+    const outputs = fixture.sent.filter(({ input }) => input.messageType === 'command_result');
+    expect(outputs).toHaveLength(3);
+    expect(outputs.every(({ input }) => input.targetId === 'system')).toBe(true);
+  });
+
+  it('runs validated private assignments from different discussions on independent lanes', async () => {
+    const fixture = await routerHarness();
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    fixture.setEvents((taskId, index) => (async function* () {
+      if (index === 0) await firstGate;
+      yield bridgeEvent(taskId, 'completed', { output: `contribution-${index}` });
+    })());
+    const envelope = { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 as const };
+    const first = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'parallel-discussion-one',
+      discussionAssignment({
+        discussionId: 'parallel-discussion-one', chatroomId: 'parallel-room-one', requestId: 'parallel-request-one',
+      }),
+      envelope,
+    )));
+    await vi.waitFor(() => expect(fixture.starts).toHaveLength(1));
+    const second = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'parallel-discussion-two',
+      discussionAssignment({
+        discussionId: 'parallel-discussion-two', chatroomId: 'parallel-room-two', requestId: 'parallel-request-two',
+      }),
+      envelope,
+    )));
+    const secondStartedBeforeRelease = await vi.waitFor(
+      () => expect(fixture.starts).toHaveLength(2),
+      { timeout: 250 },
+    ).then(() => true, () => false);
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    expect(secondStartedBeforeRelease).toBe(true);
+  });
+
+  it('keeps validated private assignments from the same discussion serialized', async () => {
+    const fixture = await routerHarness();
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    fixture.setEvents((taskId, index) => (async function* () {
+      if (index === 0) await firstGate;
+      yield bridgeEvent(taskId, 'completed', { output: `contribution-${index}` });
+    })());
+    const envelope = { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 as const };
+    const first = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'serial-discussion-one',
+      discussionAssignment({
+        discussionId: 'serial-discussion', chatroomId: 'serial-room', requestId: 'serial-request-one',
+      }),
+      envelope,
+    )));
+    await vi.waitFor(() => expect(fixture.starts).toHaveLength(1));
+    const second = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'serial-discussion-two',
+      discussionAssignment({
+        discussionId: 'serial-discussion', chatroomId: 'serial-room', requestId: 'serial-request-two',
+        assignmentId: 'serial-assignment-two', stateVersion: 2, round: 2,
+      }),
+      envelope,
+    )));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const startsBeforeRelease = fixture.starts.length;
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    expect(startsBeforeRelease).toBe(1);
+    expect(fixture.starts).toHaveLength(2);
+  });
+
   it.each([
     ['v1', discussionV1(), 'dispose-late-v1'],
     ['v2', discussionAssignment(), 'dispose-late-v2'],
@@ -3030,6 +3199,123 @@ describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
       && input.content.msg_type === 'discussion_contribution_completed')).toBe(true);
   });
 
+  it('reassembles a large system-private roundtable assignment with a distinct logical chatroom', async () => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', { output: 'private wire contribution' });
+    })());
+    const frames = encodeDiscussionWire(discussionAssignment({
+      discussionId: 'private-wire-roundtable',
+      chatroomId: 'room-private-wire',
+      task: 'T'.repeat(12_000),
+      mode: 'roundtable',
+      model: 'openai/gpt-5',
+      role: { roleName: 'Engineer', roleInstructions: 'Review the implementation path' },
+      speakingOrder: 0,
+      roundFocus: 'Find delivery risks',
+      priorContributions: [],
+      roundSummaries: [],
+      userInterjections: [],
+      attempt: 1,
+    })).reverse();
+    expect(frames.length).toBeGreaterThan(1);
+
+    for (let index = 0; index < frames.length; index += 1) {
+      await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+        `private-wire-${index}`,
+        JSON.parse(frames[index]!) as Record<string, unknown>,
+        { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+      )));
+    }
+
+    expect(fixture.starts).toHaveLength(1);
+    expect(fixture.sent.some(({ input }) => input.messageType === 'command_result'
+      && input.targetId === 'system'
+      && input.content.msg_type === 'discussion_contribution_completed')).toBe(true);
+  });
+
+  it('keeps untrusted partial-wire capacity from blocking a system-private assignment', async () => {
+    const fixture = await routerHarness();
+    for (let index = 0; index < 64; index += 1) {
+      const [partial] = encodeDiscussionWire(discussionAssignment({
+        discussionId: `untrusted-partial-${index}`,
+        requestId: `untrusted-request-${index}`,
+        task: 'U'.repeat(12_000),
+      }));
+      await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+        `untrusted-partial-${index}`,
+        JSON.parse(partial!) as Record<string, unknown>,
+        { senderId: 'ordinary-user', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+      )));
+    }
+    const systemFrames = encodeDiscussionWire(discussionAssignment({
+      discussionId: 'trusted-private-wire',
+      chatroomId: 'trusted-logical-room',
+      requestId: 'trusted-private-request',
+      task: 'S'.repeat(12_000),
+    }));
+
+    for (let index = 0; index < systemFrames.length; index += 1) {
+      await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+        `trusted-private-wire-${index}`,
+        JSON.parse(systemFrames[index]!) as Record<string, unknown>,
+        { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+      )));
+    }
+
+    expect(fixture.starts).toHaveLength(1);
+  });
+
+  it('clears trusted private wire partials when their discussion is cancelled', async () => {
+    const fixture = await routerHarness();
+    const envelope = { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 as const };
+    for (let index = 0; index < 64; index += 1) {
+      const [partial] = encodeDiscussionWire(discussionAssignment({
+        discussionId: 'cancelled-partials',
+        chatroomId: 'room-cancelled-partials',
+        requestId: `cancelled-partial-${index}`,
+        task: 'P'.repeat(12_000),
+      }));
+      await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+        `cancelled-partial-${index}`,
+        JSON.parse(partial!) as Record<string, unknown>,
+        envelope,
+      )));
+    }
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'cancel-trusted-partials',
+      discussionCancel({ discussionId: 'cancelled-partials', chatroomId: 'room-cancelled-partials' }),
+      envelope,
+    )));
+    const nextFrames = encodeDiscussionWire(discussionAssignment({
+      discussionId: 'after-cancelled-partials',
+      chatroomId: 'room-after-cancel',
+      requestId: 'after-cancel-request',
+      task: 'N'.repeat(12_000),
+    }));
+    for (let index = 0; index < nextFrames.length; index += 1) {
+      await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+        `after-cancelled-partials-${index}`,
+        JSON.parse(nextFrames[index]!) as Record<string, unknown>,
+        envelope,
+      )));
+    }
+
+    expect(fixture.starts).toHaveLength(1);
+  });
+
+  it('rejects a private host turn from a non-system sender', async () => {
+    const fixture = await routerHarness();
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'forged-private-host-turn',
+      discussionHostTurn({ chatroomId: 'room-forged-host' }),
+      { senderId: 'ordinary-user', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+    )));
+
+    expect(fixture.starts).toEqual([]);
+  });
+
   it('honors a cancel tombstone before a direct v2 assignment without starting provider work', async () => {
     const fixture = await routerHarness();
     const assignment = discussionAssignment({ discussionId: 'cancel-before-direct' });
@@ -3045,6 +3331,151 @@ describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
     expect(fixture.starts).toEqual([]);
     expect(fixture.cancellations).toEqual([]);
     expect(fixture.receipts).toHaveLength(2);
+  });
+
+  it('scopes a system-private prestart cancel to its logical chatroom', async () => {
+    const fixture = await routerHarness();
+    const discussionId = 'private-prestart-room-scope';
+    const envelope = { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 as const };
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'private-prestart-other-room-cancel',
+      discussionCancel({ discussionId, chatroomId: 'private-prestart-other-room' }),
+      envelope,
+    )));
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'private-prestart-right-room-assignment',
+      discussionAssignment({ discussionId, chatroomId: 'private-prestart-right-room' }),
+      envelope,
+    )));
+
+    expect(fixture.starts).toHaveLength(1);
+  });
+
+  it('honors a same-room system-private cancel before provider work starts', async () => {
+    const fixture = await routerHarness();
+    const discussionId = 'private-prestart-same-room';
+    const chatroomId = 'private-prestart-same-room-chatroom';
+    const envelope = { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 as const };
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'private-prestart-same-room-cancel',
+      discussionCancel({ discussionId, chatroomId }),
+      envelope,
+    )));
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'private-prestart-same-room-assignment',
+      discussionAssignment({ discussionId, chatroomId }),
+      envelope,
+    )));
+
+    expect(fixture.starts).toEqual([]);
+    expect(fixture.cancellations).toEqual([]);
+  });
+
+  it('keeps a same-room cancel effective for a queued private assignment', async () => {
+    const fixture = await routerHarness();
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    fixture.setEvents((taskId, index) => (async function* () {
+      if (index === 0) await firstGate;
+      yield bridgeEvent(taskId, 'completed', { output: `queued-cancel-${index}` });
+    })());
+    const discussionId = 'private-queued-cancel';
+    const chatroomId = 'private-queued-cancel-room';
+    const envelope = { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 as const };
+    const active = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'private-queued-cancel-active',
+      discussionAssignment({ discussionId, chatroomId }),
+      envelope,
+    )));
+    await vi.waitFor(() => expect(fixture.starts).toHaveLength(1));
+    const queued = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'private-queued-cancel-waiting',
+      discussionAssignment({
+        discussionId, chatroomId, stateVersion: 2, round: 2,
+        requestId: 'private-queued-cancel-request-2', assignmentId: 'private-queued-cancel-assignment-2',
+      }),
+      envelope,
+    )));
+    const cancellation = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'private-queued-cancel-command',
+      discussionCancel({ discussionId, chatroomId, stateVersion: 2, round: 2 }),
+      envelope,
+    )));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    releaseFirst();
+    await Promise.all([active, queued, cancellation]);
+
+    expect(fixture.starts).toHaveLength(1);
+  });
+
+  it('does not let a wrong private envelope target create a cancel tombstone', async () => {
+    const fixture = await routerHarness();
+    const discussionId = 'wrong-private-cancel-target';
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'wrong-private-cancel-target-command',
+      discussionCancel({ discussionId, chatroomId: 'private-cancel-room' }),
+      { senderId: 'system', targetId: 'codex_node-other', conversationType: 1 },
+    )));
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'after-wrong-private-cancel-target',
+      discussionAssignment({ discussionId, chatroomId: 'private-cancel-room' }),
+      { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+    )));
+
+    expect(fixture.starts).toHaveLength(1);
+  });
+
+  it('does not let a mismatched chatroom envelope create a cancel tombstone', async () => {
+    const fixture = await routerHarness();
+    const discussionId = 'wrong-chatroom-cancel-target';
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'wrong-chatroom-cancel-target-command',
+      discussionCancel({ discussionId, chatroomId: 'other-room' }),
+    )));
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'after-wrong-chatroom-cancel-target',
+      discussionAssignment({ discussionId }),
+    )));
+
+    expect(fixture.starts).toHaveLength(1);
+  });
+
+  it('does not let a wrong-room private cancel stop work or poison a later turn', async () => {
+    const fixture = await routerHarness();
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    fixture.setEvents((taskId, index) => (async function* () {
+      if (index === 0) await firstGate;
+      yield bridgeEvent(taskId, 'completed', { output: `contribution-${index}` });
+    })());
+    const envelope = { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 as const };
+    const discussionId = 'private-cancel-room-scope';
+    const active = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'private-cancel-room-active',
+      discussionAssignment({ discussionId, chatroomId: 'private-cancel-right-room' }),
+      envelope,
+    )));
+    await vi.waitFor(() => expect(fixture.starts).toHaveLength(1));
+    const wrongCancel = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'private-cancel-wrong-room',
+      discussionCancel({ discussionId, chatroomId: 'private-cancel-wrong-room' }),
+      envelope,
+    )));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const cancellationsAfterWrongRoom = [...fixture.cancellations];
+    releaseFirst();
+    await Promise.all([active, wrongCancel]);
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'private-cancel-room-later-turn',
+      discussionAssignment({
+        discussionId, chatroomId: 'private-cancel-right-room',
+        requestId: 'private-cancel-room-later-request', assignmentId: 'private-cancel-room-later-assignment',
+      }),
+      envelope,
+    )));
+
+    expect(cancellationsAfterWrongRoom).toEqual([]);
+    expect(fixture.starts).toHaveLength(2);
   });
 
   it('shares one v2 replay reservation between a completed wire command and a direct duplicate', async () => {
@@ -3579,6 +4010,72 @@ describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
       && input.content.msg_type === 'discussion_wire_chunk');
     expect(chunks.length).toBeGreaterThan(1);
     expect(chunks.every(({ input }) => input.messageType === 'command')).toBe(true);
+  });
+
+  it('accepts an exact system-private artifact ACK without letting a wrong-room ACK consume it', async () => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', {
+        output: JSON.stringify({
+          action: 'finish',
+          summary: 'done',
+          artifact: {
+            artifactType: 'markdown', title: 'Result', content: 'artifact body',
+            baseVersion: 0, final: true,
+          },
+        }),
+      });
+    })());
+    const envelope = { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 as const };
+    const routing = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'private-artifact-host',
+      discussionHostTurn({
+        discussionId: 'private-artifact', chatroomId: 'room-artifact', allowedDecisions: ['finish'],
+      }),
+      envelope,
+    )));
+    const updates = () => fixture.sent.filter(({ input }) => input.messageType === 'command_result'
+      && input.content.msg_type === 'discussion_artifact_update');
+    await vi.waitFor(() => expect(updates()).toHaveLength(1));
+    const update = updates()[0]!.input.content as Record<string, unknown>;
+    const acknowledgement = (chatroomId: string) => ({
+      msg_type: 'discussion_artifact_ack',
+      protocolVersion: 2,
+      discussionId: 'private-artifact',
+      chatroomId,
+      requestId: 'request-host',
+      stateVersion: 1,
+      round: 1,
+      timestamp: 2,
+      updateId: update.idempotencyKey,
+      idempotencyKey: update.idempotencyKey,
+      artifactId: 'artifact-private',
+      artifactVersion: 1,
+    });
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'private-artifact-wrong-target',
+      acknowledgement('room-artifact'),
+      { ...envelope, targetId: 'codex_node-other' },
+    )));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(fixture.sent.some(({ input }) => input.messageType === 'command_result'
+      && input.content.msg_type === 'discussion_host_decision')).toBe(false);
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'private-artifact-wrong-room', acknowledgement('room-other'), envelope,
+    )));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(fixture.sent.some(({ input }) => input.messageType === 'command_result'
+      && input.content.msg_type === 'discussion_host_decision')).toBe(false);
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'private-artifact-correct', acknowledgement('room-artifact'), envelope,
+    )));
+    await routing;
+
+    expect(fixture.sent.find(({ input }) => input.messageType === 'command_result'
+      && input.content.msg_type === 'discussion_host_decision')?.input.content).toMatchObject({
+      decision: 'finish', artifactId: 'artifact-private', artifactVersion: 1,
+    });
   });
 
   it('slices finish artifacts under 9000 bytes, waits for exact ACKs, paces pieces, then sends a reference-only decision', async () => {
