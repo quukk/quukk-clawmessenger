@@ -6,6 +6,8 @@ import {
   BridgeTaskIdSchema,
   BridgeTaskStartInputSchema,
   BridgeTaskStartResponseSchema,
+  BridgeTaskFenceResponseSchema,
+  type BridgeTaskFenceProof,
   isTerminalBridgeTaskEvent,
   type BridgeHealth,
   type BridgeRuntime,
@@ -186,6 +188,8 @@ export class BridgeClient implements BridgeTaskPort {
     const parsed = BridgeTaskStartInputSchema.safeParse(input);
     if (!parsed.success) throw new BridgeClientError('invalid_request');
     const wire = {
+      ...(parsed.data.model === undefined ? {} : { model: parsed.data.model }),
+      ...(parsed.data.requestId === undefined ? {} : { request_id: parsed.data.requestId }),
       runtime_id: parsed.data.runtimeId,
       conversation_key: parsed.data.conversationKey,
       prompt: parsed.data.prompt,
@@ -212,6 +216,13 @@ export class BridgeClient implements BridgeTaskPort {
     const parsed = BridgeTaskIdSchema.safeParse(taskID);
     if (!parsed.success) throw new BridgeClientError('invalid_request');
     await this.#emptyRequest(`/v1/tasks/${parsed.data}/cancel`, options);
+  }
+
+  async fenceTask(taskID: string, options: BridgeRequestOptions = {}): Promise<BridgeTaskFenceProof> {
+    const parsed = BridgeTaskIdSchema.safeParse(taskID);
+    if (!parsed.success) throw new BridgeClientError('invalid_request');
+    const response = await this.#jsonRequest(`/v1/tasks/${parsed.data}/fence`, { method: 'POST' }, BridgeTaskFenceResponseSchema, 200, options);
+    return response;
   }
 
   async health(options: BridgeRequestOptions = {}): Promise<BridgeHealth> {

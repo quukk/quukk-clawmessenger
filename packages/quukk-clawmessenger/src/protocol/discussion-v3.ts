@@ -36,6 +36,14 @@ export type DiscussionV3Checkpoint = DiscussionV3Identity & Checkpoint & { msg_t
 export type DiscussionV3Contribution = DiscussionV3Identity & { assignmentId: string; content: string; idempotencyKey: string } & ({ msg_type: 'discussion_contribution_delta'; seq: number } | { msg_type: 'discussion_contribution_completed' });
 export type DiscussionV3NodeError = DiscussionV3Identity & { msg_type: 'discussion_node_error'; assignmentId?: string; category: 'invalid_response' | 'model_error' | 'timeout'; message: string; idempotencyKey: string };
 export interface DiscussionV3EventDataMap {
+  request_interrupted: { targetRequestId: string; targetMemberId: string; reason: 'user_interjection'; partialPreserved: true };
+  interjection_applied: { messageUid: string; targetRequestId: string | null; replacementRequestId: string };
+  interruption_failed: { targetRequestId: string; targetMemberId: string; reason: 'cancel_failed' | 'cancel_unconfirmed'; retryable: true };
+  discussion_started: { roundPolicy: 'user_confirmed' };
+  discussion_completed: { reason: 'user_finished' };
+  discussion_cancelled: { reason: 'user_cancelled' | 'stopped' };
+  discussion_failed: { reason: 'summary_failed' | 'cancel_failed' | 'cancel_unconfirmed' | 'dispatch_failed'; retryable: boolean };
+  discussion_progress: Record<string, never>;
   round_started: { round: number; roundFocus: string };
   round_summary_started: { round: number };
   round_summary_completed: { round: number; revision: number; sourceRequestId: string; documentId: string; title: string; content: string };
@@ -80,6 +88,14 @@ const base: Fields = { msg_type: text(64), protocolVersion: choice(3), discussio
 const positions = array(shape({ memberId: id, position: text(2000) }), 32);
 const checkpoint: Fields = { memberPositions: positions, agreements: array(text(2000), 32), disagreements: array(text(2000), 32), openQuestions: array(text(2000), 32), nextFocus: text(2000, true), recommendation: choice('continue', 'finish'), summaryMarkdown: nonblank(L.maxContribution) };
 const eventData: Record<string, Validator> = {
+  request_interrupted: shape({ targetRequestId: id, targetMemberId: id, reason: choice('user_interjection'), partialPreserved: choice(true) }),
+  interjection_applied: shape({ messageUid: id, targetRequestId: nullable(id), replacementRequestId: id }),
+  interruption_failed: shape({ targetRequestId: id, targetMemberId: id, reason: choice('cancel_failed','cancel_unconfirmed'), retryable: choice(true) }),
+  discussion_started: shape({ roundPolicy: choice('user_confirmed') }),
+  discussion_completed: shape({ reason: choice('user_finished') }),
+  discussion_cancelled: shape({ reason: choice('user_cancelled','stopped') }),
+  discussion_failed: shape({ reason: choice('summary_failed','cancel_failed','cancel_unconfirmed','dispatch_failed'), retryable: choice(true,false) }),
+  discussion_progress: shape({}),
   round_started: shape({ round: integer(0), roundFocus: text(L.maxGoal, true) }),
   round_summary_started: shape({ round: integer(0) }),
   round_summary_completed: shape({ round: integer(0), revision: integer(0), sourceRequestId: id, documentId: id, title: text(L.maxTitle), content: nonblank(L.maxContribution) }),
@@ -123,6 +139,8 @@ export function parseDiscussionV3(value: unknown): DiscussionV3Message | null {
         if (!valid || typeof v.eventType !== 'string' || !Object.hasOwn(eventData, v.eventType) || !eventData[v.eventType]!(v.data)) return null;
         const data = v.data as Record<string, unknown>;
         valid = (!Object.hasOwn(data, 'round') || data.round === v.round)
+          && (v.eventType !== 'request_interrupted' || data.targetRequestId === v.requestId)
+          && (v.eventType !== 'interjection_applied' || data.replacementRequestId === v.requestId)
           && (v.eventType !== 'round_summary_completed' || (data.revision === v.roundRevision && data.sourceRequestId === v.requestId));
         break;
       }

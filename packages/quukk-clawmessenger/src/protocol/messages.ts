@@ -119,6 +119,7 @@ const maxCardEnvelopeBytes = 10 * 1024;
 const controlCharacters = /[\p{Cc}\p{Cf}]/u;
 const dangerousObjectKeys = new Set(['__proto__', 'prototype', 'constructor']);
 const rawContentKeys = new Set([
+  'roundRevision', 'targetRequestId', 'targetMemberId', 'summaryMarkdown', 'result', 'eventType', 'actorId',
   'protocol_version', 'stream_id', 'request_message_id', 'requester_id', 'conversation_type', 'conversation_id', 'text',
   'content', 'attachments', 'msg_type', 'service', 'version', 'action', 'payload', 'timestamp',
   'request_id', 'requestId', 'source_im_id', 'sourceImId', 'destination_im_id', 'destinationImId',

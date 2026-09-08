@@ -3,6 +3,17 @@ import { readFileSync } from 'node:fs';
 const fixture = JSON.parse(readFileSync(new URL('./fixtures/discussion-v3-messages.json', import.meta.url), 'utf8'));
 import { parseDiscussionV3, matchesDiscussionV3CancelAck } from './discussion-v3.js';
 import { createHash } from 'node:crypto';
+const runtimeFixture = JSON.parse(readFileSync(new URL('./fixtures/discussion-wire-cross-runtime.json', import.meta.url), 'utf8'));
+for (const bucket of ['valid','invalid'] as const) {
+  for (const event of runtimeFixture.v3EventContracts[bucket]) {
+    it(`validates public v3 ${event.eventType} (${bucket})`,()=>{
+      const message = {...fixture.valid.event,...event};
+      if(event.eventType==='request_interrupted') message.requestId=event.data.targetRequestId;
+      if(event.eventType==='interjection_applied') message.requestId=event.data.replacementRequestId;
+      expect(parseDiscussionV3(message)!==null).toBe(bucket==='valid');
+    });
+  }
+}
 for (const [name, message] of Object.entries(fixture.valid)) {
   it(`accepts shared ${name}`, () => expect(parseDiscussionV3(message)).toEqual(message));
 }

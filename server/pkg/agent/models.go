@@ -1821,6 +1821,8 @@ const hermesDiscoveryTimeout = 40 * time.Second
 // `--acp`), and what to label temporary work directories so they're
 // easy to identify in logs.
 type acpDiscoveryProvider struct {
+	// initializeOnly reads protocol capabilities without opening a model session.
+	initializeOnly   bool
 	defaultBin       string
 	clientName       string
 	extraEnv         []string
@@ -2008,6 +2010,9 @@ func discoverACPModels(ctx context.Context, runtimeCmd Command, p acpDiscoveryPr
 	}
 	if p.inspectInit != nil {
 		p.inspectInit(initResult)
+	}
+	if p.initializeOnly {
+		return nil, nil
 	}
 
 	// session/new requires a valid cwd — use a temp directory we

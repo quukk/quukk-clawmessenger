@@ -24,6 +24,7 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const TRANSIENT_STATUSES = new Set([408, 425, 500, 502, 503, 504]);
 
 export type RegistrationInput = {
+  capabilities?: readonly string[];
   serverUrl: string;
   installId: string;
   runtimeId: string;
@@ -36,6 +37,7 @@ export type RegistrationInput = {
 };
 
 export type RefreshInput = {
+  capabilities?: readonly string[];
   serverUrl: string;
   runtimeId: string;
   bridgeSecret: string;
@@ -265,6 +267,7 @@ function registrationResult(
   provider: Provider,
   submittedNodeName: string,
   expectedNodeId?: string,
+  expectedCapabilities: readonly string[] = CLAWMESSENGER_NODE_CAPABILITIES,
 ): RegistrationResult {
   const envelope = envelopeSchema.safeParse(value);
   if (!envelope.success) throw invalidResponse(operation);
@@ -290,9 +293,10 @@ function registrationResult(
     throw invalidResponse(operation);
   }
   if (
-    data.data.capabilities.length !== CLAWMESSENGER_NODE_CAPABILITIES.length ||
+    data.data.capabilities.length !== expectedCapabilities.length ||
+    new Set(data.data.capabilities).size !== expectedCapabilities.length ||
     data.data.capabilities.some(
-      (capability, index) => capability !== CLAWMESSENGER_NODE_CAPABILITIES[index],
+      (capability) => !expectedCapabilities.includes(capability),
     )
   ) {
     throw new RegistrationError('registration_capabilities_mismatch', 'validation', false);
@@ -443,13 +447,13 @@ export class RegistrationClient {
           mac_address: stableMac(input.installId, this.#networkInterfaces),
           node_type: input.provider,
           ai_type: input.provider,
-          capabilities: [...CLAWMESSENGER_NODE_CAPABILITIES],
+          capabilities: [...(input.capabilities ?? CLAWMESSENGER_NODE_CAPABILITIES)],
         }
       : {
           provider: input.provider,
           name: input.nodeName,
           mac_address: stableMac(input.installId, this.#networkInterfaces),
-          capabilities: [...CLAWMESSENGER_NODE_CAPABILITIES],
+          capabilities: [...(input.capabilities ?? CLAWMESSENGER_NODE_CAPABILITIES)],
         };
     if (input.existingNodeId !== undefined) requestBody.node_id = input.existingNodeId;
     const headers: Record<string, string> = {
@@ -480,6 +484,7 @@ export class RegistrationClient {
       input.provider,
       input.nodeName,
       input.existingNodeId,
+      input.capabilities,
     );
   }
 
@@ -511,11 +516,11 @@ export class RegistrationClient {
         headers,
         body: JSON.stringify({
           name: input.nodeName,
-          capabilities: [...CLAWMESSENGER_NODE_CAPABILITIES],
+          capabilities: [...(input.capabilities ?? CLAWMESSENGER_NODE_CAPABILITIES)],
         }),
       },
       signal,
     );
-    return registrationResult(response, 'refresh', input.provider, input.nodeName, input.nodeId);
+    return registrationResult(response, 'refresh', input.provider, input.nodeName, input.nodeId, input.capabilities);
   }
 }

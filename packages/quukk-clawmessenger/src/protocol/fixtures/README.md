@@ -33,6 +33,8 @@ All fixtures in this directory are offline protocol data. They contain no creden
 
 ## `discussion-wire-cross-runtime.json`
 
+- Interactive-round extension synchronized from S commit `b3c91ef` on 2026-09-08: `v3EventContracts.valid/invalid` adds the public interruption/lifecycle/progress schema cases. Canonical LF SHA-256: `819f2a3f9673638ee219508dbe17c22f7cd1af6e233e73bcae9ee3ab813bf103`; Git blob `8f334032239bf203d006af4b0ae7cefe84009792`. The historical provenance below describes the unchanged original wire-frame portion.
+
 - Original generator/server repository: https://github.com/quukk/clawmessenger-server
 - Server origin commit: `74967a1e16cd6c6642bd79f892ee13049e518316`
 - Server path: `tests/fixtures/discussion_wire_cross_runtime.json`

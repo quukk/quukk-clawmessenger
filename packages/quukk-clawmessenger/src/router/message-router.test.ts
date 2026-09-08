@@ -295,7 +295,7 @@ interface RouterHarness {
 }
 
 async function routerHarness(
-  overrides: Partial<Pick<MessageRouterOptions, 'sleep' | 'timers'>> = {},
+  overrides: Partial<Pick<MessageRouterOptions, 'sleep' | 'timers' | 'interactiveAvailable'>> = {},
 ): Promise<RouterHarness> {
   const filePath = await temporaryStatePath();
   const order: string[] = [];
@@ -405,6 +405,47 @@ async function routerHarness(
   };
 }
 
+it('dispatches authenticated v3 through the interactive runtime using a durable caller identity',async()=>{
+ const h=await routerHarness({interactiveAvailable:async()=>true});
+ Object.assign(h.task,{health:async()=>({instance_id:`br_${'a'.repeat(32)}`}),fenceTask:async()=> 'not_started'});
+ h.setStart(async input=>{h.starts.push(input);return {taskId:input.requestId!,eventsUrl:`/v1/tasks/${input.requestId}/events`};});
+ h.setEvents(taskId=>(async function*(){yield bridgeEvent(taskId,'completed',{output:'Interactive contribution'});})());
+ const command={...discussionAssignment(),protocolVersion:3,roundRevision:0,timestamp:100,mode:'roundtable',model:null,role:{roleName:'Reviewer',roleInstructions:'Evaluate'},speakingOrder:0,roundFocus:'Migration',priorContributions:[],roundSummaries:[],userInterjections:[],attempt:1};
+ await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,sdkPrivateProtocolMessage('v3-inbound',command)));
+ expect(h.starts).toHaveLength(1);expect(h.starts[0]?.requestId).toMatch(/^task_/);
+ expect(h.sent.some(({input})=>input.messageType==='command_result'&&input.content.protocolVersion===3&&input.content.msg_type==='discussion_contribution_completed')).toBe(true);
+ for(const [uid,text] of [['plain-opinion','My opinion'],['slash-opinion','/new']]) {
+  await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,message(uid!,text!,{conversationType:4,targetId:command.chatroomId})));
+ }
+ await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,{...protocolMessage('relay-opinion',{msg_type:'chatroom_message',chatroom_id:command.chatroomId,content:'relayed opinion'}),conversationType:4,targetId:command.chatroomId}));
+ expect(h.starts).toHaveLength(1);
+});
+
+it('learns room ownership from authenticated v3 public events without running a task',async()=>{
+ const h=await routerHarness();
+ const event={msg_type:'discussion_event',protocolVersion:3,discussionId:'public-d',chatroomId:'public-room',requestId:'event-1',stateVersion:1,round:0,roundRevision:0,timestamp:100,seq:1,eventType:'discussion_progress',actorId:null,targetId:null,data:{}};
+ await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,sdkPrivateProtocolMessage('public-v3',event)));
+ expect(await h.state.isInteractiveRoom(IDENTITY_A,'public-room')).toBe(true);
+ await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,message('public-opinion','opinion',{conversationType:4,targetId:'public-room'})));
+ expect(h.starts).toHaveLength(0);
+ const forged={...protocolMessage('forged-room',{...event,chatroomId:'forged-room'}),senderId:'attacker',conversationType:4 as const,targetId:'forged-room'};
+ await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,forged));
+ expect(await h.state.isInteractiveRoom(IDENTITY_A,'forged-room')).toBe(false);
+});
+
+it('shares a new group session across human senders without reusing private or other-group history',async()=>{
+ const h=await routerHarness();
+ h.setEvents(taskId=>(async function*(){yield bridgeEvent(taskId,'completed',{output:'ok',session_id:`session-${h.starts.length}`});})());
+ await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,message('group-first','one',{senderId:'alice'})));
+ await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,message('group-second','two',{senderId:'bob'})));
+ await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,message('other-group','three',{senderId:'alice',targetId:'other'})));
+ await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,message('private','four',{senderId:'alice',targetId:IDENTITY_A.nodeId,conversationType:1})));
+ expect(h.starts[1]?.resumeSessionId).toBe('session-1');
+ expect(h.starts[1]?.conversationKey).toBe(h.starts[0]?.conversationKey);
+ expect(h.starts[2]?.resumeSessionId).toBeUndefined();expect(h.starts[3]?.resumeSessionId).toBeUndefined();
+ expect(new Set([h.starts[0]?.conversationKey,h.starts[2]?.conversationKey,h.starts[3]?.conversationKey]).size).toBe(3);
+});
+
 async function temporaryStatePath(): Promise<string> {
   await mkdir(TASK_TEMP_ROOT, { recursive: true });
   const directory = await mkdtemp(join(TASK_TEMP_ROOT, 'quukk-task10-state-'));
@@ -501,7 +542,7 @@ describe('RouterStateStore sessions', () => {
       sessions: Array<{ currentSessionId?: string; knownSessions: Array<{ sessionId: string }> }>;
       dedup: unknown[];
     };
-    expect(persisted).toMatchObject({ schemaVersion: 1, dedup: [] });
+    expect(persisted).toMatchObject({ schemaVersion: 2, dedup: [] });
     expect(persisted.sessions[0]?.currentSessionId).toBe('session:b|a');
     expect(persisted.sessions[0]?.knownSessions.map(({ sessionId }) => sessionId)).toEqual([
       'session:a|b',
@@ -871,7 +912,7 @@ describe('MessageRouter plain task admission', () => {
     ]);
     expect(fixture.starts).toEqual([{
       runtimeId: RUNTIME_A,
-      conversationKey: JSON.stringify([RUNTIME_A, IDENTITY_A.nodeId, 3, 'group', 'sender']),
+      conversationKey: JSON.stringify([RUNTIME_A, IDENTITY_A.nodeId, 'group', 'group']),
       prompt: 'hello',
       workdir: AUTHORIZED_WORKDIR,
     }]);
@@ -1536,7 +1577,7 @@ describe('MessageRouter session, legacy, device, and chatroom dispatch', () => {
   it('never switches to or reveals a session from another conversation', async () => {
     const fixture = await routerHarness();
     const current = conversationFromForTest(IDENTITY_A);
-    const other = { ...current, senderId: 'other-sender' };
+    const other = { ...current, targetId: 'other-group', senderId: 'other-sender' };
     await fixture.state.applyEventSession({ conversation: current, authoritativeSessionId: 'mine' });
     await fixture.state.applyEventSession({ conversation: other, authoritativeSessionId: 'secret-other' });
 
@@ -1753,7 +1794,7 @@ describe('MessageRouter session, legacy, device, and chatroom dispatch', () => {
     expect(fixture.starts).toHaveLength(1);
     expect(fixture.starts[0]).toMatchObject({
       runtimeId: RUNTIME_A,
-      conversationKey: JSON.stringify([RUNTIME_A, IDENTITY_A.nodeId, 4, 'room-one', 'sender']),
+      conversationKey: JSON.stringify([RUNTIME_A, IDENTITY_A.nodeId, 'chatroom', 'room-one']),
       prompt: 'room prompt',
     });
     expect(fixture.joined).toHaveLength(2);
@@ -4632,6 +4673,7 @@ describe('MessageRouter CardKit action dispatch', () => {
 
 function conversationFromForTest(identity: WorkerIdentity): ConversationIdentity {
   return {
+    sessionScope: 'group',
     ...identity,
     conversationType: 3,
     targetId: 'group',

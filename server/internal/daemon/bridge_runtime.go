@@ -24,20 +24,22 @@ const (
 )
 
 type BridgeRuntimeCapabilities struct {
-	SessionResume  bool `json:"session_resume"`
-	Cancel         bool `json:"cancel"`
-	TextEvents     bool `json:"text_events"`
-	ToolEvents     bool `json:"tool_events"`
-	ApprovalEvents bool `json:"approval_events"`
+	InteractiveRounds bool `json:"interactive_rounds,omitempty"`
+	SessionResume     bool `json:"session_resume"`
+	Cancel            bool `json:"cancel"`
+	TextEvents        bool `json:"text_events"`
+	ToolEvents        bool `json:"tool_events"`
+	ApprovalEvents    bool `json:"approval_events"`
 }
 
 type BridgeRuntime struct {
-	ID           string                    `json:"id,omitempty"`
-	Provider     string                    `json:"provider"`
-	Version      string                    `json:"version,omitempty"`
-	Path         string                    `json:"path,omitempty"`
-	Status       BridgeRuntimeStatus       `json:"status"`
-	Capabilities BridgeRuntimeCapabilities `json:"capabilities"`
+	InteractiveUnavailableReason string                    `json:"interactive_unavailable_reason,omitempty"`
+	ID                           string                    `json:"id,omitempty"`
+	Provider                     string                    `json:"provider"`
+	Version                      string                    `json:"version,omitempty"`
+	Path                         string                    `json:"path,omitempty"`
+	Status                       BridgeRuntimeStatus       `json:"status"`
+	Capabilities                 BridgeRuntimeCapabilities `json:"capabilities"`
 }
 
 const (
@@ -60,6 +62,7 @@ var bridgeRuntimeSpecs = [bridgeRuntimeCount]bridgeRuntimeSpec{
 }
 
 type bridgeDeps struct {
+	probeInteractive           func(context.Context, string, agent.Command, string) (bool, error)
 	probeAgentCLIs             func() map[string]AgentEntry
 	resolveAgentExecutablePath func(string) (string, error)
 	canonicalExecutablePath    func(string) string
@@ -72,6 +75,7 @@ type bridgeDeps struct {
 
 func defaultBridgeDeps() bridgeDeps {
 	return bridgeDeps{
+		probeInteractive:           agent.ProbeInteractiveRuntime,
 		probeAgentCLIs:             probeAgentCLIs,
 		resolveAgentExecutablePath: resolveAgentExecutablePath,
 		canonicalExecutablePath:    canonicalExecutablePath,
@@ -217,6 +221,22 @@ func (b *Bridge) probeRuntime(ctx context.Context, spec bridgeRuntimeSpec, candi
 		return runtime
 	}
 	runtime.Status = BridgeRuntimeReady
+	runtime.InteractiveUnavailableReason = spec.provider + " requires verified cancellation, session resume and text events"
+	if spec.provider == "hermes" || spec.provider == "opencode" {
+		runtime.InteractiveUnavailableReason = spec.provider + " requires ACP protocol 1 with advertised session resume support"
+	} else if spec.provider == "openclaw" {
+		runtime.InteractiveUnavailableReason = "openclaw requires protocol 4 Gateway, exact read/write scopes, session create/patch/resolve, chat send/abort/history and chat events"
+	}
+	if b.deps.probeInteractive != nil {
+		proof, err := b.deps.probeInteractive(probeCtx, spec.provider, agent.NewCommand(candidate.launchPath, nil), version)
+		if err == nil && proof {
+			runtime.InteractiveUnavailableReason = ""
+			runtime.Capabilities.InteractiveRounds = true
+			runtime.Capabilities.SessionResume = true
+			runtime.Capabilities.Cancel = true
+			runtime.Capabilities.TextEvents = true
+		}
+	}
 	return runtime
 }
 

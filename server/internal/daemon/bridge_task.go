@@ -7,10 +7,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/multica-ai/multica/server/pkg/agent"
@@ -19,6 +22,8 @@ import (
 )
 
 type BridgeTaskRequest struct {
+	RequestID       string `json:"request_id,omitempty"`
+	Model           string `json:"model,omitempty"`
 	RuntimeID       string `json:"runtime_id"`
 	ConversationKey string `json:"conversation_key"`
 	ResumeSessionID string `json:"resume_session_id,omitempty"`
@@ -67,6 +72,10 @@ var (
 	ErrBridgeTaskRuntimeNotReady = errors.New("bridge runtime is not ready")
 	ErrBridgeTaskUnknown         = errors.New("unknown bridge task")
 	ErrBridgeTaskFutureCursor    = errors.New("bridge task replay cursor is in the future")
+	ErrBridgeTaskRequestConflict = errors.New("bridge request identity conflict")
+	ErrBridgeTaskRequestFenced   = errors.New("bridge request cancelled before start")
+	ErrBridgeTaskRequestExpired  = errors.New("bridge request expired")
+	ErrBridgeTaskStopUnconfirmed = errors.New("bridge task stop unconfirmed")
 )
 
 const (
@@ -102,6 +111,8 @@ type bridgeTaskManager struct {
 	mu            sync.Mutex
 	tasks         map[string]*bridgeTask
 	conversations map[string]*bridgeConversation
+	requests      map[string]BridgeTaskRequest
+	fences        map[string]bool
 }
 
 type bridgeConversation struct {
@@ -115,12 +126,14 @@ type bridgeTask struct {
 	now        func() time.Time
 	eventLimit int
 
-	mu          sync.Mutex
-	nextEventID uint64
-	events      []BridgeTaskEvent
-	subscribers map[chan BridgeTaskEvent]chan struct{}
-	terminal    bool
-	terminalAt  time.Time
+	mu            sync.Mutex
+	nextEventID   uint64
+	events        []BridgeTaskEvent
+	subscribers   map[chan BridgeTaskEvent]chan struct{}
+	terminal      bool
+	terminalAt    time.Time
+	done          chan struct{}
+	terminalEvent BridgeTaskEvent
 }
 
 var bridgeTaskIDSequence atomic.Uint64
@@ -164,6 +177,8 @@ func newBridgeTaskManager(root context.Context, deps bridgeTaskDeps) *bridgeTask
 		deps:          deps,
 		tasks:         make(map[string]*bridgeTask),
 		conversations: make(map[string]*bridgeConversation),
+		requests:      make(map[string]BridgeTaskRequest),
+		fences:        make(map[string]bool),
 	}
 }
 
@@ -178,9 +193,32 @@ func newDefaultBridgeTaskManager(root context.Context, bridge *Bridge, logger *s
 
 func (m *bridgeTaskManager) Start(req BridgeTaskRequest) (string, error) {
 	m.pruneExpired()
+	if req.Model != "" && (len(req.Model) > 256 || strings.Count(req.Model, "/") != 1 || strings.HasPrefix(req.Model, "/") || strings.HasSuffix(req.Model, "/") || strings.IndexFunc(req.Model, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) || r == '\ufeff' }) >= 0) {
+		return "", ErrBridgeTaskInvalidRequest
+	}
+	if req.RequestID != "" {
+		if err := m.validRequestID(req.RequestID); err != nil {
+			return "", err
+		}
+	}
 	if strings.TrimSpace(req.RuntimeID) == "" || strings.TrimSpace(req.ConversationKey) == "" ||
 		strings.TrimSpace(req.WorkDir) == "" || strings.TrimSpace(req.Prompt) == "" {
 		return "", ErrBridgeTaskInvalidRequest
+	}
+	if req.RequestID != "" {
+		m.mu.Lock()
+		previous, exists := m.requests[req.RequestID]
+		fenced := m.fences[req.RequestID]
+		m.mu.Unlock()
+		if fenced {
+			return "", ErrBridgeTaskRequestFenced
+		}
+		if exists {
+			if previous != req {
+				return "", ErrBridgeTaskRequestConflict
+			}
+			return req.RequestID, nil
+		}
 	}
 	workDir, err := m.deps.canonicalWorkDir(req.WorkDir)
 	if err != nil || workDir == "" {
@@ -196,8 +234,34 @@ func (m *bridgeTaskManager) Start(req BridgeTaskRequest) (string, error) {
 	if runtime.Status != BridgeRuntimeReady {
 		return "", ErrBridgeTaskRuntimeNotReady
 	}
+	if _, err := agent.InteractiveModelSelector(runtime.Provider, req.Model); err != nil {
+		return "", fmt.Errorf("%w: %v", ErrBridgeTaskInvalidRequest, err)
+	}
 
-	taskID := m.deps.newTaskID()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if req.RequestID != "" {
+		if m.fences[req.RequestID] {
+			return "", ErrBridgeTaskRequestFenced
+		}
+		if previous, ok := m.requests[req.RequestID]; ok {
+			if previous != req {
+				return "", ErrBridgeTaskRequestConflict
+			}
+			return req.RequestID, nil
+		}
+		bytes := len(req.Prompt)
+		for _, previous := range m.requests {
+			bytes += len(previous.Prompt)
+		}
+		if len(m.requests)+len(m.fences) >= 2048 || bytes > 32<<20 {
+			return "", ErrBridgeTaskInvalidRequest
+		}
+	}
+	taskID := req.RequestID
+	if taskID == "" {
+		taskID = m.deps.newTaskID()
+	}
 	taskCtx, cancel := context.WithCancel(m.root)
 	task := &bridgeTask{
 		id:          taskID,
@@ -205,10 +269,12 @@ func (m *bridgeTaskManager) Start(req BridgeTaskRequest) (string, error) {
 		now:         m.deps.now,
 		eventLimit:  m.deps.eventLimit,
 		subscribers: make(map[chan BridgeTaskEvent]chan struct{}),
+		done:        make(chan struct{}),
 	}
-	m.mu.Lock()
 	m.tasks[taskID] = task
-	m.mu.Unlock()
+	if req.RequestID != "" {
+		m.requests[req.RequestID] = req
+	}
 
 	go func() {
 		release, ok := m.acquireConversation(taskCtx, req.RuntimeID+"\x00"+req.ConversationKey)
@@ -294,6 +360,21 @@ func (m *bridgeTaskManager) Cancel(taskID string) error {
 	return nil
 }
 
+func (m *bridgeTaskManager) TerminalSession(taskID string) string {
+	m.mu.Lock()
+	task := m.tasks[taskID]
+	m.mu.Unlock()
+	if task == nil {
+		return ""
+	}
+	task.mu.Lock()
+	defer task.mu.Unlock()
+	if !task.terminal {
+		return ""
+	}
+	return task.terminalEvent.SessionID
+}
+
 func (m *bridgeTaskManager) pruneExpired() {
 	now := m.deps.now()
 	m.mu.Lock()
@@ -302,9 +383,75 @@ func (m *bridgeTaskManager) pruneExpired() {
 		task.mu.Lock()
 		expired := task.terminal && !task.terminalAt.IsZero() && !now.Before(task.terminalAt.Add(m.deps.terminalTTL))
 		task.mu.Unlock()
-		if expired {
+		if expired && (m.requests[id].RequestID == "" || m.validRequestID(id) != nil) {
 			delete(m.tasks, id)
+			delete(m.requests, id)
 		}
+	}
+	for id := range m.fences {
+		if m.validRequestID(id) != nil {
+			delete(m.fences, id)
+		}
+	}
+}
+
+var bridgeRequestIDPattern = regexp.MustCompile(`^task_([0-9a-f]+)_[0-9a-f]+$`)
+
+const bridgeRequestLifetime = 24 * time.Hour
+
+func (m *bridgeTaskManager) validRequestID(id string) error {
+	parts := bridgeRequestIDPattern.FindStringSubmatch(id)
+	if len(id) > 128 || len(parts) != 2 {
+		return ErrBridgeTaskInvalidRequest
+	}
+	issued, err := strconv.ParseInt(parts[1], 16, 64)
+	if err != nil {
+		return ErrBridgeTaskInvalidRequest
+	}
+	now := m.deps.now()
+	if issued <= 0 || time.UnixMilli(issued).After(now.Add(5*time.Minute)) || !now.Before(time.UnixMilli(issued).Add(bridgeRequestLifetime)) {
+		return ErrBridgeTaskRequestExpired
+	}
+	return nil
+}
+
+// Fence reserves an unknown caller identity under the same lock as Start.
+// A successful result proves a terminal boundary, never just signal delivery.
+func (m *bridgeTaskManager) Fence(ctx context.Context, id string) (string, error) {
+	m.pruneExpired()
+	if err := m.validRequestID(id); err != nil {
+		return "", err
+	}
+	m.mu.Lock()
+	task := m.tasks[id]
+	if task == nil {
+		if !m.fences[id] && len(m.requests)+len(m.fences) >= 2048 {
+			m.mu.Unlock()
+			return "", ErrBridgeTaskInvalidRequest
+		}
+		m.fences[id] = true
+		m.mu.Unlock()
+		return "not_started", nil
+	}
+	m.mu.Unlock()
+	task.mu.Lock()
+	wasTerminal := task.terminal
+	task.mu.Unlock()
+	task.cancel()
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-task.done:
+		task.mu.Lock()
+		terminal := task.terminalEvent
+		task.mu.Unlock()
+		if terminal.Error != nil && terminal.Error.Category == "stop_unconfirmed" {
+			return "", ErrBridgeTaskStopUnconfirmed
+		}
+		if wasTerminal {
+			return "already_terminal", nil
+		}
+		return "cancelled", nil
 	}
 }
 
@@ -360,6 +507,7 @@ func (m *bridgeTaskManager) execute(ctx context.Context, task *bridgeTask, runti
 	}
 
 	opts := agent.ExecOptions{
+		Model:           req.Model,
 		StreamText:      true,
 		Cwd:             workDir,
 		Timeout:         m.deps.timeout,
@@ -369,6 +517,10 @@ func (m *bridgeTaskManager) execute(ctx context.Context, task *bridgeTask, runti
 	}
 	if runtime.Provider == "openclaw" {
 		opts.OpenclawMode = "gateway"
+		opts.Model = ""
+		opts.TaskModel = req.Model
+	} else if req.Model != "" {
+		opts.Model, _ = agent.InteractiveModelSelector(runtime.Provider, req.Model)
 	}
 	result, tools, err := m.executeAttempt(ctx, task, backend, req.Prompt, opts)
 	if err != nil {
@@ -496,6 +648,10 @@ func (t *bridgeTask) publish(event BridgeTaskEvent) {
 	if bridgeTaskTerminalEvent(event.Type) {
 		t.terminal = true
 		t.terminalAt = event.Time
+		t.terminalEvent = event
+		if t.done != nil {
+			close(t.done)
+		}
 		t.cancel()
 		for subscriber, done := range t.subscribers {
 			delete(t.subscribers, subscriber)

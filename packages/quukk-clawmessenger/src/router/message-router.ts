@@ -63,10 +63,13 @@ import type { WorkerIdentity } from '../rongcloud/worker-supervisor.js';
 import {
   bindingKey,
   conversationKey,
+  interactiveSessionKey,
   replyTargetId,
   type ConversationIdentity,
 } from './conversation.js';
 import type { RouterStateStore } from './session-store.js';
+import { DiscussionV3Router, type InteractiveTaskPort } from './discussion-v3-router.js';
+import { parseDiscussionV3 } from '../protocol/discussion-v3.js';
 
 const MAX_PROMPT_BYTES = 128 * 1024;
 const MAX_WAITING_PER_CONVERSATION = 8;
@@ -227,6 +230,7 @@ export interface RouterLogger {
 }
 
 export interface MessageRouterOptions {
+  interactiveAvailable?: (identity: WorkerIdentity) => Promise<boolean>;
   task: BridgeTaskPort;
   worker: RouterWorkerPort;
   binding: RouterBindingPort;
@@ -476,6 +480,7 @@ function promptFor(message: NormalizedRongCloudMessage): string | undefined {
 
 function conversationFrom(message: NormalizedRongCloudMessage, identity: WorkerIdentity): ConversationIdentity {
   return {
+    ...(message.conversationType === 1 ? {} : { sessionScope: 'group' as const }),
     ...identity,
     conversationType: message.conversationType,
     targetId: message.targetId,
@@ -506,9 +511,10 @@ function discussionSessionConversation(
   conversation: ConversationIdentity,
   discussionId: string,
 ): ConversationIdentity {
+  const { sessionScope: _scope, ...legacy } = conversation;
   return conversation.conversationType === 1
     ? { ...conversation, targetId: discussionId }
-    : conversation;
+    : legacy;
 }
 
 function authorizedDiscussionWorkCommand(
@@ -581,6 +587,8 @@ export class MessageRouter {
   readonly #bufferDrains = new Map<string, Promise<void>>();
   readonly #bufferDrainTasks = new Map<string, string>();
   readonly #discussion = new Map<string, BindingDiscussionState>();
+  readonly #interactive = new Map<string, DiscussionV3Router>();
+  readonly #interactiveAvailable: (identity: WorkerIdentity) => Promise<boolean>;
   readonly #inflightByBinding = new Map<string, InflightBindingOperations>();
   readonly #outboundByBinding = new Map<string, Set<Promise<unknown>>>();
   readonly #bindingDisposals = new Map<string, Promise<void>>();
@@ -592,6 +600,7 @@ export class MessageRouter {
   #disposeAttempt?: Promise<void>;
 
   constructor(options: MessageRouterOptions) {
+    this.#interactiveAvailable = options.interactiveAvailable ?? (async () => false);
     this.#task = options.task;
     this.#worker = options.worker;
     this.#binding = options.binding;
@@ -648,7 +657,17 @@ export class MessageRouter {
       && typeof event.message.rawContent.msg_type === 'string'
       ? event.message.rawContent
       : event.message.text;
+    const publicEvent = parseDiscussionV3(protocolInput);
+    if (publicEvent?.msg_type === 'discussion_event' && event.message.senderId === 'system'
+      && (systemPrivateDiscussionTransportMatches(identity,event.message)
+        || (event.message.conversationType === 4 && event.message.targetId === publicEvent.chatroomId))) {
+      await this.#state.rememberInteractiveRoom(identity,publicEvent.chatroomId,publicEvent.discussionId);
+      return;
+    }
     const parsed = parseProtocolContent(protocolInput);
+    if (event.message.conversationType === 4
+      && await this.#state.isInteractiveRoom(identity,event.message.targetId)
+      && !(parsed.kind === 'protocol' && parsed.msgType.startsWith('discussion_'))) return;
     if (parsed.kind === 'ignored') return;
     if (parsed.kind === 'invalid') {
       await this.#safeSendText(identity, conversationFrom(event.message, identity), '[invalid_message]');
@@ -738,6 +757,8 @@ export class MessageRouter {
       if (!lane.running) this.#lanes.delete(laneKey);
     }
     const cancellations: Promise<unknown>[] = [];
+    const interactive = this.#interactive.get(key);
+    if (interactive) { cancellations.push(interactive.dispose()); this.#interactive.delete(key); }
     for (const active of this.#active.values()) {
       if (active.bindingKey !== key) continue;
       active.suppressed = true;
@@ -813,6 +834,10 @@ export class MessageRouter {
       if (entries[0]) identities.set(key, entries[0].identity);
     }
     for (const [key, inflight] of this.#inflightByBinding) identities.set(key, inflight.identity);
+    for (const key of this.#interactive.keys()) {
+      const [runtimeId,nodeId] = JSON.parse(key) as [string,string];
+      identities.set(key,{runtimeId,nodeId});
+    }
     for (const identity of identities.values()) this.#beginBindingDisposal(identity);
     const results = await Promise.allSettled([...this.#bindingDisposals.values()]);
     const rejected = results.find((result) => result.status === 'rejected');
@@ -942,6 +967,7 @@ export class MessageRouter {
       const conversation: ConversationIdentity = {
         ...identity,
         conversationType: 4,
+        sessionScope: 'group',
         targetId: roomId,
         senderId: message.senderId,
       };
@@ -1027,6 +1053,26 @@ export class MessageRouter {
     physicalAdmitted: boolean,
   ): Promise<void> {
     const conversation = conversationFrom(message, identity);
+    if (value.protocolVersion === 3) {
+      const command = parseDiscussionV3(value);
+      if (!command || !systemPrivateDiscussionTransportMatches(identity,message)) return;
+      const task = this.#task as Partial<InteractiveTaskPort>;
+      if (typeof task.health !== 'function' || typeof task.fenceTask !== 'function') return;
+      const key = bindingKey(identity);
+      let router = this.#interactive.get(key);
+      if (!router) {
+        const generation = this.#bindingGeneration(identity);
+        router = new DiscussionV3Router({ identity, memberId: identity.nodeId, state:this.#state, task:task as InteractiveTaskPort,
+          available:async()=>this.#bindingGenerationCurrent(identity,generation) && !!await this.#binding.binding(identity) && await this.#interactiveAvailable(identity),
+          workdir:()=>this.#binding.authorizeDefaultWorkdir(identity),
+          now:this.#clock,
+          send:payload=>this.#sendDiscussionPayload(identity,{...identity,conversationType:1,targetId:'system',senderId:'system'},'command_result',{...payload},undefined,generation),
+        });
+        this.#interactive.set(key,router);
+      }
+      await router.handle(message.senderId,command);
+      return;
+    }
     if (msgType === 'discussion_cancel' || msgType === 'discussion_artifact_ack') {
       await this.#runDiscussionControl(identity, message, msgType, value, physicalAdmitted);
       return;
@@ -2264,7 +2310,7 @@ export class MessageRouter {
       if (Buffer.byteLength(prompt, 'utf8') > MAX_PROMPT_BYTES) throw new Error('prompt_too_large');
       const started = await this.#task.startTask({
         runtimeId: identity.runtimeId,
-        conversationKey: conversationKey(conversation),
+        conversationKey: interactiveSessionKey(identity.runtimeId, identity.nodeId, 'recommendation', request.requestId),
         prompt,
         workdir,
       });

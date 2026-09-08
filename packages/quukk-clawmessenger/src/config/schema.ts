@@ -17,6 +17,7 @@ export type RuntimeDiscoveryStatus =
   | 'probe_failed';
 
 export type TrustedRuntime = {
+  nodeCapabilities?: readonly string[];
   id: string;
   provider: Provider;
   path: string;

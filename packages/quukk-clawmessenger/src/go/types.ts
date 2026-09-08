@@ -16,6 +16,7 @@ export const BridgeRuntimeStatusSchema = z.enum([
 export type BridgeRuntimeStatus = z.infer<typeof BridgeRuntimeStatusSchema>;
 
 export const BridgeRuntimeCapabilitiesSchema = z.strictObject({
+  interactive_rounds: z.boolean().optional(),
   session_resume: z.boolean(),
   cancel: z.boolean(),
   text_events: z.boolean(),
@@ -25,6 +26,7 @@ export const BridgeRuntimeCapabilitiesSchema = z.strictObject({
 export type BridgeRuntimeCapabilities = z.infer<typeof BridgeRuntimeCapabilitiesSchema>;
 
 export const BridgeRuntimeSchema = z.strictObject({
+  interactive_unavailable_reason: z.string().max(512).optional(),
   id: z.string().regex(/^rt_[0-9a-f]{32}$/).optional(),
   provider: BridgeProviderSchema,
   version: nonEmptyString(256).optional(),
@@ -53,6 +55,8 @@ export const BridgeTaskIdSchema = z
   .regex(/^task_[0-9a-f]+_[0-9a-f]+$/);
 
 export const BridgeTaskStartInputSchema = z.strictObject({
+  model: z.string().max(256).regex(/^[^\s/]+\/[^\s/]+$/u).optional(),
+  requestId: BridgeTaskIdSchema.optional(),
   runtimeId: z.string().regex(/^rt_[0-9a-f]{32}$/),
   conversationKey: nonEmptyString(4096).refine((value) => value.trim().length > 0),
   prompt: nonEmptyString(1 << 20).refine((value) => value.trim().length > 0),
@@ -62,6 +66,8 @@ export const BridgeTaskStartInputSchema = z.strictObject({
 export type BridgeTaskStartInput = z.infer<typeof BridgeTaskStartInputSchema>;
 
 export const BridgeTaskStartWireSchema = z.strictObject({
+  model: z.string().max(256).regex(/^[^\s/]+\/[^\s/]+$/u).optional(),
+  request_id: BridgeTaskIdSchema.optional(),
   runtime_id: z.string().regex(/^rt_[0-9a-f]{32}$/),
   conversation_key: nonEmptyString(4096),
   prompt: nonEmptyString(1 << 20),
@@ -74,6 +80,10 @@ export const BridgeTaskStartResponseSchema = z.strictObject({
   events_url: nonEmptyString(256),
 });
 export type BridgeTaskStartResponse = z.infer<typeof BridgeTaskStartResponseSchema>;
+
+export const BridgeTaskFenceResponseSchema = z.strictObject({ result: z.enum(['cancelled', 'already_terminal', 'not_started']), session_id: nonEmptyString(4096).optional() });
+export type BridgeTaskFenceResult = z.infer<typeof BridgeTaskFenceResponseSchema>['result'];
+export type BridgeTaskFenceProof = z.infer<typeof BridgeTaskFenceResponseSchema>;
 
 const rfc3339NanoSchema = z
   .string()
@@ -178,6 +188,8 @@ export function isTerminalBridgeTaskEvent(event: BridgeTaskEvent): boolean {
 
 export interface BridgeTaskPort {
   startTask(input: {
+    model?: string;
+    requestId?: string;
     runtimeId: string;
     conversationKey: string;
     prompt: string;

@@ -412,6 +412,7 @@ export class BindingService {
       const applicationKey = await appKey();
       const identity = this.#store.bridgeIdentity();
       const input: RegistrationInput = {
+        ...(runtime.nodeCapabilities === undefined ? {} : { capabilities: runtime.nodeCapabilities }),
         serverUrl,
         installId: identity.installId,
         runtimeId: runtime.id,
@@ -544,6 +545,7 @@ export class BindingService {
         const applicationKey = await this.#registrationClient.getAppKey(config.serverUrl, signal);
         const identity = this.#store.bridgeIdentity();
         const input: RefreshInput = {
+          ...(runtime.nodeCapabilities === undefined ? {} : { capabilities: runtime.nodeCapabilities }),
           serverUrl: config.serverUrl,
           runtimeId,
           bridgeSecret: identity.secret,

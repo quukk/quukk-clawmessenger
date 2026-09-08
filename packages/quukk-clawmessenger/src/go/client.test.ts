@@ -79,6 +79,21 @@ function clientWith(
   });
 }
 
+it('preserves caller request identity on POST and requires an explicit fence proof', async () => {
+  const requests: Array<{url:string;body:unknown}> = [];
+  const client = clientWith(async (url, init) => {
+    requests.push({url:String(url),body:init?.body ? JSON.parse(String(init.body)) : undefined});
+    return String(url).endsWith('/fence') ? jsonResponse({result:'not_started'})
+      : jsonResponse({task_id:'task_a_b',events_url:'/v1/tasks/task_a_b/events'},201);
+  });
+  await client.startTask({requestId:'task_a_b',runtimeId:`rt_${'a'.repeat(32)}`,conversationKey:'discussion-a',prompt:'Review',workdir:'D:/work'});
+  expect(requests[0]?.body).toMatchObject({request_id:'task_a_b'});
+  await expect(client.fenceTask('task_a_b')).resolves.toEqual({result:'not_started'});
+  expect(requests[1]?.url).toContain('/v1/tasks/task_a_b/fence');
+  await expect(clientWith(async()=>emptyResponse()).fenceTask('task_a_b')).rejects.toMatchObject({code:'response_invalid'});
+  await expect(clientWith(async()=>jsonResponse({result:'accepted'})).fenceTask('task_a_b')).rejects.toMatchObject({code:'response_invalid'});
+});
+
 describe('parseSSE', () => {
   it('preserves split UTF-8 and accepts LF/CRLF frames plus heartbeats', async () => {
     const data = JSON.stringify({ ...started(), text: '你好' });

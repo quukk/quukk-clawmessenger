@@ -27,6 +27,14 @@ const CAPABILITIES = [
   'discussion_role_auto_assignment',
 ] as const;
 
+it('registers and validates the requested runtime capability set instead of a global constant',async()=>{
+ const capabilities=[...CAPABILITIES,'discussion_interactive_rounds'];
+ const fake=fakeFetch(jsonResponse(successEnvelope('codex','codex_123',{capabilities:[...capabilities].reverse()})));
+ const client=new RegistrationClient({fetch:fake.fetch});
+ await expect(client.register(registrationInput({capabilities}))).resolves.toMatchObject({nodeId:'codex_123'});
+ expect(body(fake.calls[0]!).capabilities).toEqual(capabilities);
+});
+
 type FetchCall = { url: string; init: RequestInit };
 type FetchStep = Response | Error | ((url: string, init: RequestInit) => Promise<Response>);
 
@@ -383,7 +391,7 @@ describe('RegistrationClient', () => {
     ['empty token', successEnvelope('codex', 'codex_123', { token: '' }), 'registration_response_invalid'],
     ['oversized token', successEnvelope('codex', 'codex_123', { token: 'x'.repeat(16385) }), 'registration_response_invalid'],
     ['invalid name', successEnvelope('codex', 'codex_123', { name: ' untrimmed ' }), 'registration_response_invalid'],
-    ['reordered capabilities', successEnvelope('codex', 'codex_123', { capabilities: [...CAPABILITIES].reverse() }), 'registration_capabilities_mismatch'],
+    ['duplicate capabilities', successEnvelope('codex', 'codex_123', { capabilities: [...CAPABILITIES.slice(1), CAPABILITIES[1]] }), 'registration_capabilities_mismatch'],
   ] as const)('rejects %s registration responses with stable code %s', async (_name, payload, code) => {
     const response = typeof payload === 'string' ? new Response(payload, { status: 200 }) : jsonResponse(payload);
     const transport = fakeFetch(response);

@@ -10,6 +10,7 @@ import {
 import {
   bindingKey,
   conversationKey,
+  interactiveSessionKey,
   type ConversationIdentity,
 } from './conversation.js';
 import {
@@ -44,6 +45,7 @@ const knownSessionSchema = z.strictObject({
 });
 
 const sessionSchema = z.strictObject({
+  sessionScope: z.literal('group').optional(),
   conversationKey: identifier(16_384),
   bindingKey: identifier(8_192),
   runtimeId,
@@ -56,11 +58,32 @@ const sessionSchema = z.strictObject({
   updatedAt: timestamp,
 });
 
-const routerStateSchema = z.strictObject({
+const legacyRouterStateSchema = z.strictObject({
   schemaVersion: z.literal(1),
   sessions: z.array(sessionSchema).max(MAX_SESSIONS),
   dedup: z.array(DedupEntrySchema).max(MAX_DEDUP_ENTRIES),
 });
+
+const interactiveRequestSchema = z.strictObject({
+  key: identifier(16_384), sessionKey: identifier(16_384), runtimeId, nodeId: identifier(137),
+  senderId: identifier(256), memberId: identifier(256), discussionId: identifier(256), chatroomId: identifier(256),
+  requestId: identifier(256), taskId: identifier(128), instanceId: identifier(128),
+  stateVersion: timestamp, round: timestamp, roundRevision: timestamp, expiresAt: timestamp,
+  fingerprint: z.string().max(64),
+  status: z.enum(['reserved', 'running', 'cancel_pending', 'terminal', 'unconfirmed']),
+  cancelResult: z.enum(['cancelled', 'already_terminal', 'not_started', 'failed']).optional(),
+  response: z.record(z.string(), z.unknown()).optional(),
+});
+export type InteractiveRequest = z.infer<typeof interactiveRequestSchema>;
+const routerStateSchema = z.strictObject({
+  ...legacyRouterStateSchema.shape,
+  schemaVersion: z.literal(2),
+  interactiveRequests: z.array(interactiveRequestSchema).max(2048),
+  interactiveSessions: z.record(z.string(), identifier()).refine(value => Object.keys(value).length <= 2048),
+  interactiveHeads: z.record(z.string(), z.strictObject({ key: identifier(16_384), stateVersion: timestamp, round: timestamp, roundRevision: timestamp })).refine(value => Object.keys(value).length <= 2048),
+  interactiveRooms: z.record(z.string(), identifier(256)).refine(value => Object.keys(value).length <= 2048).default({}),
+});
+const loadRouterStateSchema = z.union([routerStateSchema, legacyRouterStateSchema]);
 
 type SessionEntry = z.infer<typeof sessionSchema>;
 type RouterState = z.infer<typeof routerStateSchema>;
@@ -91,7 +114,7 @@ export interface RouterStateStoreOptions {
 }
 
 function emptyState(): RouterState {
-  return { schemaVersion: 1, sessions: [], dedup: [] };
+  return { schemaVersion: 2, sessions: [], dedup: [], interactiveRequests: [], interactiveSessions: {}, interactiveHeads: {}, interactiveRooms: {} };
 }
 
 function cloneState(state: RouterState): RouterState {
@@ -118,6 +141,17 @@ function validateState(value: unknown): RouterState {
   const parsed = routerStateSchema.safeParse(value);
   if (!parsed.success) throw new RouterStateError('router_state_invalid');
   const state = parsed.data;
+  const requestKeys = new Set<string>();
+  const taskIds = new Set<string>();
+  for (const entry of state.interactiveRequests) {
+    if (entry.key !== JSON.stringify([entry.runtimeId,entry.nodeId,entry.senderId,entry.discussionId,entry.requestId])
+      || entry.sessionKey !== interactiveSessionKey(entry.runtimeId,entry.nodeId,'discussion',entry.discussionId)
+      || !/^task_[0-9a-f]+_[0-9a-f]+$/.test(entry.taskId)
+      || !/^br_[0-9a-f]{32}$/.test(entry.instanceId)
+      || (entry.fingerprint !== '' && !/^[0-9a-f]{64}$/.test(entry.fingerprint))
+      || requestKeys.has(entry.key) || taskIds.has(entry.taskId)) throw new RouterStateError('router_state_invalid');
+    requestKeys.add(entry.key); taskIds.add(entry.taskId);
+  }
   const sessionCounts = countByRuntime(state.sessions);
   const dedupCounts = countByRuntime(state.dedup);
   if ([...sessionCounts.values()].some((count) => count > MAX_SESSIONS_PER_RUNTIME)
@@ -240,11 +274,13 @@ export class RouterStateStore {
       try {
         const loaded = await readJsonFileIfExists(
           this.#filePath,
-          routerStateSchema,
+          loadRouterStateSchema,
           MAX_STATE_BYTES,
           this.#atomicDependencies,
         );
-        const current = validateState(loaded ?? emptyState());
+        const current = validateState(loaded?.schemaVersion === 1
+          ? { ...loaded, schemaVersion: 2, interactiveRequests: [], interactiveSessions: {}, interactiveHeads: {} }
+          : loaded ?? emptyState());
         const dedup = pruneDedup(current.dedup, this.#time());
         const next = validateState({ ...current, dedup });
         if (loaded !== undefined && dedup.length !== current.dedup.length) {
@@ -261,6 +297,68 @@ export class RouterStateStore {
 
   currentSession(identity: ConversationIdentity): Promise<string | undefined> {
     return this.#read((state) => stateEntry(state, this.#identity(identity))?.currentSessionId);
+  }
+
+  interactiveRequest(key: string): Promise<InteractiveRequest | undefined> {
+    return this.#read(state => structuredClone(state.interactiveRequests.find(entry => entry.key === key)));
+  }
+
+  rememberInteractiveRoom(identity: {runtimeId:string;nodeId:string}, roomId: string, discussionId: string): Promise<void> {
+    return this.#mutate(state => {
+      const key = interactiveSessionKey(identity.runtimeId,identity.nodeId,'chatroom',roomId);
+      const previous = state.interactiveRooms[key];
+      if (previous === discussionId) return {changed:false,value:undefined};
+      if (previous !== undefined) throw new RouterStateError('router_state_invalid');
+      state.interactiveRooms[key] = identifier(256).parse(discussionId);
+      return {changed:true,value:undefined};
+    });
+  }
+
+  isInteractiveRoom(identity: {runtimeId:string;nodeId:string}, roomId: string): Promise<boolean> {
+    return this.#read(state => Object.hasOwn(state.interactiveRooms,interactiveSessionKey(identity.runtimeId,identity.nodeId,'chatroom',roomId)));
+  }
+
+  interactiveSession(key: string): Promise<string | undefined> {
+    return this.#read(state => state.interactiveSessions[key]);
+  }
+
+  interactiveRequests(identity: {runtimeId:string;nodeId:string}): Promise<InteractiveRequest[]> {
+    return this.#read(state => structuredClone(state.interactiveRequests.filter(entry => entry.runtimeId === identity.runtimeId && entry.nodeId === identity.nodeId)));
+  }
+
+  reserveInteractive(input: InteractiveRequest): Promise<InteractiveRequest | undefined> {
+    return this.#mutate((state, now) => {
+      const record = interactiveRequestSchema.parse(input);
+      // An unresolved run is retained even after expiry: its session must stay fenced.
+      state.interactiveRequests = state.interactiveRequests.filter(entry => entry.expiresAt > now || entry.status !== 'terminal');
+      const existing = state.interactiveRequests.find(entry => entry.key === record.key);
+      if (existing) return { changed: false, value: structuredClone(existing) };
+      const head = state.interactiveHeads[record.sessionKey];
+      if (head?.key === record.key) return { changed: false, value: undefined };
+      if (record.status === 'reserved' && head && (record.stateVersion < head.stateVersion || record.round < head.round
+        || (record.round === head.round && record.roundRevision < head.roundRevision))) return { changed: false, value: undefined };
+      if (record.expiresAt <= now || state.interactiveRequests.length >= 2048
+        || (record.status === 'reserved' && state.interactiveRequests.some(entry => entry.sessionKey === record.sessionKey && entry.status !== 'terminal'))) {
+        return { changed: false, value: undefined };
+      }
+      state.interactiveRequests.push(record);
+      if (record.status === 'reserved') state.interactiveHeads[record.sessionKey] = { key: record.key, stateVersion: record.stateVersion, round: record.round, roundRevision: record.roundRevision };
+      return { changed: true, value: structuredClone(record) };
+    });
+  }
+
+  updateInteractive(key: string, changes: Partial<Pick<InteractiveRequest, 'status' | 'cancelResult' | 'response'>>, sessionId?: string): Promise<InteractiveRequest> {
+    return this.#mutate(state => {
+      const entry = state.interactiveRequests.find(item => item.key === key);
+      if (!entry) throw new RouterStateError('router_state_invalid');
+      Object.assign(entry, changes);
+      if (sessionId !== undefined && state.interactiveHeads[entry.sessionKey]?.key === key) {
+        if (Object.entries(state.interactiveSessions).some(([owner,owned]) => owned === sessionId && owner !== entry.sessionKey && JSON.parse(owner)[0] === entry.runtimeId)
+          || state.sessions.some(owner => owner.runtimeId === entry.runtimeId && owner.knownSessions.some(known => known.sessionId === sessionId))) throw new RouterStateError('session_conflict');
+        state.interactiveSessions[entry.sessionKey] = this.#sessionId(sessionId);
+      }
+      return { changed: true, value: structuredClone(entry) };
+    });
   }
 
   knownSessions(identity: ConversationIdentity): Promise<readonly string[]> {

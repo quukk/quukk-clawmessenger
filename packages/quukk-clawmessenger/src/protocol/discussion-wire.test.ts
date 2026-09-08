@@ -94,9 +94,9 @@ describe('discussion wire encoder', () => {
 
 describe('discussion wire reassembler', () => {
   it('consumes the byte-for-byte Codex/OpenClaw/server shared fixture out of order', () => {
-    expect(Buffer.byteLength(fixtureSource, 'utf8')).toBe(34_218);
+    expect(Buffer.byteLength(fixtureSource, 'utf8')).toBe(35_454);
     expect(createHash('sha256').update(fixtureSource).digest('hex'))
-      .toBe('710b46e02c5797dee61bd8387edc5e59c5c30b41e76687e802b19532f0cfe027');
+      .toBe('819f2a3f9673638ee219508dbe17c22f7cd1af6e233e73bcae9ee3ab813bf103');
     const wire = new DiscussionWireReassembler();
     const results = [...fixture.frames].reverse()
       .map((frame) => wire.acceptSerialized('python-node', frame));

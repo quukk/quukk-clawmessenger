@@ -26,6 +26,9 @@ type Backend interface {
 type ExecOptions struct {
 	Cwd   string
 	Model string
+	// TaskModel is a canonical provider/model override for an owned OpenClaw
+	// session. Model retains its legacy OpenClaw agent-ID meaning.
+	TaskModel string
 	// StreamText opts into incremental text transport. The caller must drain
 	// Messages or cancel the context to release text backpressure.
 	StreamText bool

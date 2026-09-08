@@ -33,6 +33,8 @@ func TestBridgeTaskPublicJSONContracts(t *testing.T) {
 		name string
 		tag  string
 	}{
+		{"RequestID", "request_id,omitempty"},
+		{"Model", "model,omitempty"},
 		{"RuntimeID", "runtime_id"},
 		{"ConversationKey", "conversation_key"},
 		{"ResumeSessionID", "resume_session_id,omitempty"},

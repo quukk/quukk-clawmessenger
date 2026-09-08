@@ -38,12 +38,14 @@ type BridgeHTTPConfig struct {
 }
 
 type bridgeHTTPDeps struct {
-	runtimes   func() []BridgeRuntime
-	refresh    func(context.Context) []BridgeRuntime
-	start      func(BridgeTaskRequest) (string, error)
-	subscribe  func(context.Context, string, uint64) (<-chan BridgeTaskEvent, error)
-	cancelTask func(string) error
-	newTicker  func(time.Duration) bridgeHTTPTicker
+	runtimes        func() []BridgeRuntime
+	refresh         func(context.Context) []BridgeRuntime
+	start           func(BridgeTaskRequest) (string, error)
+	subscribe       func(context.Context, string, uint64) (<-chan BridgeTaskEvent, error)
+	cancelTask      func(string) error
+	fenceTask       func(context.Context, string) (string, error)
+	terminalSession func(string) string
+	newTicker       func(time.Duration) bridgeHTTPTicker
 }
 
 type bridgeHTTPTicker interface {
@@ -279,6 +281,11 @@ func (h *bridgeHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		switch action {
+		case "fence":
+			if !bridgeHTTPMethod(w, r, http.MethodPost) {
+				return
+			}
+			h.handleTaskFence(w, r, taskID)
 		case "events":
 			if !bridgeHTTPMethod(w, r, http.MethodGet) {
 				return
@@ -324,6 +331,8 @@ func (h *bridgeHTTPHandler) handleTaskStart(w http.ResponseWriter, r *http.Reque
 			writeBridgeHTTPError(w, http.StatusNotFound, "runtime_not_found")
 		case errors.Is(err, ErrBridgeTaskRuntimeNotReady):
 			writeBridgeHTTPError(w, http.StatusConflict, "runtime_not_ready")
+		case errors.Is(err, ErrBridgeTaskRequestConflict), errors.Is(err, ErrBridgeTaskRequestFenced), errors.Is(err, ErrBridgeTaskRequestExpired):
+			writeBridgeHTTPError(w, http.StatusConflict, "request_rejected")
 		default:
 			writeBridgeHTTPError(w, http.StatusInternalServerError, "internal_error")
 		}
@@ -416,6 +425,32 @@ func (h *bridgeHTTPHandler) handleTaskCancel(w http.ResponseWriter, r *http.Requ
 	w.WriteHeader(http.StatusAccepted)
 }
 
+func (h *bridgeHTTPHandler) handleTaskFence(w http.ResponseWriter, r *http.Request, taskID string) {
+	if !bridgeHTTPEmptyBody(r) {
+		writeBridgeHTTPError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
+	if h.deps.fenceTask == nil {
+		writeBridgeHTTPError(w, http.StatusNotImplemented, "fence_unavailable")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	result, err := h.deps.fenceTask(ctx, taskID)
+	if err != nil {
+		writeBridgeHTTPError(w, http.StatusConflict, "stop_unconfirmed")
+		return
+	}
+	sessionID := ""
+	if h.deps.terminalSession != nil {
+		sessionID = h.deps.terminalSession(taskID)
+	}
+	writeBridgeHTTPJSON(w, http.StatusOK, struct {
+		Result    string `json:"result"`
+		SessionID string `json:"session_id,omitempty"`
+	}{result, sessionID})
+}
+
 func (h *bridgeHTTPHandler) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	if !bridgeHTTPEmptyBody(r) {
 		writeBridgeHTTPError(w, http.StatusBadRequest, "invalid_request")
@@ -436,7 +471,7 @@ func bridgeHTTPTaskPath(path string) (taskID, action string, ok bool) {
 		return "", "", false
 	}
 	parts := strings.Split(remainder, "/")
-	if len(parts) != 2 || parts[0] == "" || (parts[1] != "events" && parts[1] != "cancel") {
+	if len(parts) != 2 || parts[0] == "" || (parts[1] != "events" && parts[1] != "cancel" && parts[1] != "fence") {
 		return "", "", false
 	}
 	return parts[0], parts[1], true
@@ -561,11 +596,13 @@ func serveBridgeHTTPWithDeps(ctx context.Context, listener net.Listener, cfg Bri
 	}
 	tasks := deps.newTasks(gate.root, bridge)
 	handler := newBridgeHTTPHandler(gate.root, gate.stop, cfg, bridgeHTTPDeps{
-		runtimes:   bridge.Runtimes,
-		refresh:    bridge.Refresh,
-		start:      tasks.Start,
-		subscribe:  tasks.Subscribe,
-		cancelTask: tasks.Cancel,
+		runtimes:        bridge.Runtimes,
+		refresh:         bridge.Refresh,
+		start:           tasks.Start,
+		subscribe:       tasks.Subscribe,
+		cancelTask:      tasks.Cancel,
+		fenceTask:       tasks.Fence,
+		terminalSession: tasks.TerminalSession,
 	})
 	if deps.wrapHandler != nil {
 		handler = deps.wrapHandler(handler)

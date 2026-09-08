@@ -68,6 +68,7 @@ function event(
 
 function conversation(identity: WorkerIdentity): ConversationIdentity {
   return {
+    sessionScope: 'group',
     ...identity,
     conversationType: 3,
     targetId: 'same-group',

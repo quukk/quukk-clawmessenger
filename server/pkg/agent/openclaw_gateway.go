@@ -230,11 +230,13 @@ type openclawGatewayFrame struct {
 // One execution goroutine owns writes and dispatch; the reader is bounded by
 // socket close. No subprocess or shared Gateway lifecycle is owned here.
 type openclawGatewayClient struct {
-	conn    *websocket.Conn
-	frames  chan openclawGatewayFrame
-	done    chan struct{}
-	onEvent func(openclawGatewayFrame)
-	next    int
+	interactive    bool
+	modelSelection bool
+	conn           *websocket.Conn
+	frames         chan openclawGatewayFrame
+	done           chan struct{}
+	onEvent        func(openclawGatewayFrame)
+	next           int
 }
 
 func dialOpenclawGateway(ctx context.Context, cfg openclawGatewayConfig) (*openclawGatewayClient, error) {
@@ -289,6 +291,10 @@ func dialOpenclawGateway(ctx context.Context, cfg openclawGatewayConfig) (*openc
 		return nil, errors.New("openclaw Gateway authentication failed; verify local token and operator.read/operator.write access")
 	}
 	var hello struct {
+		Features struct {
+			Methods []string `json:"methods"`
+			Events  []string `json:"events"`
+		} `json:"features"`
 		Type     string `json:"type"`
 		Protocol int    `json:"protocol"`
 		Auth     struct {
@@ -299,6 +305,12 @@ func dialOpenclawGateway(ctx context.Context, cfg openclawGatewayConfig) (*openc
 		c.close()
 		return nil, errors.New("openclaw Gateway requires protocol 4 and operator.read/operator.write access")
 	}
+	c.interactive = slices.Contains(hello.Features.Events, "chat")
+	for _, method := range []string{"agents.list", "sessions.resolve", "chat.send", "chat.abort", "chat.history"} {
+		c.interactive = c.interactive && slices.Contains(hello.Features.Methods, method)
+	}
+	c.modelSelection = slices.Contains(hello.Features.Methods, "sessions.create") && slices.Contains(hello.Features.Methods, "sessions.patch") && len(hello.Auth.Scopes) == 2
+	c.interactive = c.interactive && c.modelSelection
 	return c, nil
 }
 
@@ -439,6 +451,36 @@ func (b *openclawBackend) executeGateway(ctx context.Context, prompt string, opt
 			key = "agent:" + agentID + ":clawmessenger:" + uuid.NewString()
 		}
 		result.SessionID = key
+		if opts.TaskModel != "" {
+			if !c.modelSelection || !strings.HasPrefix(key, "agent:"+agentID+":clawmessenger:") {
+				result.Error = "openclaw task model requires session create/patch support, exact read/write scopes, and a ClawMessenger-owned session"
+				return
+			}
+			if opts.ResumeSessionID == "" {
+				raw, err := c.request(setup, "sessions.create", map[string]any{"key": key, "idempotencyKey": key, "agentId": agentID, "model": opts.TaskModel})
+				var created struct {
+					OK  bool   `json:"ok"`
+					Key string `json:"key"`
+				}
+				if err != nil || json.Unmarshal(raw, &created) != nil || !created.OK || created.Key != key {
+					result.Error = "openclaw task model session creation was not confirmed"
+					return
+				}
+			}
+			raw, err := c.request(setup, "sessions.patch", map[string]any{"key": key, "model": opts.TaskModel})
+			var patched struct {
+				OK       bool   `json:"ok"`
+				Key      string `json:"key"`
+				Resolved struct {
+					Provider string `json:"modelProvider"`
+					Model    string `json:"model"`
+				} `json:"resolved"`
+			}
+			if err != nil || json.Unmarshal(raw, &patched) != nil || !patched.OK || patched.Key != key || patched.Resolved.Provider+"/"+patched.Resolved.Model != opts.TaskModel {
+				result.Error = "openclaw task model selection was not confirmed for the exact session"
+				return
+			}
+		}
 		select {
 		case msgCh <- Message{Type: MessageStatus, Status: "running", SessionID: key}:
 		case <-runCtx.Done():

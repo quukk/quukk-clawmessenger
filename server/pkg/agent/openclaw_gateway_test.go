@@ -35,11 +35,12 @@ type openclawGatewayFixture struct {
 		Method string
 		Params map[string]any
 	}
-	release  chan struct{}
-	aborted  chan struct{}
-	received chan struct{}
-	config   string
-	run, key string
+	release      chan struct{}
+	aborted      chan struct{}
+	received     chan struct{}
+	receivedOnce sync.Once
+	config       string
+	run, key     string
 }
 
 func newOpenclawGatewayFixture(t *testing.T, mode string) *openclawGatewayFixture {
@@ -98,7 +99,14 @@ func newOpenclawGatewayFixture(t *testing.T, mode string) *openclawGatewayFixtur
 					fail()
 					continue
 				}
-				reply(map[string]any{"type": "hello-ok", "protocol": 4, "auth": map[string]any{"role": "operator", "scopes": []string{"operator.read", "operator.write"}}})
+				hello := map[string]any{"type": "hello-ok", "protocol": 4, "auth": map[string]any{"role": "operator", "scopes": []string{"operator.read", "operator.write"}}}
+				if f.mode == "interactive" || strings.HasPrefix(f.mode, "model-") {
+					hello["features"] = map[string]any{"methods": []string{"agents.list", "sessions.resolve", "sessions.create", "sessions.patch", "chat.send", "chat.abort", "chat.history"}, "events": []string{"chat"}}
+				}
+				if f.mode == "model-admin" {
+					hello["auth"] = map[string]any{"scopes": []string{"operator.read", "operator.write", "operator.admin"}}
+				}
+				reply(hello)
 			case "agents.list":
 				reply(map[string]any{"defaultId": "main", "agents": []any{map[string]any{"id": "main"}, map[string]any{"id": "writer"}}})
 			case "sessions.resolve":
@@ -111,6 +119,14 @@ func newOpenclawGatewayFixture(t *testing.T, mode string) *openclawGatewayFixtur
 					resolved = requested
 				}
 				reply(map[string]any{"ok": true, "key": resolved})
+			case "sessions.create":
+				reply(map[string]any{"ok": true, "key": req.Params["key"]})
+			case "sessions.patch":
+				provider, model, _ := strings.Cut(fmt.Sprint(req.Params["model"]), "/")
+				if f.mode == "model-wrong" {
+					model = "wrong"
+				}
+				reply(map[string]any{"ok": true, "key": req.Params["key"], "resolved": map[string]any{"modelProvider": provider, "model": model}})
 			case "chat.send":
 				run, _ = req.Params["idempotencyKey"].(string)
 				key, _ = req.Params["sessionKey"].(string)
@@ -121,7 +137,7 @@ func newOpenclawGatewayFixture(t *testing.T, mode string) *openclawGatewayFixtur
 					fail()
 					continue
 				}
-				close(f.received)
+				f.receivedOnce.Do(func() { close(f.received) })
 				if strings.HasPrefix(f.mode, "preadmission-") {
 					// Receipt is not admission: no ack, text, or abortable run yet.
 					continue

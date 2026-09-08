@@ -90,6 +90,7 @@ import {
   BridgeSupervisor,
 } from './process/supervisor.js';
 import { RegistrationClient } from './registration/client.js';
+import { nodeCapabilitiesForRuntime } from './registration/capabilities.js';
 import type { WorkerEvent } from './rongcloud/worker-protocol.js';
 import {
   RongCloudWorkerSupervisor,
@@ -1619,6 +1620,7 @@ function productionRuntimeSource(client: ProductionBridgeClient): PairingRuntime
             path: runtime.path,
             status: runtime.status,
             version: runtime.version,
+            nodeCapabilities: nodeCapabilitiesForRuntime(runtime),
           }]),
   };
 }
@@ -1951,6 +1953,10 @@ async function composeProductionServiceWithin(
     const control = createConservativeRouterControl({ runtimes: client, bindings, workers, mutationGate });
     router = factories.createRouter({
       task: client,
+      interactiveAvailable: async identity => {
+        const runtime = parseCatalog(await client.runtimes()).find(item => item.id === identity.runtimeId);
+        return runtime !== undefined && nodeCapabilitiesForRuntime(runtime).includes('discussion_interactive_rounds');
+      },
       worker: workers,
       binding: productionBindingPort(store, bindings, configOverrides, configEnvironment),
       control,
