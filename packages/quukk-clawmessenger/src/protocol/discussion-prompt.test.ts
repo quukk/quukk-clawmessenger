@@ -16,6 +16,23 @@ const turn: DiscussionHostTurn = {
 };
 
 describe('discussion model prompt contract', () => {
+  it('keeps tiny checkpoint strings when excerpt markers would enlarge the context', () => {
+    const summaries = Array.from({ length: 9 }, (_, index) => ({
+      round: index + 1, agreements: Array(32).fill('a'), disagreements: Array(32).fill('d'),
+      openQuestions: Array(32).fill('q'),
+    }));
+    const prompt = buildDiscussionPrompt({ ...turn, round: 10, hostPrompt: '汉'.repeat(32_000),
+      roundSummaries: summaries, userInterjections: [],
+      priorContributions: [{ memberId: 'member-1', content: 'P'.repeat(40_000), round: 10 }],
+    });
+    expect(Buffer.byteLength(prompt, 'utf8')).toBeLessThanOrEqual(128 * 1024);
+    const context = JSON.parse(prompt.split('\n').find((line) => line.startsWith('{"msg_type":'))!);
+    expect(context.roundSummaries).toEqual(summaries);
+    expect(context.hostPrompt).toBe('汉'.repeat(32_000));
+    expect(context.priorContributions[0].memberId).toBe('member-1');
+    expect(context.priorContributions[0].content).toContain('[Context excerpt: remaining text omitted]');
+  });
+
   it.each([
     ['ASCII', 'H'.repeat(32_000), 'A'.repeat(49_500)],
     ['multibyte', '汉'.repeat(32_000), '🙂'.repeat(10_000)],

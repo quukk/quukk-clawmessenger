@@ -19,7 +19,9 @@ function excerptContext(value: unknown, textBytes: number, key = ''): unknown {
       if (bytes > textBytes) break;
       prefix += character;
     }
-    return prefix + EXCERPT_MARKER;
+    const excerpt = prefix + EXCERPT_MARKER;
+    return Buffer.byteLength(JSON.stringify(excerpt), 'utf8') < Buffer.byteLength(JSON.stringify(value), 'utf8')
+      ? excerpt : value;
   }
   if (Array.isArray(value)) return value.map((item) => excerptContext(item, textBytes, key));
   if (value && typeof value === 'object') return Object.fromEntries(
