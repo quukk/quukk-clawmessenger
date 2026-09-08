@@ -488,8 +488,17 @@ function discussionTransportMatches(
   chatroomId: string,
 ): boolean {
   return message.conversationType === 1
-    ? message.senderId === 'system' && message.targetId === identity.nodeId
+    ? systemPrivateDiscussionTransportMatches(identity, message)
     : message.targetId === chatroomId;
+}
+
+function systemPrivateDiscussionTransportMatches(
+  identity: WorkerIdentity,
+  message: NormalizedRongCloudMessage,
+): boolean {
+  return message.conversationType === 1
+    && message.senderId === 'system'
+    && (message.targetId === message.senderId || message.targetId === identity.nodeId);
 }
 
 function discussionSessionConversation(
@@ -1054,9 +1063,7 @@ export class MessageRouter {
     const claim = await this.#claimLocal(identity, message.messageUid, conversation, generation);
     if (!claim) return;
     const state = this.#discussionState(identity);
-    const systemPrivate = message.conversationType === 1
-      && message.senderId === 'system'
-      && message.targetId === identity.nodeId;
+    const systemPrivate = systemPrivateDiscussionTransportMatches(identity, message);
     const result = (systemPrivate ? state.systemPrivateWire : state.wire)
       .accept(message.senderId, value);
     const admitted = await this.#admitOnly(identity, message, claim, generation, true);

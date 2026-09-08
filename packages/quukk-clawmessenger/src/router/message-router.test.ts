@@ -9,7 +9,7 @@ import { BridgeClient } from '../go/client.js';
 import type { BridgeTaskEvent, BridgeTaskPort } from '../go/types.js';
 import { DiscussionWireReassembler, encodeDiscussionWire } from '../protocol/discussion-wire.js';
 import { parseChatStreamEvent, type ChatStreamEvent } from '../protocol/chat-stream.js';
-import type { NormalizedRongCloudMessage } from '../protocol/messages.js';
+import { normalizeRongCloudMessage, type NormalizedRongCloudMessage } from '../protocol/messages.js';
 import type { WorkerEvent } from '../rongcloud/worker-protocol.js';
 import type { WorkerIdentity } from '../rongcloud/worker-supervisor.js';
 import {
@@ -92,6 +92,25 @@ function protocolMessage(
   overrides: Partial<NormalizedRongCloudMessage> = {},
 ): NormalizedRongCloudMessage {
   return message(uid, '', { text: undefined, rawContent, objectName: 'RC:CmdMsg', ...overrides });
+}
+
+function sdkPrivateProtocolMessage(
+  uid: string,
+  rawContent: Record<string, unknown>,
+  overrides: Record<string, unknown> = {},
+): NormalizedRongCloudMessage {
+  const normalized = normalizeRongCloudMessage({
+    messageUId: uid,
+    senderUserId: 'system',
+    targetId: 'system',
+    conversationType: 1,
+    messageType: 'RC:CmdMsg',
+    messageDirection: 2,
+    content: rawContent,
+    ...overrides,
+  });
+  if (!normalized.ok) throw new Error(`SDK fixture did not normalize: ${normalized.code}`);
+  return normalized.value;
 }
 
 function bridgeEvent(
@@ -2836,6 +2855,56 @@ describe('MessageRouter task events and reconnect behavior', () => {
 });
 
 describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
+  it('routes a normalized SDK system-private assignment and returns its contribution to system', async () => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', { output: 'SDK private contribution' });
+    })());
+    const sdkMessage = sdkPrivateProtocolMessage(
+      'sdk-private-assignment',
+      discussionAssignment({ discussionId: 'sdk-private-assignment', chatroomId: 'sdk-private-room' }),
+    );
+    expect(sdkMessage).toMatchObject({ senderId: 'system', targetId: 'system', direction: 2 });
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, sdkMessage));
+
+    expect(fixture.starts).toHaveLength(1);
+    expect(fixture.sent).toContainEqual(expect.objectContaining({
+      input: expect.objectContaining({
+        conversationType: 1,
+        targetId: 'system',
+        messageType: 'command_result',
+        content: expect.objectContaining({ msg_type: 'discussion_contribution_completed' }),
+      }),
+    }));
+  });
+
+  it('routes a normalized SDK system-private host turn for the bound host node', async () => {
+    const fixture = await routerHarness();
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, sdkPrivateProtocolMessage(
+      'sdk-private-host-turn',
+      discussionHostTurn({ discussionId: 'sdk-private-host-turn', chatroomId: 'sdk-private-host-room' }),
+    )));
+
+    expect(fixture.starts).toHaveLength(1);
+  });
+
+  it.each([
+    ['non-system peer', { senderUserId: 'ordinary-peer', targetId: 'ordinary-peer' }],
+    ['unrelated private peer target', { senderUserId: 'system', targetId: 'unrelated-peer' }],
+  ] as const)('rejects a normalized SDK discussion assignment from a %s', async (_case, envelope) => {
+    const fixture = await routerHarness();
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, sdkPrivateProtocolMessage(
+      `sdk-private-rejected-${_case}`,
+      discussionAssignment({ discussionId: `sdk-private-rejected-${_case}`, chatroomId: 'sdk-private-room' }),
+      envelope,
+    )));
+
+    expect(fixture.starts).toEqual([]);
+  });
+
   it('runs a system-private roundtable assignment whose logical chatroom differs from the node envelope target', async () => {
     const fixture = await routerHarness();
     const payload = discussionAssignment({
@@ -3256,10 +3325,9 @@ describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
     }));
 
     for (let index = 0; index < systemFrames.length; index += 1) {
-      await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, sdkPrivateProtocolMessage(
         `trusted-private-wire-${index}`,
         JSON.parse(systemFrames[index]!) as Record<string, unknown>,
-        { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 },
       )));
     }
 
@@ -3476,6 +3544,41 @@ describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
 
     expect(cancellationsAfterWrongRoom).toEqual([]);
     expect(fixture.starts).toHaveLength(2);
+  });
+
+  it('accepts a normalized SDK system-private cancel for active work in the same room', async () => {
+    const fixture = await routerHarness();
+    let releaseWork!: () => void;
+    let markEventsEntered!: () => void;
+    const workGate = new Promise<void>((resolve) => { releaseWork = resolve; });
+    const eventsEntered = new Promise<void>((resolve) => { markEventsEntered = resolve; });
+    fixture.setEvents((taskId) => (async function* () {
+      markEventsEntered();
+      await workGate;
+      yield bridgeEvent(taskId, 'completed', { output: 'late contribution' });
+    })());
+    const discussionId = 'sdk-private-active-cancel';
+    const chatroomId = 'sdk-private-active-cancel-room';
+    const legacyEnvelope = { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 as const };
+    const active = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'sdk-private-active-before-cancel',
+      discussionAssignment({ discussionId, chatroomId }),
+      legacyEnvelope,
+    )));
+    await eventsEntered;
+
+    const cancellation = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, sdkPrivateProtocolMessage(
+      'sdk-private-active-cancel-command',
+      discussionCancel({ discussionId, chatroomId }),
+    )));
+    const cancellationAccepted = await vi.waitFor(
+      () => expect(fixture.cancellations).toEqual(['task_1_1']),
+      { timeout: 250 },
+    ).then(() => true, () => false);
+    releaseWork();
+    await Promise.all([active, cancellation]);
+
+    expect(cancellationAccepted).toBe(true);
   });
 
   it('shares one v2 replay reservation between a completed wire command and a direct duplicate', async () => {
@@ -4076,6 +4179,59 @@ describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
       && input.content.msg_type === 'discussion_host_decision')?.input.content).toMatchObject({
       decision: 'finish', artifactId: 'artifact-private', artifactVersion: 1,
     });
+  });
+
+  it('accepts a normalized SDK system-private artifact ACK for an active host turn', async () => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', {
+        output: JSON.stringify({
+          action: 'finish',
+          summary: 'done',
+          artifact: {
+            artifactType: 'markdown', title: 'SDK result', content: 'artifact body',
+            baseVersion: 0, final: true,
+          },
+        }),
+      });
+    })());
+    const discussionId = 'sdk-private-artifact';
+    const chatroomId = 'sdk-private-artifact-room';
+    const routing = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'sdk-private-artifact-host',
+      discussionHostTurn({ discussionId, chatroomId, allowedDecisions: ['finish'] }),
+      { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+    )));
+    const updates = () => fixture.sent.filter(({ input }) => input.messageType === 'command_result'
+      && input.content.msg_type === 'discussion_artifact_update');
+    await vi.waitFor(() => expect(updates()).toHaveLength(1));
+    const update = updates()[0]!.input.content as Record<string, unknown>;
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, sdkPrivateProtocolMessage(
+      'sdk-private-artifact-ack',
+      {
+        msg_type: 'discussion_artifact_ack',
+        protocolVersion: 2,
+        discussionId,
+        chatroomId,
+        requestId: 'request-host',
+        stateVersion: 1,
+        round: 1,
+        timestamp: 2,
+        updateId: update.idempotencyKey,
+        idempotencyKey: update.idempotencyKey,
+        artifactId: 'sdk-private-artifact-id',
+        artifactVersion: 1,
+      },
+    )));
+    const accepted = await vi.waitFor(() => expect(fixture.sent.some(({ input }) =>
+      input.messageType === 'command_result'
+      && input.content.msg_type === 'discussion_host_decision')).toBe(true), { timeout: 250 })
+      .then(() => true, () => false);
+    if (!accepted) await fixture.router.dispose();
+    await routing;
+
+    expect(accepted).toBe(true);
   });
 
   it('slices finish artifacts under 9000 bytes, waits for exact ACKs, paces pieces, then sends a reference-only decision', async () => {
