@@ -3460,6 +3460,7 @@ export class MessageRouter {
     }
     if (active.rawOutput.endsWith(output)) return;
 
+    const previousVisibleText = streamSafeContent(active.rawOutput);
     const previous = parseCardMarkers(active.rawOutput);
     active.rawOutput = '';
     active.rawOutputBytes = 0;
@@ -3468,7 +3469,7 @@ export class MessageRouter {
     const completed = parseCardMarkers(active.rawOutput);
     // Completed replies may revise earlier deltas. Without item boundaries only
     // an unchanged visible suffix can preserve the preceding narration safely.
-    if (previous.text.endsWith(completed.text)) completed.text = previous.text;
+    if (previousVisibleText.endsWith(completed.text)) completed.text = previousVisibleText;
 
     // Carry cards across text corrections without reconstructing marker syntax.
     // A completed card with the same ID replaces its streamed representation.

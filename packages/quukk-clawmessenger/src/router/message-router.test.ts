@@ -1904,6 +1904,47 @@ describe('MessageRouter task events and reconnect behavior', () => {
     expect(fixture.sent.filter(({ input }) => input.messageType === 'card_message')).toHaveLength(1);
   });
 
+  it.each([false, true])('preserves the visible suffix after an unfinished streamed marker (earlier card: %s)', async (hasCard) => {
+    vi.useFakeTimers();
+    const fixture = await routerHarness();
+    const card = { schema: '1.0.0', id: 'unfinished-marker-card', header: { title: 'Safe card' }, sections: [] };
+    let release!: () => void;
+    let observed!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const ready = new Promise<void>((resolve) => { observed = resolve; });
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'text_delta', {
+        id: 1, text: `${hasCard ? `[CARD][${JSON.stringify(card)}]` : ''}Let me think. Answer[CAR`,
+      });
+      observed();
+      await gate;
+      yield bridgeEvent(taskId, 'completed', { id: 2, output: 'Answer' });
+    })());
+    const routing = fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('unfinished-marker-suffix')));
+    await ready;
+    await vi.advanceTimersByTimeAsync(250);
+    expect(streamEvents(fixture.sent).at(-1)).toMatchObject({ status: 'streaming', text: 'Let me think. Answer' });
+    release();
+    await routing;
+    expect(streamEvents(fixture.sent).at(-1)).toMatchObject({ status: 'completed', text: 'Let me think. Answer' });
+    const delivered = fixture.sent.filter(({ input }) => input.messageType === 'card_message');
+    expect(delivered).toHaveLength(hasCard ? 1 : 0);
+    if (hasCard) expect(delivered[0]!.input.content).toMatchObject({ card });
+  });
+
+  it('keeps actual completed marker diagnostics after an unfinished streamed marker', async () => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'text_delta', { id: 1, text: 'Let me think. Answer[CAR' });
+      yield bridgeEvent(taskId, 'completed', { id: 2, output: 'Corrected answer[CAR' });
+    })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('completed-invalid-marker')));
+    expect(streamEvents(fixture.sent).at(-1)).toMatchObject({
+      status: 'completed', text: 'Corrected answer[invalid card marker]',
+    });
+    expect(fixture.sent.some(({ input }) => input.messageType === 'card_message')).toBe(false);
+  });
+
   it('does not duplicate an authoritative final item already emitted after narration', async () => {
     const fixture = await routerHarness();
     fixture.setEvents((taskId) => (async function* () {
