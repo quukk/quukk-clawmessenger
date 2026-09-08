@@ -8,8 +8,23 @@ export interface DiscussionV3Identity {
   stateVersion: number; round: number; roundRevision: number; timestamp: number;
 }
 export type CancelResult = 'cancelled' | 'already_terminal' | 'not_started' | 'failed';
-export type DiscussionV3HostTurn = Omit<DiscussionHostTurn, keyof DiscussionV3Identity | 'remainingRounds'> & DiscussionV3Identity & { userInterjections: unknown[] };
-export type DiscussionV3Assignment = Omit<DiscussionAssignment, keyof DiscussionV3Identity> & DiscussionV3Identity & { userInterjections: unknown[] };
+export type DiscussionV3HostTurn = Omit<DiscussionHostTurn,
+  keyof DiscussionV3Identity | 'remainingRounds' | 'mode' | 'phase' | 'allowedDecisions'
+  | 'roundSummaries' | 'userInterjections' | 'hostPrompt' | 'configVersion' | 'priorContributions'
+> & DiscussionV3Identity & {
+  mode: 'roundtable'; phase: 'round_summary'; allowedDecisions: ['checkpoint'];
+  roundSummaries: unknown[]; userInterjections: unknown[];
+  priorContributions?: Array<{ memberId: string; content: string; round: number }>;
+} & ({ hostPrompt: string; configVersion: number } | { hostPrompt?: never; configVersion?: never });
+export type DiscussionV3Assignment = Omit<DiscussionAssignment,
+  keyof DiscussionV3Identity | 'mode' | 'model' | 'role' | 'speakingOrder' | 'roundFocus'
+  | 'priorContributions' | 'roundSummaries' | 'userInterjections' | 'attempt'
+> & DiscussionV3Identity & {
+  mode: 'roundtable'; model: string | null;
+  role: { roleName: string; roleInstructions: string }; speakingOrder: number;
+  roundFocus: string; priorContributions: unknown[]; roundSummaries: unknown[];
+  userInterjections: unknown[]; attempt: 1 | 2;
+};
 export type DiscussionV3Cancel = DiscussionV3Identity & { msg_type: 'discussion_cancel'; targetRequestId: string; targetMemberId: string; reason: string };
 export type DiscussionV3CancelAck = DiscussionV3Identity & { msg_type: 'discussion_cancel_ack'; targetRequestId: string; targetMemberId: string; result: CancelResult };
 export interface Checkpoint {
@@ -47,7 +62,13 @@ const id: Validator = v => text(L.maxId)(v) && (v as string).trim() === v && !/[
 const integer = (min: number): Validator => v => typeof v === 'number' && Number.isSafeInteger(v) && v >= min;
 const choice = (...values: unknown[]): Validator => v => values.includes(v);
 const nullable = (f: Validator): Validator => v => v === null || f(v);
-const array = (f: Validator, max = 100): Validator => v => Array.isArray(v) && v.length <= max && v.every(f) && new TextEncoder().encode(JSON.stringify(v)).length <= L.maxContribution;
+function validNestedUnicode(value: unknown): boolean {
+  if (typeof value === 'string') return text(Number.MAX_SAFE_INTEGER, true)(value);
+  if (Array.isArray(value)) return value.every(validNestedUnicode);
+  if (object(value)) return Object.entries(value).every(([key, item]) => validNestedUnicode(key) && validNestedUnicode(item));
+  return true;
+}
+const array = (f: Validator, max = 100): Validator => v => Array.isArray(v) && v.length <= max && v.every(f) && validNestedUnicode(v) && new TextEncoder().encode(JSON.stringify(v)).length <= L.maxContribution;
 const shape = (fields: Fields, optional: Fields = {}): Validator => v => object(v) && Object.keys(fields).every(k => Object.hasOwn(v, k)) && Object.keys(v).every(k => Object.hasOwn(fields, k) || Object.hasOwn(optional, k)) && Object.entries(fields).every(([k, f]) => f(v[k])) && Object.entries(optional).every(([k, f]) => !Object.hasOwn(v, k) || f(v[k]));
 const model: Validator = v => text(256)(v) && (v as string).trim() === v && !/\s/.test(v as string) && (v as string).split('/').length === 2 && (v as string).split('/').every(Boolean);
 const history = array(() => true);

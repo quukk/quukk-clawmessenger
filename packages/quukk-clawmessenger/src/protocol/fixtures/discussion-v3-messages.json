@@ -1,5 +1,104 @@
 {
   "valid": {
+    "summaryNextLine": {
+      "protocolVersion": 3,
+      "discussionId": "discussion-1",
+      "chatroomId": "room-1",
+      "requestId": "request-1",
+      "stateVersion": 4,
+      "round": 1,
+      "roundRevision": 0,
+      "timestamp": 1723950002000,
+      "msg_type": "discussion_host_decision",
+      "decision": "checkpoint",
+      "memberPositions": [
+        {
+          "memberId": "member-1",
+          "position": "Option A"
+        }
+      ],
+      "agreements": [
+        "Preserve compatibility"
+      ],
+      "disagreements": [],
+      "openQuestions": [],
+      "nextFocus": "Migration",
+      "recommendation": "continue",
+      "summaryMarkdown": "",
+      "idempotencyKey": "checkpoint-1"
+    },
+    "integralFloatEnvelope": {
+      "protocolVersion": 3.0,
+      "discussionId": "discussion-1",
+      "chatroomId": "room-1",
+      "requestId": "float-envelope",
+      "stateVersion": 4.0,
+      "round": 1.0,
+      "roundRevision": 0.0,
+      "timestamp": 1723950002000.0,
+      "msg_type": "discussion_cancel",
+      "targetRequestId": "request-1",
+      "targetMemberId": "member-1",
+      "reason": "User interjection"
+    },
+    "integralFloatAttempt": {
+      "protocolVersion": 3,
+      "discussionId": "discussion-1",
+      "chatroomId": "room-1",
+      "requestId": "request-1",
+      "stateVersion": 4,
+      "round": 1,
+      "roundRevision": 0,
+      "timestamp": 1723950002000,
+      "msg_type": "discussion_assignment",
+      "assignmentId": "assignment-1",
+      "targetId": "member-1",
+      "task": "Review",
+      "topic": "API",
+      "goal": "Choose",
+      "mode": "roundtable",
+      "model": null,
+      "role": {
+        "roleName": "Reviewer",
+        "roleInstructions": "Evaluate"
+      },
+      "speakingOrder": 0,
+      "roundFocus": "Migration",
+      "priorContributions": [],
+      "roundSummaries": [],
+      "userInterjections": [],
+      "attempt": 1.0
+    },
+    "nestedAstralUnicode": {
+      "protocolVersion": 3,
+      "discussionId": "discussion-1",
+      "chatroomId": "room-1",
+      "requestId": "request-1",
+      "stateVersion": 4,
+      "round": 1,
+      "roundRevision": 0,
+      "timestamp": 1723950002000,
+      "msg_type": "discussion_host_turn",
+      "topic": "API",
+      "goal": "Choose",
+      "roles": {},
+      "allowedDecisions": [
+        "checkpoint"
+      ],
+      "eventSummary": "Members completed",
+      "currentArtifact": null,
+      "mode": "roundtable",
+      "phase": "round_summary",
+      "roundSummaries": [],
+      "userInterjections": [
+        {
+          "content": "😀",
+          "nested": {
+            "😀": "ok"
+          }
+        }
+      ]
+    },
     "hostTurn": {
       "protocolVersion": 3,
       "discussionId": "discussion-1",
@@ -345,6 +444,167 @@
     }
   },
   "invalid": [
+    {
+      "name": "summary BOM is whitespace",
+      "message": {
+        "protocolVersion": 3,
+        "discussionId": "discussion-1",
+        "chatroomId": "room-1",
+        "requestId": "request-1",
+        "stateVersion": 4,
+        "round": 1,
+        "roundRevision": 0,
+        "timestamp": 1723950002000,
+        "msg_type": "discussion_host_decision",
+        "decision": "checkpoint",
+        "memberPositions": [
+          {
+            "memberId": "member-1",
+            "position": "Option A"
+          }
+        ],
+        "agreements": [
+          "Preserve compatibility"
+        ],
+        "disagreements": [],
+        "openQuestions": [],
+        "nextFocus": "Migration",
+        "recommendation": "continue",
+        "summaryMarkdown": "﻿",
+        "idempotencyKey": "checkpoint-1"
+      }
+    },
+    {
+      "name": "history lone high surrogate",
+      "message": {
+        "protocolVersion": 3,
+        "discussionId": "discussion-1",
+        "chatroomId": "room-1",
+        "requestId": "request-1",
+        "stateVersion": 4,
+        "round": 1,
+        "roundRevision": 0,
+        "timestamp": 1723950002000,
+        "msg_type": "discussion_host_turn",
+        "topic": "API",
+        "goal": "Choose",
+        "roles": {},
+        "allowedDecisions": [
+          "checkpoint"
+        ],
+        "eventSummary": "Members completed",
+        "currentArtifact": null,
+        "mode": "roundtable",
+        "phase": "round_summary",
+        "roundSummaries": [],
+        "userInterjections": [
+          {
+            "content": "\ud800"
+          }
+        ]
+      }
+    },
+    {
+      "name": "history lone low surrogate",
+      "message": {
+        "protocolVersion": 3,
+        "discussionId": "discussion-1",
+        "chatroomId": "room-1",
+        "requestId": "request-1",
+        "stateVersion": 4,
+        "round": 1,
+        "roundRevision": 0,
+        "timestamp": 1723950002000,
+        "msg_type": "discussion_assignment",
+        "assignmentId": "assignment-1",
+        "targetId": "member-1",
+        "task": "Review",
+        "topic": "API",
+        "goal": "Choose",
+        "mode": "roundtable",
+        "model": null,
+        "role": {
+          "roleName": "Reviewer",
+          "roleInstructions": "Evaluate"
+        },
+        "speakingOrder": 0,
+        "roundFocus": "Migration",
+        "priorContributions": [],
+        "roundSummaries": [],
+        "userInterjections": [
+          {
+            "nested": [
+              "\udc00"
+            ]
+          }
+        ],
+        "attempt": 1
+      }
+    },
+    {
+      "name": "history surrogate object key",
+      "message": {
+        "protocolVersion": 3,
+        "discussionId": "discussion-1",
+        "chatroomId": "room-1",
+        "requestId": "request-1",
+        "stateVersion": 4,
+        "round": 1,
+        "roundRevision": 0,
+        "timestamp": 1723950002000,
+        "msg_type": "discussion_host_turn",
+        "topic": "API",
+        "goal": "Choose",
+        "roles": {},
+        "allowedDecisions": [
+          "checkpoint"
+        ],
+        "eventSummary": "Members completed",
+        "currentArtifact": null,
+        "mode": "roundtable",
+        "phase": "round_summary",
+        "roundSummaries": [],
+        "userInterjections": [
+          {
+            "\ud800": "ok"
+          }
+        ]
+      }
+    },
+    {
+      "name": "fractional round",
+      "message": {
+        "protocolVersion": 3,
+        "discussionId": "discussion-1",
+        "chatroomId": "room-1",
+        "requestId": "cancel-1",
+        "stateVersion": 4,
+        "round": 1.5,
+        "roundRevision": 0,
+        "timestamp": 1723950002000,
+        "msg_type": "discussion_cancel",
+        "targetRequestId": "request-1",
+        "targetMemberId": "member-1",
+        "reason": "User interjection"
+      }
+    },
+    {
+      "name": "boolean protocol version",
+      "message": {
+        "protocolVersion": true,
+        "discussionId": "discussion-1",
+        "chatroomId": "room-1",
+        "requestId": "cancel-1",
+        "stateVersion": 4,
+        "round": 1,
+        "roundRevision": 0,
+        "timestamp": 1723950002000,
+        "msg_type": "discussion_cancel",
+        "targetRequestId": "request-1",
+        "targetMemberId": "member-1",
+        "reason": "User interjection"
+      }
+    },
     {
       "name": "missing revision",
       "message": {
