@@ -1841,6 +1841,67 @@ describe('MessageRouter task events and reconnect behavior', () => {
     expect(fixture.sent.some(({ input }) => input.messageType === 'card_message')).toBe(false);
   });
 
+  it('bounds ordinary completion after invalid-card diagnostics expand legal raw output', async () => {
+    const fixture = await routerHarness();
+    const output = `🌍${'x'.repeat(1_048_346)}${'[CARD][{}]'.repeat(16)}`;
+    expect(Buffer.byteLength(output, 'utf8')).toBe(1_048_510);
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', { output });
+    })());
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('ordinary-invalid-card-cap')));
+
+    const terminal = streamEvents(fixture.sent).at(-1)!;
+    expect(terminal.status).toBe('completed');
+    expect(Buffer.byteLength(terminal.text, 'utf8')).toBeLessThanOrEqual(1024 * 1024);
+    expect(terminal.text.startsWith('🌍')).toBe(true);
+    expect(terminal.text.endsWith('[output_truncated]')).toBe(true);
+    expect(terminal.text).not.toContain('\uFFFD');
+    expect(fixture.sent.some(({ input }) => input.messageType === 'card_message')).toBe(false);
+  });
+
+  it.each(['cancelled', 'failed'] as const)(
+    'bounds ordinary %s terminals after diagnostics while retaining partial output and a card once',
+    async (status) => {
+      const fixture = await routerHarness();
+      const card = { schema: '1.0.0', id: 'ordinary-bounded-card', header: { title: 'Safe card' }, sections: [] };
+      const markers = `[CARD][${JSON.stringify(card)}]${'[CARD][{}]'.repeat(15)}`;
+      const partial = `🌍${'x'.repeat(1_048_550 - 4 - Buffer.byteLength(markers, 'utf8'))}${markers}`;
+      expect(Buffer.byteLength(partial, 'utf8')).toBe(1_048_550);
+      let release!: () => void;
+      let observed!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const ready = new Promise<void>((resolve) => { observed = resolve; });
+      fixture.setEvents((taskId) => (async function* () {
+        yield bridgeEvent(taskId, 'text_delta', { id: 1, text: partial });
+        observed();
+        await gate;
+        if (status === 'cancelled') yield bridgeEvent(taskId, 'cancelled', { id: 2 });
+        else yield bridgeEvent(taskId, 'failed', { id: 2, error: { category: 'transport' } });
+      })());
+
+      const routing = fixture.router.onWorkerEvent(
+        IDENTITY_A,
+        inbound(IDENTITY_A, message(`ordinary-${status}-invalid-card-cap`)),
+      );
+      await ready;
+      await vi.waitFor(() => expect(streamEvents(fixture.sent).at(-1)?.status).toBe('streaming'));
+      release();
+      await routing;
+
+      const terminal = streamEvents(fixture.sent).at(-1)!;
+      expect(terminal.status).toBe(status);
+      expect(Buffer.byteLength(terminal.text, 'utf8')).toBeLessThanOrEqual(1024 * 1024);
+      expect(terminal.text.startsWith('🌍')).toBe(true);
+      expect(terminal.text.endsWith('[output_truncated]')).toBe(true);
+      expect(terminal.text).not.toContain('\uFFFD');
+      if (status === 'failed') expect(terminal.error_code).toBe('runtime_transport_error');
+      const cards = fixture.sent.filter(({ input }) => input.messageType === 'card_message');
+      expect(cards).toHaveLength(1);
+      expect(cards[0]!.input.content).toMatchObject({ card });
+    },
+  );
+
   it('shares the corrected output byte budget with retained structured cards', async () => {
     const fixture = await routerHarness();
     const card = { schema: '1.0.0', id: 'bounded-card', header: { title: 'Safe card' }, sections: [] };
@@ -2312,8 +2373,10 @@ describe('MessageRouter task events and reconnect behavior', () => {
       yield bridgeEvent(taskId, 'completed', { output: '[CARD][{"secret":"raw"}]' });
     })());
     await invalid.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, message('invalid-card')));
+    expect(streamEvents(invalid.sent).at(-1)).toMatchObject({
+      status: 'completed', text: '[invalid card marker]',
+    });
     const invalidText = JSON.stringify(invalid.sent);
-    expect(invalidText).toContain('[invalid card marker]');
     expect(invalidText).not.toContain('"secret":"raw"');
   });
 

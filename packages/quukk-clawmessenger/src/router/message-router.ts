@@ -3596,7 +3596,10 @@ export class MessageRouter {
           invalidCards += 1;
         }
       }
-      const finalText = parsed.text + INVALID_CARD_MARKER_TEXT.repeat(invalidCards);
+      let finalText = parsed.text + INVALID_CARD_MARKER_TEXT.repeat(invalidCards);
+      if (Buffer.byteLength(finalText, 'utf8') > MAX_OUTPUT_BYTES) {
+        finalText = utf8Prefix(finalText, MAX_OUTPUT_CONTENT_BYTES) + OUTPUT_TRUNCATED_TEXT;
+      }
       const textMessages = this.#streamMessages(active, finalText, active.streamStatus);
       this.#removeBufferedTask(active.bindingKey, active.taskId, 'coarse');
       const messages = [...textMessages, ...cardMessages];
