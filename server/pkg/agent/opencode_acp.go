@@ -165,6 +165,10 @@ func (b *opencodeBackend) executeACP(ctx context.Context, prompt string, opts Ex
 			err = io.ErrUnexpectedEOF
 		}
 		c.closeAllPending(fmt.Errorf("opencode ACP stdout: %w", err))
+		// Cancelling the transport context cannot interrupt a synchronous pipe
+		// write. EOF must release unread stdin too, so the lifecycle can reach
+		// its bounded owned-tree cleanup without a separate caller cancellation.
+		_ = stdin.Close()
 	}()
 	request := func(method string, params any) (json.RawMessage, error) {
 		response, err := c.request(transportCtx, method, params)

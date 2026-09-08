@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -72,6 +73,12 @@ func TestOpenCodeACPHelper(t *testing.T) {
 		case "initialize":
 			response(map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]any{"http": true, "sse": true}}})
 		case "session/new", "session/load":
+			if mode == "flattened-session-error" {
+				// Exact error shape observed by the controller's installed 1.18.18
+				// missing-session probe. It does not prove the cause to the client.
+				send(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": -32603, "message": "Internal error: OpenCode service failure", "data": map[string]any{"service": "session"}}})
+				return
+			}
 			if mode == "mcp" {
 				servers, ok := req.Params["mcpServers"].([]any)
 				var config struct {
@@ -107,9 +114,12 @@ func TestOpenCodeACPHelper(t *testing.T) {
 			} else {
 				response(map[string]any{"sessionId": "active"})
 			}
-			if mode == "blocked-writer" {
+			if mode == "blocked-writer" || mode == "eof-blocked-writer" {
 				_, _ = io.ReadFull(os.Stdin, make([]byte, 4096))
 				_ = os.WriteFile(filepath.Join(os.Getenv("TEST_OPENCODE_DIR"), "blocked"), nil, 0600)
+				if mode == "eof-blocked-writer" {
+					_ = os.Stdout.Close()
+				}
 				time.Sleep(20 * time.Second)
 				return
 			}
@@ -236,7 +246,7 @@ func openCodeACPTestSession(t *testing.T, ctx context.Context, mode string, opts
 	opts.StreamText = true
 	opts.Cwd = dir
 	prompt := "hello"
-	if mode == "blocked-writer" {
+	if mode == "blocked-writer" || mode == "eof-blocked-writer" {
 		prompt = strings.Repeat("x", 1024*1024)
 	}
 	s, err := b.Execute(ctx, prompt, opts)
@@ -244,6 +254,100 @@ func openCodeACPTestSession(t *testing.T, ctx context.Context, mode string, opts
 		t.Fatal(err)
 	}
 	return s, dir
+}
+
+type acpResponseBeforeWriteReturns func([]byte) (int, error)
+
+func (write acpResponseBeforeWriteReturns) Write(p []byte) (int, error) { return write(p) }
+
+// Both the RPC response and context cancellation are ready before request can
+// enter its select. There is no race between fixture goroutines or pipe timing.
+func TestACPRequestPreservesBufferedResponseOnTransportClose(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		for _, writeFailure := range []bool{false, true} {
+			t.Run(fmt.Sprintf("missing=%v/writeFailure=%v", missing, writeFailure), func(t *testing.T) {
+				for i := 0; i < 64; i++ {
+					ctx, cancel := context.WithCancel(context.Background())
+					c := &hermesClient{pending: make(map[int]*pendingRPC)}
+					c.stdin = acpResponseBeforeWriteReturns(func(p []byte) (int, error) {
+						var request struct {
+							ID int `json:"id"`
+						}
+						if err := json.Unmarshal(p, &request); err != nil {
+							t.Fatal(err)
+						}
+						frame := map[string]any{"jsonrpc": "2.0", "id": request.ID}
+						if missing {
+							frame["error"] = map[string]any{"code": -32602, "message": "session not found: active"}
+						} else {
+							frame["result"] = map[string]any{"stopReason": "end_turn"}
+						}
+						data, _ := json.Marshal(frame)
+						c.handleLine(string(data))
+						cancel()
+						if writeFailure {
+							return len(p), io.ErrClosedPipe
+						}
+						return len(p), nil
+					})
+					response, err := c.request(ctx, "session/prompt", map[string]any{})
+					cancel()
+					if missing {
+						if !isACPSessionNotFound(err) {
+							t.Fatalf("buffered structured error lost: %v", err)
+						}
+					} else if err != nil || string(response) != `{"stopReason":"end_turn"}` {
+						t.Fatalf("buffered completion lost: %s, %v", response, err)
+					}
+					if len(c.pending) != 0 {
+						t.Fatal("request retained after response")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestACPRequestCancellationWithoutResponse(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &hermesClient{pending: make(map[int]*pendingRPC)}
+	c.stdin = acpResponseBeforeWriteReturns(func(p []byte) (int, error) { cancel(); return len(p), nil })
+	_, err := c.request(ctx, "initialize", map[string]any{})
+	cancel()
+	if !errors.Is(err, context.Canceled) || len(c.pending) != 0 {
+		t.Fatalf("pending request not cancelled: %v, %d", err, len(c.pending))
+	}
+}
+
+func TestOpenCodeACPEOFReleasesBlockedPromptWithoutCallerCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, dir := openCodeACPTestSession(t, ctx, "eof-blocked-writer", ExecOptions{})
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "blocked")); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("large prompt never reached unread stdin")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case result := <-s.Result:
+		if result.Status != "failed" || result.Error == "" || result.ResumeRejected {
+			t.Fatalf("transport failure misclassified: %+v", result)
+		}
+		if ctx.Err() != nil {
+			t.Fatal("transport cleanup required caller cancellation")
+		}
+	case <-time.After(3 * time.Second):
+		cancel()
+		openCodeACPResult(t, s)
+		t.Fatal("stdout EOF left the large prompt blocked until caller cancellation")
+	}
+	for range s.Messages {
+	}
 }
 
 func openCodeACPResult(t *testing.T, s *Session) Result {
@@ -309,6 +413,7 @@ func TestOpenCodeACPFailuresAndSettings(t *testing.T) {
 		{"foreign-permission", "completed", "Hello denied", false},
 		{"mcp", "completed", "Hello world!", false},
 		{"missing-exit", "failed", "", true},
+		{"flattened-session-error", "failed", "", false},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)

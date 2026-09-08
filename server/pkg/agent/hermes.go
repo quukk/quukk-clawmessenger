@@ -985,6 +985,13 @@ func (c *hermesClient) request(ctx context.Context, method string, params any) (
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()
+		// A peer can reply and then close the transport before Write returns.
+		// Preserve the response already delivered to this request.
+		select {
+		case res := <-pr.ch:
+			return res.result, res.err
+		default:
+		}
 		return nil, fmt.Errorf("write %s: %w", method, err)
 	}
 
@@ -995,6 +1002,13 @@ func (c *hermesClient) request(ctx context.Context, method string, params any) (
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()
+		// EOF cancellation and a buffered response can become ready together.
+		// The response wins even when the outer select chose cancellation.
+		select {
+		case res := <-pr.ch:
+			return res.result, res.err
+		default:
+		}
 		return nil, ctx.Err()
 	}
 }
