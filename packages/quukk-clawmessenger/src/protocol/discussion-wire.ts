@@ -129,7 +129,7 @@ export class DiscussionWireReassembler {
   readonly #maxInflightBytes: number;
   readonly #maxCompleted: number;
   readonly #partials = new Map<string, PartialMessage>();
-  readonly #completed = new Map<string, number>();
+  readonly #completed = new Map<string, { expiresAt: number; protocolVersion: number }>();
   #storedBytes = 0;
   #disposed = false;
 
@@ -226,7 +226,8 @@ export class DiscussionWireReassembler {
     const raw = canonicalBase64(value.data as string);
     if (!raw || raw.length < 1 || raw.length > RAW_DISCUSSION_CHUNK_BYTES) return { status: 'invalid' };
     const key = JSON.stringify([senderId, value.messageId]);
-    if (this.#completed.has(key)) return { status: 'replay' };
+    const completed = this.#completed.get(key);
+    if (completed) return { status: completed.protocolVersion === value.protocolVersion ? 'replay' : 'invalid' };
 
     let partial = this.#partials.get(key);
     if (!partial) {
@@ -289,7 +290,7 @@ export class DiscussionWireReassembler {
     if (!record(payload) || this.#completed.size >= this.#maxCompleted) return { status: 'invalid' };
     // Existing generic v2 transport has no inner version. V3 must declare it.
     if ((Object.hasOwn(payload, 'protocolVersion') ? payload.protocolVersion : 2) !== partial.protocolVersion) return { status: 'invalid' };
-    this.#completed.set(key, now + this.#ttlMs);
+    this.#completed.set(key, { expiresAt: now + this.#ttlMs, protocolVersion: partial.protocolVersion });
     return { status: 'complete', payload, serialized };
   }
 
@@ -329,8 +330,8 @@ export class DiscussionWireReassembler {
     for (const [key, partial] of this.#partials) {
       if (partial.expiresAt <= now) this.#remove(key);
     }
-    for (const [key, expiresAt] of this.#completed) {
-      if (expiresAt <= now) this.#completed.delete(key);
+    for (const [key, completed] of this.#completed) {
+      if (completed.expiresAt <= now) this.#completed.delete(key);
     }
   }
 }

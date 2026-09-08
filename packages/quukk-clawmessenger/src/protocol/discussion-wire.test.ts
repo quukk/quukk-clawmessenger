@@ -272,3 +272,14 @@ describe('discussion wire reassembler', () => {
     expect(wire.accept('sender', frames[0])).toEqual({ status: 'invalid' });
   });
 });
+it('rejects a conflicting outer version after completion without losing same-version replay or expiry', () => {
+  let now = 100;
+  const codec = new DiscussionWireReassembler({ clock: () => now, ttlMs: 1000 });
+  const frames = encodeDiscussionWire({ content: 'x'.repeat(20000) }).map(frame => JSON.parse(frame));
+  for (const frame of frames) codec.accept('sender', frame);
+  expect(codec.accept('sender', frames[0])).toMatchObject({ status: 'replay' });
+  expect(codec.accept('sender', { ...frames[0], protocolVersion: 3 })).toMatchObject({ status: 'invalid' });
+  expect(codec.accept('sender', frames[0])).toMatchObject({ status: 'replay' });
+  now = 1100;
+  expect(codec.accept('sender', frames[0])).toMatchObject({ status: 'incomplete' });
+});
