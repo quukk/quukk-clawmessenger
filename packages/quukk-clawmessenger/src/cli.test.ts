@@ -60,6 +60,7 @@ function runtimeResponse(pathSentinel = resolve('runtime-path')) {
         status: 'ready' as const,
         capabilities,
         binding: null,
+        credentialMode: null,
         worker: null,
       },
       ...(['openclaw', 'codex', 'hermes'] as const).map((provider) => ({
@@ -70,6 +71,7 @@ function runtimeResponse(pathSentinel = resolve('runtime-path')) {
         status: 'not_found' as const,
         capabilities,
         binding: null,
+        credentialMode: null,
         worker: null,
       })),
     ],

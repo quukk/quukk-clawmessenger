@@ -16,6 +16,8 @@ import type {
 } from '../config/schema.js';
 import {
   RegistrationError,
+  type DeviceEnrollmentInput,
+  type DeviceEnrollmentResult,
   type RefreshInput,
   type RegistrationInput,
   type RegistrationResult,
@@ -92,6 +94,22 @@ class FakeRegistrationClient {
     nodeName: input.nodeName,
     token: `${input.provider}-refreshed-token`,
   });
+  readonly enrollCalls: DeviceEnrollmentInput[] = [];
+  enrollImplementation: (input: DeviceEnrollmentInput) => Promise<DeviceEnrollmentResult> = async (
+    input,
+  ) => ({
+    credentialId: input.credentialId,
+    nodeId: input.nodeId,
+    provider: input.provider,
+    runtimeId: input.runtimeId,
+    bindingVersion: input.bindingVersion,
+    status: 'active',
+  });
+
+  async enrollDeviceCredential(input: DeviceEnrollmentInput): Promise<DeviceEnrollmentResult> {
+    this.enrollCalls.push({ ...input });
+    return this.enrollImplementation(input);
+  }
 
   async getAppKey(serverUrl: string, signal?: AbortSignal): Promise<string> {
     this.appKeyCalls.push(serverUrl);
@@ -645,6 +663,42 @@ describe('BindingService', () => {
     ).toBeUndefined();
     expect(registration.registerCalls).toHaveLength(1);
     expect(registration.refreshCalls).toEqual([]);
+  });
+
+  it('enrolls and persists a device credential when registration returns a ticket', async () => {
+    const selected = runtime('codex');
+    const registration = new FakeRegistrationClient();
+    registration.registerImplementation = async (input) => ({
+      nodeId: `${input.provider}_registered`,
+      nodeName: input.nodeName,
+      token: `${input.provider}-token`,
+      deviceCredentialTicket: 'T'.repeat(43),
+      bindingVersion: 1,
+    });
+    const fixture = await harness([selected], { registration });
+
+    const [enabled] = await fixture.service.enableSelected([selected.id]);
+    expect(enabled?.ok).toBe(true);
+    expect(registration.enrollCalls).toHaveLength(1);
+    const call = registration.enrollCalls[0]!;
+    expect(call).toMatchObject({
+      nodeId: 'codex_registered',
+      provider: 'codex',
+      runtimeId: selected.id,
+      bindingVersion: 1,
+      ticket: 'T'.repeat(43),
+    });
+    expect(call.credentialId).toMatch(/^dc_[0-9a-f]{32}$/);
+    expect(call.secret.length).toBeGreaterThanOrEqual(32);
+
+    const binding = fixture.service.list().find((item) => item.runtimeId === selected.id)!;
+    const credential = fixture.store.credential(binding.tokenRef!);
+    expect(credential?.token).toBeUndefined();
+    expect(credential?.deviceCredential).toEqual({
+      credentialId: call.credentialId,
+      secret: call.secret,
+      bindingVersion: 1,
+    });
   });
 
   it('runs a later disable after deferred enable so call order leaves the binding disabled', async () => {

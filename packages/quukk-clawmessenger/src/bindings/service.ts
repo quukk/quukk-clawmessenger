@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { hostname as osHostname } from 'node:os';
 import { isAbsolute } from 'node:path';
 
@@ -36,7 +37,10 @@ export type ReregisterOptions = {
   preserveNodeIdentity?: boolean;
 };
 
-type RegistrationPort = Pick<RegistrationClient, 'getAppKey' | 'register' | 'refreshToken'>;
+type RegistrationPort = Pick<
+  RegistrationClient,
+  'getAppKey' | 'register' | 'refreshToken' | 'enrollDeviceCredential'
+>;
 
 export type BindingConfigSnapshotContext = {
   overrides?: ConfigOverrides;
@@ -173,6 +177,29 @@ export class BindingService {
       return undefined;
     }
     return credential;
+  }
+
+  async #enrollDeviceCredential(
+    registered: Awaited<ReturnType<RegistrationClient['register']>>,
+    runtime: TrustedRuntime,
+    serverUrl: string,
+  ): Promise<{ credentialId: string; secret: string; bindingVersion: number } | undefined> {
+    const ticket = registered.deviceCredentialTicket;
+    if (ticket === undefined) return undefined;
+    const credentialId = `dc_${randomBytes(16).toString('hex')}`;
+    const secret = randomBytes(32).toString('base64url');
+    const bindingVersion = registered.bindingVersion ?? 1;
+    await this.#registrationClient.enrollDeviceCredential({
+      serverUrl,
+      ticket,
+      credentialId,
+      secret,
+      nodeId: registered.nodeId,
+      provider: runtime.provider,
+      runtimeId: runtime.id,
+      bindingVersion,
+    });
+    return { credentialId, secret, bindingVersion };
   }
 
   #enqueue<T>(runtimeId: string, operation: () => Promise<T>): Promise<T> {
@@ -425,6 +452,7 @@ export class BindingService {
           : {}),
       };
       const registered = await this.#registrationClient.register(input, signal);
+      const deviceCredential = await this.#enrollDeviceCredential(registered, runtime, serverUrl);
       const committed = await this.#store.commitRegistration(
         {
           ...pending,
@@ -438,7 +466,9 @@ export class BindingService {
         {
           serverUrl,
           appKey: applicationKey,
-          token: registered.token,
+          ...(deviceCredential === undefined
+            ? { token: registered.token }
+            : { deviceCredential }),
           createdAt: this.#now().toISOString(),
         },
       );
@@ -554,7 +584,11 @@ export class BindingService {
           nodeName: previous.nodeName,
           existingNodeToken: credential.token,
         };
-        const refreshed = await this.#registrationClient.refreshToken(input, signal);
+        // A migrated node refreshes through a connection session, so this
+        // legacy path keeps its device credential instead of minting a token.
+        const refreshed = credential.deviceCredential === undefined
+          ? await this.#registrationClient.refreshToken(input, signal)
+          : undefined;
         const committed = await this.#store.commitRegistration(
           {
             ...previous,
@@ -565,7 +599,9 @@ export class BindingService {
           {
             serverUrl: config.serverUrl,
             appKey: applicationKey,
-            token: refreshed.token,
+            ...(credential.deviceCredential === undefined
+              ? { token: refreshed!.token }
+              : { deviceCredential: credential.deviceCredential }),
             createdAt: this.#now().toISOString(),
           },
         );

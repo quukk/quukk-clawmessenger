@@ -52,6 +52,8 @@ export const REGISTRATION_ERROR_CODES = [
   'registration_node_mismatch',
   'registration_capabilities_mismatch',
   'token_refresh_failed',
+  'device_enrollment_failed',
+  'connection_session_failed',
 ] as const;
 
 export type RegistrationErrorCode = (typeof REGISTRATION_ERROR_CODES)[number];
@@ -219,6 +221,21 @@ export const LocalStateSchema = z
 
 export type LocalState = z.infer<typeof LocalStateSchema>;
 
+export const DEVICE_CREDENTIAL_ID_PATTERN = /^dc_[0-9a-f]{32}$/;
+
+export const DeviceCredentialSchema = z
+  .strictObject({
+    credentialId: z.string().regex(DEVICE_CREDENTIAL_ID_PATTERN),
+    secret: z
+      .string()
+      .min(32)
+      .max(512)
+      .refine((value) => value === value.trim()),
+    bindingVersion: z.number().int().min(1),
+  });
+
+export type DeviceCredential = z.infer<typeof DeviceCredentialSchema>;
+
 export const RongCloudCredentialSchema = z
   .strictObject({
     runtimeId: z.string().regex(RUNTIME_ID_PATTERN),
@@ -226,12 +243,24 @@ export const RongCloudCredentialSchema = z
     nodeId: z.string().max(137),
     serverUrl: ServerUrlSchema,
     appKey: z.string().min(1).max(256).refine((value) => value === value.trim()),
-    token: z.string().min(1).max(16384).refine((value) => value === value.trim()),
+    // A migrated node persists a device credential; an unmigrated node keeps the
+    // legacy connection token. Exactly one of the two is present.
+    token: z.string().min(1).max(16384).refine((value) => value === value.trim()).optional(),
+    deviceCredential: DeviceCredentialSchema.optional(),
     createdAt: z.iso.datetime({ offset: true }),
   })
   .superRefine((value, context) => {
     if (!isValidNodeId(value.provider, value.nodeId)) {
       context.addIssue({ code: 'custom', path: ['nodeId'], message: 'invalid_node_id' });
+    }
+    if ((value.token === undefined) === (value.deviceCredential === undefined)) {
+      context.addIssue({ code: 'custom', message: 'credential_mode_ambiguous' });
+    }
+    if (
+      value.deviceCredential !== undefined
+      && value.deviceCredential.bindingVersion < 1
+    ) {
+      context.addIssue({ code: 'custom', path: ['deviceCredential'], message: 'invalid_binding_version' });
     }
   });
 

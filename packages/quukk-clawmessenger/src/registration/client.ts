@@ -34,6 +34,7 @@ export type RegistrationInput = {
   existingNodeId?: string;
   existingNodeToken?: string;
   authorization?: PairingRegistrationAuthorization;
+  bindingVersion?: number;
 };
 
 export type RefreshInput = {
@@ -51,6 +52,52 @@ export type RegistrationResult = {
   nodeId: string;
   nodeName: string;
   token: string;
+  deviceCredentialTicket?: string;
+  bindingVersion?: number;
+};
+
+export type DeviceEnrollmentInput = {
+  serverUrl: string;
+  ticket: string;
+  credentialId: string;
+  secret: string;
+  nodeId: string;
+  provider: Provider;
+  runtimeId: string;
+  bindingVersion: number;
+};
+
+export type DeviceEnrollmentResult = {
+  credentialId: string;
+  nodeId: string;
+  provider: Provider;
+  runtimeId: string;
+  bindingVersion: number;
+  status: string;
+};
+
+export type ConnectionSessionInput = {
+  serverUrl: string;
+  credentialId: string;
+  secret: string;
+  attemptId: string;
+  runtimeId: string;
+  bindingVersion: number;
+};
+
+export type ConnectionSessionResult = {
+  sessionId: string;
+  nodeId: string;
+  appKey: string;
+  token: string;
+  bindingVersion: number;
+  policyVersion: number;
+};
+
+export type ConnectionSessionCloseInput = {
+  serverUrl: string;
+  credentialId: string;
+  secret: string;
 };
 
 type RegistrationErrorCategory =
@@ -89,7 +136,7 @@ export type RegistrationClientDependencies = {
   timeoutMs?: number;
 };
 
-type Operation = 'app-key' | 'register' | 'refresh';
+type Operation = 'app-key' | 'register' | 'refresh' | 'enroll' | 'session' | 'close';
 
 class AttemptFailure {
   readonly kind: 'transport' | 'timeout';
@@ -115,7 +162,33 @@ const registrationDataSchema = z.object({
   token: z.string(),
   capabilities: z.array(z.string()),
   name: z.string().optional(),
+  device_credential_ticket: z.string().optional(),
+  binding_version: z.number().int().optional(),
 });
+const deviceEnrollmentDataSchema = z.object({
+  credential_id: z.string(),
+  node_id: z.string(),
+  provider: z.string(),
+  runtime_id: z.string(),
+  binding_version: z.number().int(),
+  status: z.string(),
+});
+const connectionSessionDataSchema = z.object({
+  session_id: z.string(),
+  node_id: z.string(),
+  app_key: z.string(),
+  token: z.string(),
+  binding_version: z.number().int(),
+  policy_version: z.number().int(),
+});
+const connectionSessionCloseDataSchema = z.object({
+  session_id: z.string(),
+  status: z.string(),
+  revoked: z.boolean(),
+});
+
+const CREDENTIAL_ID_PATTERN = /^dc_[0-9a-f]{32}$/;
+const ATTEMPT_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 
 function invalidServerUrl(): RegistrationError {
   return new RegistrationError('invalid_server_url', 'validation', false);
@@ -135,6 +208,12 @@ function permanentError(operation: Operation): RegistrationError {
   }
   if (operation === 'refresh') {
     return new RegistrationError('token_refresh_failed', 'registration', false);
+  }
+  if (operation === 'enroll') {
+    return new RegistrationError('device_enrollment_failed', 'registration', false);
+  }
+  if (operation === 'session' || operation === 'close') {
+    return new RegistrationError('connection_session_failed', 'registration', false);
   }
   return new RegistrationError('registration_rejected', 'registration', false);
 }
@@ -172,6 +251,58 @@ function validateCredentialToken(token: string | undefined): void {
   if (
     token !== undefined &&
     (token.length === 0 || token.length > 16_384 || token !== token.trim())
+  ) {
+    throw new RegistrationError('registration_rejected', 'validation', false);
+  }
+}
+
+function validateDeviceEnrollmentInput(input: DeviceEnrollmentInput): void {
+  if (
+    !PROVIDERS.includes(input.provider)
+    || !RUNTIME_ID_PATTERN.test(input.runtimeId)
+    || !isValidNodeId(input.provider, input.nodeId)
+    || !CREDENTIAL_ID_PATTERN.test(input.credentialId)
+    || typeof input.secret !== 'string'
+    || input.secret.length < 32
+    || input.secret.length > 512
+    || input.secret !== input.secret.trim()
+    || typeof input.ticket !== 'string'
+    || input.ticket.length < 16
+    || input.ticket.length > 512
+    || !Number.isInteger(input.bindingVersion)
+    || input.bindingVersion < 1
+  ) {
+    throw new RegistrationError('registration_rejected', 'validation', false);
+  }
+}
+
+function validateConnectionSessionInput(input: ConnectionSessionInput): void {
+  if (
+    !CREDENTIAL_ID_PATTERN.test(input.credentialId)
+    || typeof input.secret !== 'string'
+    || input.secret.length === 0
+    || input.secret.length > 512
+    || !ATTEMPT_ID_PATTERN.test(input.attemptId)
+    || !RUNTIME_ID_PATTERN.test(input.runtimeId)
+    || !Number.isInteger(input.bindingVersion)
+    || input.bindingVersion < 1
+  ) {
+    throw new RegistrationError('registration_rejected', 'validation', false);
+  }
+}
+
+function validateConnectionSessionCloseInput(
+  input: ConnectionSessionCloseInput,
+  sessionId: string,
+): void {
+  if (
+    typeof sessionId !== 'string'
+    || sessionId.length === 0
+    || sessionId.length > 128
+    || !CREDENTIAL_ID_PATTERN.test(input.credentialId)
+    || typeof input.secret !== 'string'
+    || input.secret.length === 0
+    || input.secret.length > 512
   ) {
     throw new RegistrationError('registration_rejected', 'validation', false);
   }
@@ -301,7 +432,28 @@ function registrationResult(
   ) {
     throw new RegistrationError('registration_capabilities_mismatch', 'validation', false);
   }
-  return { nodeId: data.data.node_id, nodeName: submittedNodeName, token: data.data.token };
+  const deviceCredentialTicket = data.data.device_credential_ticket;
+  if (
+    deviceCredentialTicket !== undefined
+    && (
+      deviceCredentialTicket.length < 16
+      || deviceCredentialTicket.length > 512
+      || deviceCredentialTicket !== deviceCredentialTicket.trim()
+    )
+  ) {
+    throw invalidResponse(operation);
+  }
+  const bindingVersion = data.data.binding_version;
+  if (bindingVersion !== undefined && (!Number.isInteger(bindingVersion) || bindingVersion < 1)) {
+    throw invalidResponse(operation);
+  }
+  return {
+    nodeId: data.data.node_id,
+    nodeName: submittedNodeName,
+    token: data.data.token,
+    ...(deviceCredentialTicket !== undefined ? { deviceCredentialTicket } : {}),
+    ...(bindingVersion !== undefined ? { bindingVersion } : {}),
+  };
 }
 
 export class RegistrationClient {
@@ -435,6 +587,9 @@ export class RegistrationClient {
       throw new RegistrationError('registration_node_mismatch', 'validation', false);
     }
     validateCredentialToken(input.existingNodeToken);
+    if (input.bindingVersion !== undefined && (!Number.isInteger(input.bindingVersion) || input.bindingVersion < 1)) {
+      throw new RegistrationError('registration_rejected', 'validation', false);
+    }
     if (input.authorization !== undefined) {
       validatePairingAuthorization(input.authorization);
       if (input.existingNodeId !== undefined || input.existingNodeToken !== undefined) {
@@ -454,6 +609,8 @@ export class RegistrationClient {
           name: input.nodeName,
           mac_address: stableMac(input.installId, this.#networkInterfaces),
           capabilities: [...(input.capabilities ?? CLAWMESSENGER_NODE_CAPABILITIES)],
+          runtime_id: input.runtimeId,
+          binding_version: input.bindingVersion ?? 1,
         };
     if (input.existingNodeId !== undefined) requestBody.node_id = input.existingNodeId;
     const headers: Record<string, string> = {
@@ -522,5 +679,135 @@ export class RegistrationClient {
       signal,
     );
     return registrationResult(response, 'refresh', input.provider, input.nodeName, input.nodeId, input.capabilities);
+  }
+
+  async enrollDeviceCredential(
+    input: DeviceEnrollmentInput,
+    signal?: AbortSignal,
+  ): Promise<DeviceEnrollmentResult> {
+    const server = normalizeUrl(input.serverUrl);
+    validateDeviceEnrollmentInput(input);
+    const response = await this.#request(
+      'enroll',
+      `${server}/api/claw/device-credentials/enroll`,
+      {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ticket: input.ticket,
+          credential_id: input.credentialId,
+          secret: input.secret,
+          node_id: input.nodeId,
+          provider: input.provider,
+          runtime_id: input.runtimeId,
+          binding_version: input.bindingVersion,
+        }),
+      },
+      signal,
+    );
+    const envelope = envelopeSchema.safeParse(response);
+    if (!envelope.success || envelope.data.code !== 200) throw permanentError('enroll');
+    const data = deviceEnrollmentDataSchema.safeParse(envelope.data.data);
+    if (!data.success) throw invalidResponse('enroll');
+    if (
+      data.data.credential_id !== input.credentialId
+      || data.data.node_id !== input.nodeId
+      || data.data.provider !== input.provider
+      || data.data.runtime_id !== input.runtimeId
+      || data.data.binding_version !== input.bindingVersion
+      || data.data.status !== 'active'
+    ) {
+      throw new RegistrationError('registration_node_mismatch', 'validation', false);
+    }
+    return {
+      credentialId: data.data.credential_id,
+      nodeId: data.data.node_id,
+      provider: input.provider,
+      runtimeId: data.data.runtime_id,
+      bindingVersion: data.data.binding_version,
+      status: data.data.status,
+    };
+  }
+
+  async openConnectionSession(
+    input: ConnectionSessionInput,
+    signal?: AbortSignal,
+  ): Promise<ConnectionSessionResult> {
+    const server = normalizeUrl(input.serverUrl);
+    validateConnectionSessionInput(input);
+    const response = await this.#request(
+      'session',
+      `${server}/api/claw/connection-sessions`,
+      {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          credential_id: input.credentialId,
+          secret: input.secret,
+          attempt_id: input.attemptId,
+          runtime_id: input.runtimeId,
+          binding_version: input.bindingVersion,
+        }),
+      },
+      signal,
+    );
+    const envelope = envelopeSchema.safeParse(response);
+    if (!envelope.success || envelope.data.code !== 200) throw permanentError('session');
+    const data = connectionSessionDataSchema.safeParse(envelope.data.data);
+    if (!data.success) throw invalidResponse('session');
+    const token = data.data.token;
+    const appKey = data.data.app_key;
+    if (
+      token.length === 0
+      || token.length > 16_384
+      || token !== token.trim()
+      || appKey.length === 0
+      || appKey.length > 256
+      || appKey !== appKey.trim()
+      || data.data.session_id.length === 0
+      || data.data.binding_version < 1
+      || data.data.policy_version < 1
+    ) {
+      throw invalidResponse('session');
+    }
+    return {
+      sessionId: data.data.session_id,
+      nodeId: data.data.node_id,
+      appKey,
+      token,
+      bindingVersion: data.data.binding_version,
+      policyVersion: data.data.policy_version,
+    };
+  }
+
+  async closeConnectionSession(
+    sessionId: string,
+    input: ConnectionSessionCloseInput,
+    signal?: AbortSignal,
+  ): Promise<{ sessionId: string; status: string; revoked: boolean }> {
+    const server = normalizeUrl(input.serverUrl);
+    validateConnectionSessionCloseInput(input, sessionId);
+    const response = await this.#request(
+      'close',
+      `${server}/api/claw/connection-sessions/${encodeURIComponent(sessionId)}/close`,
+      {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          credential_id: input.credentialId,
+          secret: input.secret,
+        }),
+      },
+      signal,
+    );
+    const envelope = envelopeSchema.safeParse(response);
+    if (!envelope.success || envelope.data.code !== 200) throw permanentError('close');
+    const data = connectionSessionCloseDataSchema.safeParse(envelope.data.data);
+    if (!data.success) throw invalidResponse('close');
+    return {
+      sessionId: data.data.session_id,
+      status: data.data.status,
+      revoked: data.data.revoked,
+    };
   }
 }

@@ -31,6 +31,7 @@ const emptyRuntimes: RuntimesResponse = {
       sessionResume: false, cancel: false, textEvents: false, toolEvents: false, approvalEvents: false,
     },
     binding: null,
+    credentialMode: null,
     worker: null,
   })),
 };

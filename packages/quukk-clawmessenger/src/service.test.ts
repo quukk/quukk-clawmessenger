@@ -1417,8 +1417,14 @@ describe('QuukkService projections and settings', () => {
     const response = await f.service.runtimes(new AbortController().signal);
     expect(response.runtimes.map((runtime) => runtime.provider)).toEqual(PROVIDERS);
     expect(response.runtimes[0]?.binding?.runtimeId).toBe(opencode.runtimeId);
+    expect(response.runtimes[0]?.credentialMode).toBe('legacy');
     expect(response.runtimes[0]?.worker).toEqual({ state: 'online', restartCount: 2 });
-    expect(response.runtimes[1]).toMatchObject({ runtimeId: null, binding: null, worker: null });
+    expect(response.runtimes[1]).toMatchObject({
+      runtimeId: null,
+      binding: null,
+      credentialMode: null,
+      worker: null,
+    });
     await f.service.stop();
   });
 

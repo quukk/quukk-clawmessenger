@@ -12,14 +12,14 @@ Quukk ClawMessenger 采用 **fork 路线**：在 Multica 完整 monorepo 上增�
 npm install -g quukk-clawmessenger
 ```
 
-安装后的交互式桌面环境会启动本地服务并打开浏览器；非交互环境、CI、禁用 lifecycle scripts 的 npm 配置不会自动弹窗，用户可执行 `quukk-clawmessenger setup` 获得同样结果。首次页面展示本机检测到的 OpenCode、OpenClaw、Codex 与 Hermes 运行时，用户选择一个或全部后，系统为每个所选运行时幂等注册一个独立融云用户，并启动对应消息桥。
+安装后的交互式桌面环境会启动本地服务并打开浏览器；非交互环境、CI、禁用 lifecycle scripts 的 npm 配置不会自动弹窗，用户可执行 `quukk-clawmessenger setup` 获得同样结果。首次页面展示本机检测到的 OpenCode、OpenClaw、Codex 与 Hermes 运行时，用户选择一个或全部后，系统为每个所选运行时幂等注册一个独立消息服务用户，并启动对应消息桥。
 
 架构职责固定如下：
 
 - Multica Go 守护进程：检测 CLI、描述运行时、启动/恢复/取消智能体任务、输出标准化事件。
-- Node.js ClawMessenger 桥：本地控制面、配置与进程管理、每运行时一个隔离的融云 worker、消息协议兼容、会话映射。
+- Node.js ClawMessenger 桥：本地控制面、配置与进程管理、每运行时一个隔离的消息服务 worker、消息协议兼容、会话映射。
 - Multica 本地界面：上手引导、运行时选择、活动记录、诊断与设置；保留上游品牌和版权展示。
-- ClawMessenger 服务端：按 `node_type` 幂等签发融云身份；增加 Hermes 类型支持。
+- ClawMessenger 服务端：按 `node_type` 幂等签发消息服务身份；增加 Hermes 类型支持。
 
 默认模式不依赖 PostgreSQL、Docker 或公开部署的 Multica Server。fork 中原有完整平台仍保留，但 npm 用户走轻量的本地 Bridge mode。
 
@@ -32,16 +32,16 @@ npm install -g quukk-clawmessenger
 3. 自动检测 OpenCode、OpenClaw、Codex、Hermes；检测结果区分 `ready`、`found_not_runnable`、`not_found`、`probe_failed`。`ready` 只表示 CLI 已安装且版本探针可运行；首次任务返回明确认证错误后，运行状态转为 `needs_auth`。
 4. 首次安装后在可交互桌面环境自动打开本地设置页；所有环境均可用显式 CLI 命令完成设置。
 5. 用户可以选择单个、多个或全部已检测运行时，未选择的运行时不注册、不联网、不启动。
-6. 每个所选运行时获得独立的融云用户、token、会话存储、运行状态和故障隔离。
+6. 每个所选运行时获得独立的消息服务用户、token、会话存储、运行状态和故障隔离。
 7. 保留现有 ClawMessenger 行为：普通对话、会话新建/切换/清理、命令消息、设备状态、设备控制、去重、已读回执、结构化讨论消息与卡片动作。
-8. 本地 UI 可查看运行时、融云连接、当前任务、最近活动和可脱敏导出的诊断信息。
+8. 本地 UI 可查看运行时、消息服务连接、当前任务、最近活动和可脱敏导出的诊断信息。
 9. Hermes 在 ClawMessenger 服务端成为正式 `node_type`，而不是伪装成其他智能体。
 10. 测试通过、发布物审计通过、安装烟测通过后，才执行 npm 发布。
 
 ### 2.2 明确不做
 
 - 不自动安装、升级或登录任何第三方智能体 CLI。
-- 不在用户选择前创建融云身份。
+- 不在用户选择前创建消息服务身份。
 - 不把 npm 安装当作授权远程执行任意 shell 的许可。
 - 不在 Bridge mode 中引入 Multica 工作区、任务看板、PostgreSQL 或 Docker。
 - 不删除或替换 Multica 品牌，不宣称获得商业许可或品牌豁免。
@@ -69,13 +69,13 @@ npm install -g quukk-clawmessenger
 3. **注册**：按 provider 独立执行注册，逐项展示进行中、成功或可重试错误；部分成功不会回滚已经成功的其他运行时。
 4. **完成**：展示已上线的智能体列表和入口，允许稍后重新扫描、启停或注销单个运行时。
 
-任何自动注册都发生在用户点击“接入所选智能体”之后。这里的“自动”表示无需用户手填融云账号或 token，而不是无提示创建远端身份。
+任何自动注册都发生在用户点击“接入所选智能体”之后。这里的“自动”表示无需用户手填消息服务账号或 token，而不是无提示创建远端身份。
 
 ### 3.3 日常页面
 
 Bridge mode 保留 Multica 的视觉系统与品牌区域，提供四个最小页面：
 
-- **运行时**：按本机分组展示 provider、别名、版本、检测状态、融云连接状态和启用开关。
+- **运行时**：按本机分组展示 provider、别名、版本、检测状态、消息服务连接状态和启用开关。
 - **活动**：按运行时展示消息接收、任务启动、流式输出、完成、失败与取消的时间线。
 - **诊断**：服务版本、端口、进程、CLI 探测结果、脱敏日志导出。
 - **设置**：ClawMessenger 服务地址、默认工作目录、授权工作目录根、provider 路径覆盖、日志级别与重新注册。v1 不提供 OS 登录自动启动；安装后弹出只由严格 gated postinstall 或显式 setup 触发。
@@ -154,7 +154,7 @@ ClawMessenger App / 小程序
 
 探测不使用 shell 字符串拼接。每个候选可执行文件用参数数组启动，限制并发、单次探针超时和输出大小；Bridge 路径覆盖必须是绝对文件路径。结果带来源优先级并选择一个主候选：用户覆盖 > 进程 PATH > 有缓存的登录 shell PATH > Codex macOS app bundle。重新扫描不会改变已启用 runtime ID，除非原路径已不可用。瞬时探针超时使用 `probe_failed`，不会被误报成已确认不可运行。
 
-### 4.3 运行时与融云身份模型
+### 4.3 运行时与消息服务身份模型
 
 核心实体为 `RuntimeBinding`：
 
@@ -173,17 +173,17 @@ type RuntimeBinding = {
 };
 ```
 
-`runtimeId` 由 provider、规范化可执行文件路径和本机安装 ID 的摘要形成，用于本地稳定关联；它不会作为融云 token。服务端注册请求沿用现有 `/api/ai/register`：`name`、`mac_address`、`node_type`、`ai_type`、`capabilities`，存在同服务器旧 `node_id` 时带上以实现精确复用。注册/刷新还携带 `X-Node-Enrollment-Token`：Node 用解码后的 32 字节 Bridge secret，对完整规范化服务地址（含 `/im` 基路径）和 runtime ID 做带域分隔的 HMAC-SHA256；原始 Bridge secret 不上网，服务端只保存派生凭据的 SHA-256。每个 provider 使用自己的 `node_type`，服务端允许值扩展为 `openclaw`、`opencode`、`codex`、`hermes`，并保留已有 `kimi` 兼容。
+`runtimeId` 由 provider、规范化可执行文件路径和本机安装 ID 的摘要形成，用于本地稳定关联；它不会作为消息服务 token。服务端注册请求沿用现有 `/api/ai/register`：`name`、`mac_address`、`node_type`、`ai_type`、`capabilities`，存在同服务器旧 `node_id` 时带上以实现精确复用。注册/刷新还携带 `X-Node-Enrollment-Token`：Node 用解码后的 32 字节 Bridge secret，对完整规范化服务地址（含 `/im` 基路径）和 runtime ID 做带域分隔的 HMAC-SHA256；原始 Bridge secret 不上网，服务端只保存派生凭据的 SHA-256。每个 provider 使用自己的 `node_type`，服务端允许值扩展为 `openclaw`、`opencode`、`codex`、`hermes`，并保留已有 `kimi` 兼容。
 
 注册结果必须同时校验业务码、`node_id` 前缀、`node_type`、非空 token 和 capability 集合。注册成功后，token 只写入本地受保护的凭据文件并以引用形式进入 binding 状态；`config.json` 和 `state.json` 都不包含 token 或 Bridge bearer。新凭据必须先持久化，再原子切换 binding 引用，最后删除旧凭据。重新启动优先复用未过期身份；token 失效时只刷新对应 binding，不影响其他运行时。
 
-注销单个运行时会停止其融云连接并删除本地 token；远端身份删除不是 v1 的隐式行为，避免误删仍被其他客户端引用的账号。
+注销单个运行时会停止其消息服务连接并删除本地 token；远端身份删除不是 v1 的隐式行为，避免误删仍被其他客户端引用的账号。
 
 ## 5. 消息、会话与任务流
 
 ### 5.1 入站
 
-每个融云连接把消息交给共享路由器，路由键为 `(nodeId, conversationType, targetId, senderId)`。共享路由器先校验结构和大小，再做 message UID 去重，然后处理：
+每个消息服务连接把消息交给共享路由器，路由键为 `(nodeId, conversationType, targetId, senderId)`。共享路由器先校验结构和大小，再做 message UID 去重，然后处理：
 
 - 文本/文件上下文消息：映射为智能体 prompt。
 - 会话控制：新建、切换、列出、清理会话。
@@ -197,7 +197,7 @@ type RuntimeBinding = {
 
 Node 桥拥有 `sessions.json`，向 Go Bridge API 提交 runtime ID、conversation key、可选 `resume_session_id`、prompt 和经 Node 授权并规范化的工作目录；媒体或其他允许的上下文由 Node 在入站边界验证后转换为受限 prompt 内容，不另扩展 Go 的文件授权面。Go 守护进程选择对应 adapter：存在有效 session ID 时恢复，否则新建，并在事件中返回实际 session ID 供 Node 原子持久化；恢复被 provider 明确拒绝或被 Multica 现有窄兼容规则判定为不可恢复时最多自动新建一次，其他错误不盲目重试。只要选择了 fresh retry，权威终态携带 `status: "resume_invalidated"`；Node 必须以任务最初提交的 session ID 做 compare-and-swap 清理，再应用终态中新的非空 session ID，避免旧任务清除更新后的映射。
 
-标准事件模型为：`started`、`text_delta`、`tool_started`、`tool_finished`、`status`、`completed`、`failed`、`cancelled`。OpenClaw 当前只保证最终文本，其余 provider 按 adapter 实际能力提供增量事件。Node 桥按现有 ClawMessenger 消息格式聚合和限流后发回融云。连接短暂中断时，当前任务继续执行并把有限事件写入环形缓冲；重连后发送最终状态，不无限持久化 token 流。
+标准事件模型为：`started`、`text_delta`、`tool_started`、`tool_finished`、`status`、`completed`、`failed`、`cancelled`。OpenClaw 当前只保证最终文本，其余 provider 按 adapter 实际能力提供增量事件。Node 桥按现有 ClawMessenger 消息格式聚合和限流后发回消息服务。连接短暂中断时，当前任务继续执行并把有限事件写入环形缓冲；重连后发送最终状态，不无限持久化 token 流。
 
 ### 5.3 权限与控制
 
@@ -218,9 +218,9 @@ Node 桥拥有 `sessions.json`，向 Go Bridge API 提交 runtime ID、conversat
   run/daemon.pid
 ```
 
-Windows 使用用户 ACL，Unix 文件权限为 `0600`、目录为 `0700`。JSON 采用临时文件 + fsync + 原子替换；进程崩溃不会留下半份凭据。每个 RongCloud worker 使用 `~/.quukk-clawmessenger/rongcloud/<runtimeId>/` 作为独立 SDK 存储空间。日志结构化记录 binding、provider、conversation 和 task ID，但永不记录融云 token、完整 prompt、授权票据或环境变量。`doctor --json` 默认脱敏。
+Windows 使用用户 ACL，Unix 文件权限为 `0600`、目录为 `0700`。JSON 采用临时文件 + fsync + 原子替换；进程崩溃不会留下半份凭据。每个 RongCloud worker 使用 `~/.quukk-clawmessenger/rongcloud/<runtimeId>/` 作为独立 SDK 存储空间。日志结构化记录 binding、provider、conversation 和 task ID，但永不记录消息服务 token、完整 prompt、授权票据或环境变量。`doctor --json` 默认脱敏。
 
-`config.json` 只保存非敏感设置；`state.json` 保存稳定安装 ID 与不含 token 的 runtime bindings；`credentials.json` 保存每安装 32 字节随机 Bridge secret 和按 opaque `tokenRef` 索引的融云 AppKey/token。`authorizedWorkRoots` 默认为空，用户在本地 UI/CLI 明确授权真实目录前，远程任务工作目录一律拒绝。
+`config.json` 只保存非敏感设置；`state.json` 保存稳定安装 ID 与不含 token 的 runtime bindings；`credentials.json` 保存每安装 32 字节随机 Bridge secret 和按 opaque `tokenRef` 索引的消息服务 AppKey/token。`authorizedWorkRoots` 默认为空，用户在本地 UI/CLI 明确授权真实目录前，远程任务工作目录一律拒绝。
 
 配置优先级固定为：CLI 参数 > `QUUKK_CLAWMESSENGER_*` 环境变量 > 配置文件 > 内置默认值。默认 ClawMessenger 服务地址为 `https://newsradar.dreamdt.cn/im`，允许在设置页和 CLI 显式覆盖。启动时检测旧的单 provider 配置，只展示可导入项并要求用户确认；导入成功前不移动或删除旧文件。
 
@@ -238,7 +238,7 @@ Node supervisor 只管理自己启动的 Go 守护进程和 RongCloud worker 子
 - 服务端不可用时 UI 仍可展示检测结果和诊断；已缓存身份可按 SDK 能力重连，但不会伪报在线。
 - 错误分为 `detection`、`authentication`、`registration`、`transport`、`runtime`、`policy`，用户文案提供下一步动作，详细堆栈只进入本地脱敏日志。
 - 新节点零交互注册是持有证明而非用户/设备认证：生产服务端必须将派生 enrollment proof 绑定到单一节点、拒绝冲突复用，并以共享边缘限流约束任意新节点铸造；compat 模式只用于显式迁移窗口，npm 发布时必须关闭。
-- 服务端任何公共节点投影、错误响应和日志都不得包含主/OM 融云 token、模型/OpenClaw secret 或原始 SDK 响应；匿名 token 路由必须退役，OM、SaaS、配置和下载接口必须执行 node/owner 鉴权。
+- 服务端任何公共节点投影、错误响应和日志都不得包含主/OM 消息服务 token、模型/OpenClaw secret 或原始 SDK 响应；匿名 token 路由必须退役，OM、SaaS、配置和下载接口必须执行 node/owner 鉴权。
 
 ## 8. 许可证与 fork 治理
 
@@ -263,7 +263,7 @@ Node supervisor 只管理自己启动的 Go 守护进程和 RongCloud worker 子
 - 四类 provider 的候选路径、版本输出、认证状态、超时、超大输出与优先级。
 - `RuntimeBinding` 状态机、幂等注册、token 刷新、部分失败和注销。
 - 消息解析、UID 去重、路由隔离、会话键隔离、命令白名单。
-- Go 标准事件到融云消息的聚合、限流、错误与取消映射。
+- Go 标准事件到消息服务消息的聚合、限流、错误与取消映射。
 - 配置权限、原子写入、敏感字段脱敏、PID 防复用校验。
 - postinstall 在 CI、非全局、禁用自动打开和交互式全局安装下的分支行为。
 
@@ -277,7 +277,7 @@ Node supervisor 只管理自己启动的 Go 守护进程和 RongCloud worker 子
 
 ### 9.3 发布验证矩阵
 
-CI 构建 Windows x64/arm64、macOS x64/arm64、Linux glibc x64/arm64；每个平台至少执行：安装 tarball、`setup --no-open`、`doctor --json`、fake runtime 扫描、启动/停止烟测。真实融云和真实智能体端到端测试使用显式 opt-in 的受控环境，不进入默认测试。
+CI 构建 Windows x64/arm64、macOS x64/arm64、Linux glibc x64/arm64；每个平台至少执行：安装 tarball、`setup --no-open`、`doctor --json`、fake runtime 扫描、启动/停止烟测。真实消息服务和真实智能体端到端测试使用显式 opt-in 的受控环境，不进入默认测试。
 
 ## 10. 发布门槛
 
@@ -299,7 +299,7 @@ CI 构建 Windows x64/arm64、macOS x64/arm64、Linux glibc x64/arm64；每个�
 
 - 新用户在支持的平台只安装入口包即可看到本地智能体列表。
 - 本机同时存在 OpenCode 和 OpenClaw 时，页面准确展示两者；可只接入其中一个，也可全部接入。
-- 四个 provider 中每个所选运行时都拥有可验证、互不串号的融云身份。
+- 四个 provider 中每个所选运行时都拥有可验证、互不串号的消息服务身份。
 - 从 ClawMessenger 发给某一智能体的消息只进入该智能体的会话；回复、取消和状态回传保持兼容，权限消息按 v1 明示的 headless 策略处理。
 - 任一智能体离线、认证失败或崩溃不影响其他智能体继续工作。
 - 重启后身份、选择和会话可恢复，敏感数据不出现在日志和诊断导出中。

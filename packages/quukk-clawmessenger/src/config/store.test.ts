@@ -1061,3 +1061,52 @@ describe('local schemas, paths, atomic JSON, and store', () => {
     expect(publicText).not.toContain(store.bridgeIdentity().secret);
   });
 });
+
+describe('device credential persistence', () => {
+  const deviceCredential = {
+    credentialId: `dc_${'1'.repeat(32)}`,
+    secret: 'S'.repeat(48),
+    bindingVersion: 1,
+  };
+
+  it('round-trips a device credential without persisting a legacy token', async () => {
+    const home = await temporaryHome();
+    const store = await LocalStore.open({ homeDirectory: home });
+    const pending = binding('codex', { registrationState: 'registering' });
+    await store.saveBinding(pending);
+
+    const committed = await store.commitRegistration(
+      { ...pending, enabled: true, nodeId: 'codex_123', registrationState: 'offline' },
+      {
+        serverUrl: 'https://example.test/im',
+        appKey: 'app-key',
+        deviceCredential,
+        createdAt: TIME_0,
+      },
+    );
+
+    const reopened = await LocalStore.open({ homeDirectory: home });
+    const stored = reopened.credential(committed.tokenRef!);
+    expect(stored?.token).toBeUndefined();
+    expect(stored?.deviceCredential).toEqual(deviceCredential);
+    expect(JSON.stringify(stored)).not.toContain('rongcloud-token');
+  });
+
+  it('rejects a credential that carries both or neither mode', () => {
+    const base = { schemaVersion: 1 as const, bridgeSecret: BRIDGE_SECRET, tokens: {} };
+    const ref = tokenRef('a');
+
+    const both = CredentialFileSchema.safeParse({
+      ...base,
+      tokens: { [ref]: { ...credential('codex'), deviceCredential } },
+    });
+    expect(both.success).toBe(false);
+
+    const { token: _legacyToken, ...withoutToken } = credential('codex');
+    const neither = CredentialFileSchema.safeParse({
+      ...base,
+      tokens: { [ref]: withoutToken },
+    });
+    expect(neither.success).toBe(false);
+  });
+});

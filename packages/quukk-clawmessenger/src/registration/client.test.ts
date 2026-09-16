@@ -251,9 +251,45 @@ describe('RegistrationClient', () => {
       name: 'fixture-host · Codex',
       mac_address: '32:01:59:EB:E3:21',
       capabilities: [...CAPABILITIES],
+      runtime_id: RUNTIME_A,
+      binding_version: 1,
     });
     expect(JSON.stringify(body(transport.calls[0]!))).not.toContain(authorization.ticket);
     expect(JSON.stringify(body(transport.calls[0]!))).not.toContain(authorization.deviceSecret);
+  });
+
+  it('returns the one-time device credential ticket from a pairing registration response', async () => {
+    const transport = fakeFetch(jsonResponse(successEnvelope('codex', 'codex_123', {
+      device_credential_ticket: 'T'.repeat(43),
+      binding_version: 2,
+    })));
+    const client = new RegistrationClient({ fetch: transport.fetch, networkInterfaces: () => ({}) });
+
+    const result = await client.register(registrationInput({
+      authorization: pairingAuthorization(),
+      bindingVersion: 2,
+    }));
+
+    expect(result.deviceCredentialTicket).toBe('T'.repeat(43));
+    expect(result.bindingVersion).toBe(2);
+    expect(body(transport.calls[0]!)).toMatchObject({
+      runtime_id: RUNTIME_A,
+      binding_version: 2,
+    });
+  });
+
+  it.each([
+    ['too short', 'short'],
+    ['untrimmed', ` ${'T'.repeat(42)}`],
+    ['too long', 'T'.repeat(513)],
+  ] as const)('rejects an unsafe device credential ticket: %s', async (_name, ticket) => {
+    const transport = fakeFetch(jsonResponse(successEnvelope('codex', 'codex_123', {
+      device_credential_ticket: ticket,
+    })));
+    await expect(
+      new RegistrationClient({ fetch: transport.fetch, networkInterfaces: () => ({}) })
+        .register(registrationInput({ authorization: pairingAuthorization() })),
+    ).rejects.toMatchObject({ code: 'registration_response_invalid', retryable: false });
   });
 
   it('rejects malformed pairing registration context before transport', async () => {
@@ -756,6 +792,208 @@ describe('RegistrationClient', () => {
       category: 'validation',
       retryable: false,
     });
+    expect(transport.calls).toHaveLength(0);
+  });
+
+  it('enrolls a device credential on the exact route without sending the bridge secret', async () => {
+    const credentialId = `dc_${'1'.repeat(32)}`;
+    const transport = fakeFetch(jsonResponse({
+      code: 200,
+      data: {
+        credential_id: credentialId,
+        node_id: 'codex_123',
+        provider: 'codex',
+        runtime_id: RUNTIME_A,
+        binding_version: 1,
+        status: 'active',
+      },
+    }));
+    const client = new RegistrationClient({ fetch: transport.fetch });
+
+    const result = await client.enrollDeviceCredential({
+      serverUrl: 'https://example.test/im/',
+      ticket: 'T'.repeat(43),
+      credentialId,
+      secret: 'S'.repeat(48),
+      nodeId: 'codex_123',
+      provider: 'codex',
+      runtimeId: RUNTIME_A,
+      bindingVersion: 1,
+    });
+
+    expect(transport.calls[0]?.url).toBe(
+      'https://example.test/im/api/claw/device-credentials/enroll',
+    );
+    expect(body(transport.calls[0]!)).toEqual({
+      ticket: 'T'.repeat(43),
+      credential_id: credentialId,
+      secret: 'S'.repeat(48),
+      node_id: 'codex_123',
+      provider: 'codex',
+      runtime_id: RUNTIME_A,
+      binding_version: 1,
+    });
+    expect(result).toEqual({
+      credentialId,
+      nodeId: 'codex_123',
+      provider: 'codex',
+      runtimeId: RUNTIME_A,
+      bindingVersion: 1,
+      status: 'active',
+    });
+    expect(JSON.stringify(transport.calls)).not.toContain(BRIDGE_SECRET);
+  });
+
+  it('rejects a device enrollment node mismatch with a stable code', async () => {
+    const transport = fakeFetch(jsonResponse({
+      code: 200,
+      data: {
+        credential_id: `dc_${'1'.repeat(32)}`,
+        node_id: 'codex_other',
+        provider: 'codex',
+        runtime_id: RUNTIME_A,
+        binding_version: 1,
+        status: 'active',
+      },
+    }));
+    await expect(
+      new RegistrationClient({ fetch: transport.fetch }).enrollDeviceCredential({
+        serverUrl: 'https://example.test/im',
+        ticket: 'T'.repeat(43),
+        credentialId: `dc_${'1'.repeat(32)}`,
+        secret: 'S'.repeat(48),
+        nodeId: 'codex_123',
+        provider: 'codex',
+        runtimeId: RUNTIME_A,
+        bindingVersion: 1,
+      }),
+    ).rejects.toMatchObject({ code: 'registration_node_mismatch', retryable: false });
+  });
+
+  it('opens a connection session with the exact body and returns the token', async () => {
+    const credentialId = `dc_${'2'.repeat(32)}`;
+    const transport = fakeFetch(jsonResponse({
+      code: 200,
+      data: {
+        session_id: 'cs_abc',
+        node_id: 'codex_123',
+        app_key: 'app-key',
+        token: 'connection-token',
+        binding_version: 1,
+        policy_version: 1,
+      },
+    }));
+    const client = new RegistrationClient({ fetch: transport.fetch });
+
+    const result = await client.openConnectionSession({
+      serverUrl: 'https://example.test/im',
+      credentialId,
+      secret: 'S'.repeat(48),
+      attemptId: 'attempt-0001',
+      runtimeId: RUNTIME_A,
+      bindingVersion: 1,
+    });
+
+    expect(transport.calls[0]?.url).toBe(
+      'https://example.test/im/api/claw/connection-sessions',
+    );
+    expect(body(transport.calls[0]!)).toEqual({
+      credential_id: credentialId,
+      secret: 'S'.repeat(48),
+      attempt_id: 'attempt-0001',
+      runtime_id: RUNTIME_A,
+      binding_version: 1,
+    });
+    expect(result).toEqual({
+      sessionId: 'cs_abc',
+      nodeId: 'codex_123',
+      appKey: 'app-key',
+      token: 'connection-token',
+      bindingVersion: 1,
+      policyVersion: 1,
+    });
+  });
+
+  it('maps a revoked credential to an authentication failure without retrying', async () => {
+    const transport = fakeFetch(new Response('', { status: 401 }));
+    await expect(
+      new RegistrationClient({ fetch: transport.fetch }).openConnectionSession({
+        serverUrl: 'https://example.test/im',
+        credentialId: `dc_${'2'.repeat(32)}`,
+        secret: 'S'.repeat(48),
+        attemptId: 'attempt-0001',
+        runtimeId: RUNTIME_A,
+        bindingVersion: 1,
+      }),
+    ).rejects.toMatchObject({ code: 'registration_unauthorized', retryable: false });
+    expect(transport.calls).toHaveLength(1);
+  });
+
+  it.each([
+    ['empty token', { session_id: 'cs', node_id: 'codex_123', app_key: 'k', token: '', binding_version: 1, policy_version: 1 }],
+    ['untrimmed token', { session_id: 'cs', node_id: 'codex_123', app_key: 'k', token: ' t ', binding_version: 1, policy_version: 1 }],
+    ['missing token', { session_id: 'cs', node_id: 'codex_123', app_key: 'k', binding_version: 1, policy_version: 1 }],
+  ] as const)('rejects a malformed connection session response: %s', async (_name, data) => {
+    const transport = fakeFetch(jsonResponse({ code: 200, data }));
+    await expect(
+      new RegistrationClient({ fetch: transport.fetch }).openConnectionSession({
+        serverUrl: 'https://example.test/im',
+        credentialId: `dc_${'2'.repeat(32)}`,
+        secret: 'S'.repeat(48),
+        attemptId: 'attempt-0001',
+        runtimeId: RUNTIME_A,
+        bindingVersion: 1,
+      }),
+    ).rejects.toMatchObject({ code: 'registration_response_invalid', retryable: false });
+  });
+
+  it('maps a permanent connection session failure to a stable code', async () => {
+    const transport = fakeFetch(jsonResponse({ code: 409, data: {} }));
+    await expect(
+      new RegistrationClient({ fetch: transport.fetch }).openConnectionSession({
+        serverUrl: 'https://example.test/im',
+        credentialId: `dc_${'2'.repeat(32)}`,
+        secret: 'S'.repeat(48),
+        attemptId: 'attempt-0001',
+        runtimeId: RUNTIME_A,
+        bindingVersion: 1,
+      }),
+    ).rejects.toMatchObject({ code: 'connection_session_failed', retryable: false });
+  });
+
+  it('closes a connection session on the encoded route', async () => {
+    const transport = fakeFetch(jsonResponse({
+      code: 200,
+      data: { session_id: 'cs_a-b', status: 'closed', revoked: true },
+    }));
+    const client = new RegistrationClient({ fetch: transport.fetch });
+
+    const result = await client.closeConnectionSession('cs_a-b', {
+      serverUrl: 'https://example.test/im',
+      credentialId: `dc_${'2'.repeat(32)}`,
+      secret: 'S'.repeat(48),
+    });
+
+    expect(transport.calls[0]?.url).toBe(
+      'https://example.test/im/api/claw/connection-sessions/cs_a-b/close',
+    );
+    expect(result).toEqual({ sessionId: 'cs_a-b', status: 'closed', revoked: true });
+  });
+
+  it('rejects invalid enrollment input before any request', async () => {
+    const transport = fakeFetch(jsonResponse({ code: 200, data: {} }));
+    const client = new RegistrationClient({ fetch: transport.fetch });
+
+    await expect(client.enrollDeviceCredential({
+      serverUrl: 'https://example.test/im',
+      ticket: 'short',
+      credentialId: 'bad',
+      secret: 'S'.repeat(48),
+      nodeId: 'codex_123',
+      provider: 'codex',
+      runtimeId: RUNTIME_A,
+      bindingVersion: 1,
+    })).rejects.toMatchObject({ code: 'registration_rejected', category: 'validation' });
     expect(transport.calls).toHaveLength(0);
   });
 });

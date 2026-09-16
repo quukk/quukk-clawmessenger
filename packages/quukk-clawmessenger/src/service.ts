@@ -1,4 +1,4 @@
-import { createHmac } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { chmod, lstat, mkdir, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -282,7 +282,10 @@ type ProductionBridgePort = Omit<ServiceBridgePort, 'ensureStarted'> & {
   }>;
 };
 type ProductionWorkerPort = ServiceWorkerPort & RouterWorkerPort;
-type RegistrationPort = Pick<RegistrationClient, 'getAppKey' | 'register' | 'refreshToken'>;
+type RegistrationPort = Pick<
+  RegistrationClient,
+  'getAppKey' | 'register' | 'refreshToken' | 'openConnectionSession' | 'enrollDeviceCredential'
+>;
 export type ProductionBindingFactoryOptions = Omit<BindingServiceDependencies, 'store'> & {
   store: ServiceStorePort;
 };
@@ -1391,6 +1394,11 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
           approvalEvents: false,
         },
         binding: binding === undefined ? null : safeBinding(binding),
+        credentialMode: binding === undefined || binding.tokenRef === undefined
+          ? null
+          : (this.#store.credential(binding.tokenRef)?.deviceCredential !== undefined
+            ? 'device'
+            : 'legacy'),
         worker: worker === undefined
           ? null
           : { state: worker.state, restartCount: worker.restartCount },
@@ -1674,6 +1682,33 @@ function exactCredential(
   return credential;
 }
 
+/**
+ * Resolve the connection credential for one worker connection.
+ *
+ * A migrated node opens a fresh connection session (the token lives only in
+ * memory). An unmigrated node falls back to its persisted legacy token.
+ */
+async function connectionCredential(
+  registrationClient: RegistrationPort,
+  credential: RongCloudCredential,
+  runtimeId: string,
+): Promise<{ appKey: string; token: string }> {
+  const device = credential.deviceCredential;
+  if (device === undefined) {
+    if (credential.token === undefined) throw new ServiceError('operation_unavailable');
+    return { appKey: credential.appKey, token: credential.token };
+  }
+  const session = await registrationClient.openConnectionSession({
+    serverUrl: credential.serverUrl,
+    credentialId: device.credentialId,
+    secret: device.secret,
+    attemptId: `attempt-${randomUUID()}`,
+    runtimeId,
+    bindingVersion: device.bindingVersion,
+  });
+  return { appKey: session.appKey, token: session.token };
+}
+
 function adaptWorkerSupervisor(supervisor: RongCloudWorkerSupervisor): ProductionWorkerPort {
   return {
     reconcile: (bindings) => supervisor.reconcile(bindings),
@@ -1912,9 +1947,23 @@ async function composeProductionServiceWithin(
       processEnv: processEnvironment,
       resolveCredential: async (binding): Promise<SupervisorCredential> => {
         const credential = exactCredential(store, bindings, binding);
-        return { appKey: credential.appKey, token: credential.token };
+        return connectionCredential(registrationClient, credential, binding.runtimeId);
       },
       refreshCredential: (binding): Promise<string> => enqueueServiceMutation(mutationGate, async () => {
+        let currentCredential: RongCloudCredential | undefined;
+        try {
+          currentCredential = exactCredential(store, bindings, binding);
+        } catch {
+          currentCredential = undefined;
+        }
+        if (currentCredential?.deviceCredential !== undefined) {
+          const session = await connectionCredential(
+            registrationClient,
+            currentCredential,
+            binding.runtimeId,
+          );
+          return session.token;
+        }
         const refreshed = await bindings.reregister(binding.runtimeId);
         if (refreshed.runtimeId !== binding.runtimeId
           || !refreshed.ok
@@ -1933,10 +1982,12 @@ async function composeProductionServiceWithin(
         const supervisor = workers;
         if (supervisor === undefined) throw new ServiceError('operation_unavailable');
         await supervisor.reconcile(supervisorBindings(paths.rongcloudDir, fresh));
-        return exactCredential(store, bindings, {
+        const resolved = exactCredential(store, bindings, {
           ...binding,
           tokenRef: current.tokenRef,
-        }).token;
+        });
+        if (resolved.token === undefined) throw new ServiceError('operation_unavailable');
+        return resolved.token;
       }),
       onEvent: (workerIdentity: WorkerIdentity, event: WorkerEvent) => {
         const target = routerReference;

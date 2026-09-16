@@ -60,6 +60,9 @@ export const RuntimeViewSchema = z.strictObject({
     approvalEvents: z.literal(false),
   }),
   binding: SafeBindingSchema.nullable(),
+  // 'device' marks a migrated node that fetches a connection token per
+  // connection; 'legacy' marks an unmigrated node still using its stored token.
+  credentialMode: z.enum(['device', 'legacy']).nullable(),
   worker: z.strictObject({
     state: WorkerStateSchema,
     restartCount: z.number().int().nonnegative().safe(),

@@ -58,6 +58,7 @@ const runtimes: RuntimesResponse = {
       registrationState: 'online' as const,
       updatedAt: TIME,
     } : null,
+    credentialMode: index === 0 ? 'legacy' : null,
     worker: index === 0 ? { state: 'online' as const, restartCount: 0 } : null,
   })),
 };
