@@ -27,6 +27,7 @@ import {
 } from './config/schema.js';
 import { readJsonFile } from './config/atomic-json.js';
 import { localPaths } from './config/paths.js';
+import { installAutostart } from './process/autostart.js';
 import {
   DaemonIdentityStore,
   ReadyDaemonIdentitySchema,
@@ -858,6 +859,12 @@ async function startCommand(parsed: ParsedCli, options: RunCliOptions): Promise<
   const result = checkedStartResult(await options.runtime.start(input));
   if (result.alreadyRunning && hasOverrides(parsed.configOverrides)) {
     throw new CliFailure('already_running_with_overrides');
+  }
+  // Register a per-user autostart entry so the bridge comes back after reboot.
+  // Best-effort: a failure must not prevent the already-running service from starting.
+  const scriptPath = process.argv[1];
+  if (scriptPath !== undefined && isAbsolute(scriptPath)) {
+    await installAutostart({ execPath: process.execPath, scriptPath }).catch(() => undefined);
   }
   if (!parsed.noOpen) {
     await openBrowser(parsed.command as 'setup' | 'start', result.identity, options);
