@@ -238,11 +238,16 @@ const ENTRY_MODULES = [
   'pairing/ipv4-fetch',
   'pairing/schema',
   'pairing/service',
+  'process/autostart',
   'process/identity',
   'process/service-identity',
   'process/supervisor',
+  'protocol/chat-stream',
+  'protocol/discussion-prompt',
   'protocol/discussion-v1',
   'protocol/discussion-v2',
+  'protocol/discussion-v3',
+  'protocol/discussion-v3-prompt',
   'protocol/discussion-wire',
   'protocol/messages',
   'registration/capabilities',
@@ -254,6 +259,7 @@ const ENTRY_MODULES = [
   'rongcloud/worker-supervisor',
   'router/conversation',
   'router/dedup',
+  'router/discussion-v3-router',
   'router/message-router',
   'router/session-store',
   'service',
@@ -467,7 +473,7 @@ describe('audit-tarball', () => {
   it('accepts an exact entry listing with legal files, bin, UI assets, worker, and npm manifest', async () => {
     const fixture = await entryFixture();
 
-    expect(ENTRY_FILES).toHaveLength(108);
+    expect(ENTRY_FILES).toHaveLength(120);
     await expect(auditTarball({
       packJsonPath: fixture.report,
       packageDirectory: fixture.entry,
