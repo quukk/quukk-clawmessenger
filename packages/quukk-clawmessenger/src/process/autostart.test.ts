@@ -44,7 +44,7 @@ function options(home: string, platform: NodeJS.Platform = 'win32') {
 describe('autostart', () => {
   it('resolves the per-user entry path per platform', () => {
     const home = 'C:\\Users\\alice';
-    expect(autostartEntryPath(options(home, 'win32'))).toContain(join('Startup', `${AUTOSTART_ID}.cmd`));
+    expect(autostartEntryPath(options(home, 'win32'))).toContain(win32.join('Startup', `${AUTOSTART_ID}.cmd`));
     expect(autostartEntryPath(options('/home/alice', 'darwin'))).toBe(
       '/home/alice/Library/LaunchAgents/com.quukk-clawmessenger-bridge.plist',
     );
