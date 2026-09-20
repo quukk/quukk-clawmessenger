@@ -22,6 +22,7 @@ export type RuntimeCapabilities = {
   textEvents: boolean;
   toolEvents: boolean;
   approvalEvents: boolean;
+  interactiveRounds: boolean;
 };
 
 export type RuntimeBindingSummary = {
@@ -44,6 +45,8 @@ export type BridgeRuntime = {
   path?: string;
   status: RuntimeStatus;
   capabilities: RuntimeCapabilities;
+  interactiveUnavailableReason?: string;
+  credentialMode?: 'device' | 'legacy';
   binding?: RuntimeBindingSummary;
   worker?: RuntimeWorkerSummary;
 };
@@ -134,6 +137,8 @@ export type DiagnosticsSnapshot = {
     status: RuntimeStatus;
     version?: string;
     executableName?: string;
+    interactiveRounds: boolean;
+    interactiveUnavailableReason?: string;
   }>;
   workers: Array<{
     runtimeId: string;

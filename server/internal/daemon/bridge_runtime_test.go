@@ -481,3 +481,16 @@ func TestBridgeRuntimeStatusJSONValues(t *testing.T) {
 		t.Fatalf("status values = %q, want %q", got, want)
 	}
 }
+
+// The interactive proof runs inside the runtime probe budget, and version
+// detection has already spent part of it by then. An outer bound at or below
+// the inner one can never complete the ACP handshake that OpenCode needs, which
+// is how hosts silently lost discussion_interactive_rounds.
+func TestBridgeInteractiveProbeBudgetFitsInsideRuntimeProbe(t *testing.T) {
+	if defaultBridgeProbeTimeout <= agent.InteractiveProbeTimeout {
+		t.Fatalf(
+			"runtime probe budget %s must exceed the interactive probe budget %s",
+			defaultBridgeProbeTimeout, agent.InteractiveProbeTimeout,
+		)
+	}
+}

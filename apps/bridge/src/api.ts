@@ -22,6 +22,7 @@ const capabilitiesSchema = z
     textEvents: z.boolean(),
     toolEvents: z.boolean(),
     approvalEvents: z.literal(false),
+    interactiveRounds: z.boolean(),
   })
   .strict();
 
@@ -64,7 +65,9 @@ const runtimeSchema = z
       'probe_failed',
     ]),
     capabilities: capabilitiesSchema,
+    interactiveUnavailableReason: z.string().min(1).max(512).optional(),
     binding: safeBindingSchema.nullable(),
+    credentialMode: z.enum(['device', 'legacy']).nullable(),
     worker: workerSchema.nullable(),
   })
   .strict()
@@ -84,6 +87,10 @@ const runtimeSchema = z
       ...(value.path === null ? {} : { path: value.path }),
       status: value.status,
       capabilities: value.capabilities,
+      ...(value.interactiveUnavailableReason === undefined
+        ? {}
+        : { interactiveUnavailableReason: value.interactiveUnavailableReason }),
+      ...(value.credentialMode === null ? {} : { credentialMode: value.credentialMode }),
       ...(value.binding === null
         ? {}
         : {
@@ -278,6 +285,8 @@ const diagnosticsSchema = z
             ]),
             version: z.string().max(256).optional(),
             executableName: z.string().max(256).optional(),
+            interactiveRounds: z.boolean(),
+            interactiveUnavailableReason: z.string().min(1).max(512).optional(),
           })
           .strict(),
       )

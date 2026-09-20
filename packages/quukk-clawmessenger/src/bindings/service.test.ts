@@ -190,7 +190,7 @@ async function seedBinding(
       registrationState: 'offline',
     },
     {
-      serverUrl: options.serverUrl ?? 'https://newsradar.dreamdt.cn/im',
+      serverUrl: options.serverUrl ?? DEFAULT_CONFIG.serverUrl,
       appKey: 'old-app-key',
       token: 'old-rongcloud-token',
       createdAt: TIME_0,
@@ -485,7 +485,7 @@ describe('BindingService', () => {
     });
     const reopenedSame = await harness([selected], { home: sameServer.home });
     await reopenedSame.service.enableSelected([selected.id]);
-    expect(reopenedSame.registration.appKeyCalls).toEqual(['https://newsradar.dreamdt.cn/im']);
+    expect(reopenedSame.registration.appKeyCalls).toEqual([DEFAULT_CONFIG.serverUrl]);
     expect(reopenedSame.registration.registerCalls[0]).not.toHaveProperty('existingNodeId');
     expect(reopenedSame.registration.registerCalls[0]).not.toHaveProperty('existingNodeToken');
 

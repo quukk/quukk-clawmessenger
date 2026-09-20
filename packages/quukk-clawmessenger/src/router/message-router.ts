@@ -3459,9 +3459,17 @@ export class MessageRouter {
         return;
       }
       await this.#consume(active);
-    } catch {
+    } catch (error) {
       if (!started) {
         await this.#state.releaseMessage(claim.key, claimId).catch(() => undefined);
+        this.#logger.warn({
+          event: 'task_start_failed',
+          runtimeId: identity.runtimeId,
+          nodeId: identity.nodeId,
+          conversationType: candidate.conversation.conversationType,
+          conversationKeyHash: hashConversation(conversationKey(candidate.conversation)),
+          errorCode: workerErrorCode(error) ?? 'unknown',
+        });
         if (this.#bindingGenerationCurrent(identity, generation)) {
           await this.#safeSendText(identity, candidate.conversation, '[task_start_failed]');
         }

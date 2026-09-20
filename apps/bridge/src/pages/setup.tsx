@@ -8,7 +8,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@multica/ui/components/ui/dialog';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { BridgeApiError } from '../api';
 import { PairingPanel } from '../components/pairing-panel';
@@ -36,6 +36,9 @@ function discoveryView(runtime: BridgeRuntime): BridgeRuntime {
     provider: runtime.provider,
     status: runtime.status,
     capabilities: runtime.capabilities,
+    ...(runtime.interactiveUnavailableReason === undefined
+      ? {}
+      : { interactiveUnavailableReason: runtime.interactiveUnavailableReason }),
     ...(runtime.version === undefined ? {} : { version: runtime.version }),
     ...(runtime.binding === undefined ? {} : { binding: runtime.binding }),
     ...(runtime.worker === undefined ? {} : { worker: runtime.worker }),
@@ -46,6 +49,7 @@ export function SetupPage({
   api,
   runtimes,
   settings,
+  onRuntimesChange,
   onSettingsChange,
 }: SetupPageProps) {
   const { t } = useI18n();
@@ -56,7 +60,11 @@ export function SetupPage({
   const [savingPolicy, setSavingPolicy] = useState(false);
   const [pairing, setPairing] = useState<PairingSnapshot | null>(null);
   const [startFailure, setStartFailure] = useState<TranslationKey | null>(null);
+  const hasReadyRuntime = runtimes.some((runtime) => runtime.status === 'ready');
+  const [scanBusy, setScanBusy] = useState(() => !runtimes.some((runtime) => runtime.status === 'ready'));
+  const [scanFailed, setScanFailed] = useState(false);
   const pairingStartController = useRef<AbortController | undefined>(undefined);
+  const automaticScan = useRef(false);
   const requestFence = useRequestFence();
   const policyComplete =
     authorizedRoot.trim().length > 0 &&
@@ -69,6 +77,28 @@ export function SetupPage({
     },
     [],
   );
+
+  const rescanRuntimes = useCallback(async (): Promise<void> => {
+    const generation = requestFence.begin();
+    setScanBusy(true);
+    setScanFailed(false);
+    try {
+      const nextRuntimes = await api.rescanRuntimes();
+      if (requestFence.isCurrent(generation)) onRuntimesChange(nextRuntimes);
+    } catch {
+      if (requestFence.isCurrent(generation)) setScanFailed(true);
+    } finally {
+      if (requestFence.isCurrent(generation)) setScanBusy(false);
+    }
+  }, [api, onRuntimesChange, requestFence]);
+
+  // The catalog is read once per page load, so a stale or not-yet-populated
+  // startup scan would otherwise leave Setup with no detected platform at all.
+  useEffect(() => {
+    if (hasReadyRuntime || automaticScan.current) return;
+    automaticScan.current = true;
+    void rescanRuntimes();
+  }, [hasReadyRuntime, rescanRuntimes]);
 
   async function generatePairing() {
     if (!policyComplete || savingPolicy || pairing !== null) return;
@@ -127,11 +157,31 @@ export function SetupPage({
         </p>
       </header>
 
+      {!hasReadyRuntime ? (
+        <p role="status" aria-live="polite" className="text-body text-muted-foreground">
+          {scanBusy ? t('setup.scanning') : scanFailed ? t('setup.rescanFailed') : t('setup.noRuntime')}
+        </p>
+      ) : null}
+
       <div className="runtime-grid" aria-label={t('setup.detectedAria')}>
         {runtimes.map((runtime) => (
           <RuntimeCard key={runtime.provider} runtime={discoveryView(runtime)} />
         ))}
       </div>
+
+      {!hasReadyRuntime ? (
+        <div className="flex justify-end">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={scanBusy}
+            onClick={() => { void rescanRuntimes() }}
+          >
+            {scanBusy ? t('setup.rescanning') : t('setup.rescan')}
+          </Button>
+        </div>
+      ) : null}
 
       <div className="grid gap-4 rounded-xl border border-surface-border bg-surface p-4 sm:p-5">
         <div className="grid gap-1">

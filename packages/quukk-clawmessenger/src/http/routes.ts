@@ -58,7 +58,14 @@ export const RuntimeViewSchema = z.strictObject({
     textEvents: z.boolean(),
     toolEvents: z.boolean(),
     approvalEvents: z.literal(false),
+    // Proven interactive discussion support (request-level cancel + session
+    // resume + text events). This is the flag that gates
+    // `discussion_interactive_rounds` at node registration.
+    interactiveRounds: z.boolean(),
   }),
+  // Present only when the bridge probed the runtime and it did not prove
+  // interactive support; explains why `interactiveRounds` is false.
+  interactiveUnavailableReason: z.string().min(1).max(512).optional(),
   binding: SafeBindingSchema.nullable(),
   // 'device' marks a migrated node that fetches a connection token per
   // connection; 'legacy' marks an unmigrated node still using its stored token.
@@ -161,6 +168,8 @@ export const DiagnosticsResponseSchema = z.strictObject({
     status: RuntimeStatusSchema,
     version: z.string().min(1).max(256).optional(),
     executableName: z.string().min(1).max(255).refine((value) => !/[\\/\0]/.test(value)).optional(),
+    interactiveRounds: z.boolean(),
+    interactiveUnavailableReason: z.string().min(1).max(512).optional(),
   })).max(PROVIDERS.length),
   workers: z.array(z.strictObject({
     runtimeId: z.string().regex(RUNTIME_ID_PATTERN),
@@ -195,6 +204,30 @@ export const PairingResponseSchema = z.strictObject({
   results: z.array(PairingResultSchema).max(PAIRING_MAX_CANDIDATES),
 });
 export type PairingResponse = z.infer<typeof PairingResponseSchema>;
+
+export const ControlPairingResponseSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  serverUrl: z.string().min(1).max(2048),
+  pairing: PairingResponseSchema,
+});
+export type ControlPairingResponse = z.infer<typeof ControlPairingResponseSchema>;
+
+// A runtime refresh probes every installed agent CLI. The interactive proof
+// alone is allowed agent.InteractiveProbeTimeout (15s), and version detection
+// spends more on top of it, so neither the browser route nor the control route
+// may cap the operation below this.
+export const RUNTIME_REFRESH_TIMEOUT_MS = 60_000;
+
+// Server-side budgets for the CLI control channel. The CLI's own request budget
+// is derived from these (see CONTROL_REQUEST_TIMEOUT_MS in cli.ts) so a slow but
+// successful operation cannot be aborted by a tighter client cap.
+export const CONTROL_OPERATION_TIMEOUT_MS = Object.freeze({
+  status: 5_000,
+  rescan: RUNTIME_REFRESH_TIMEOUT_MS,
+  pairing_status: 10_000,
+  pairing_start: 45_000,
+} as const);
+export type ControlOperation = keyof typeof CONTROL_OPERATION_TIMEOUT_MS;
 
 export const ReadyDaemonIdentitySchema = z.strictObject({
   schema_version: z.literal(1),
@@ -236,6 +269,8 @@ export interface LocalApiPort {
 export interface LocalControlPort {
   status(signal: AbortSignal): Promise<ControlStatusResponse>;
   rescan(signal: AbortSignal): Promise<RuntimesResponse>;
+  controlPairingStatus(signal: AbortSignal): Promise<ControlPairingResponse>;
+  controlPairingStart(signal: AbortSignal): Promise<ControlPairingResponse>;
   shutdownAfterResponse(): void;
 }
 
@@ -287,6 +322,7 @@ const ERROR_DEFINITIONS = {
   ui_unavailable: { status: 503, category: 'transport', retryable: true },
   operation_unavailable: { status: 503, category: 'transport', retryable: true },
   pairing_api_unavailable: { status: 502, category: 'transport', retryable: false },
+  pairing_no_candidates: { status: 409, category: 'detection', retryable: false },
   pairing_unauthorized: { status: 401, category: 'authentication', retryable: false },
   pairing_rate_limited: { status: 429, category: 'transport', retryable: true },
   pairing_response_invalid: { status: 502, category: 'policy', retryable: false },
@@ -450,6 +486,8 @@ const ControlInputSchema = z.discriminatedUnion('command', [
   z.strictObject({ command: z.literal('status') }),
   z.strictObject({ command: z.literal('launch_ticket') }),
   z.strictObject({ command: z.literal('rescan') }),
+  z.strictObject({ command: z.literal('pairing_status') }),
+  z.strictObject({ command: z.literal('pairing_start') }),
   z.strictObject({ command: z.literal('shutdown') }),
 ]);
 const ExchangeResponseSchema = z.strictObject({
@@ -633,7 +671,7 @@ export class LocalRoutes {
       const value = await this.#operation(request, response, 12_000, (signal) => this.#api.runtimes(signal));
       sendJson(request, response, 200, value, RuntimesResponseSchema);
     } else if (route.kind === 'rescan') {
-      const value = await this.#operation(request, response, 35_000, (signal) => this.#api.rescan(signal));
+      const value = await this.#operation(request, response, RUNTIME_REFRESH_TIMEOUT_MS, (signal) => this.#api.rescan(signal));
       sendJson(request, response, 200, value, RuntimesResponseSchema);
     } else if (route.kind === 'disable') {
       const value = await this.#operation(request, response, 10_000, (signal) => this.#api.disable(route.runtimeId!, signal));
@@ -671,14 +709,20 @@ export class LocalRoutes {
     rejectInternalBrowserHeaders(request);
     const input = parseInput(ControlInputSchema, await readJson(request, SMALL_BODY_LIMIT));
     if (input.command === 'status') {
-      const value = await this.#operation(request, response, 5_000, (signal) => this.#control.status(signal));
+      const value = await this.#operation(request, response, CONTROL_OPERATION_TIMEOUT_MS.status, (signal) => this.#control.status(signal));
       sendJson(request, response, 200, value, ControlStatusResponseSchema);
     } else if (input.command === 'launch_ticket') {
       const issued = this.#tickets.issue();
       sendJson(request, response, 201, { schemaVersion: 1, ...issued }, LaunchTicketResponseSchema);
     } else if (input.command === 'rescan') {
-      const value = await this.#operation(request, response, 35_000, (signal) => this.#control.rescan(signal));
+      const value = await this.#operation(request, response, CONTROL_OPERATION_TIMEOUT_MS.rescan, (signal) => this.#control.rescan(signal));
       sendJson(request, response, 200, value, RuntimesResponseSchema);
+    } else if (input.command === 'pairing_status') {
+      const value = await this.#operation(request, response, CONTROL_OPERATION_TIMEOUT_MS.pairing_status, (signal) => this.#control.controlPairingStatus(signal));
+      sendJson(request, response, 200, value, ControlPairingResponseSchema);
+    } else if (input.command === 'pairing_start') {
+      const value = await this.#operation(request, response, CONTROL_OPERATION_TIMEOUT_MS.pairing_start, (signal) => this.#control.controlPairingStart(signal));
+      sendJson(request, response, 200, value, ControlPairingResponseSchema);
     } else {
       response.once('finish', () => queueMicrotask(() => this.#control.shutdownAfterResponse()));
       sendJson(request, response, 202, { schemaVersion: 1, accepted: true }, ShutdownResponseSchema);

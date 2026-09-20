@@ -38,8 +38,11 @@ import {
   type StartingDaemonIdentity,
 } from './process/service-identity.js';
 import {
+  CONTROL_OPERATION_TIMEOUT_MS,
+  ControlPairingResponseSchema,
   ControlStatusResponseSchema,
   RuntimesResponseSchema,
+  type ControlPairingResponse,
   type ControlStatusResponse,
   type RuntimesResponse,
 } from './http/routes.js';
@@ -51,7 +54,7 @@ import {
 } from './service.js';
 import { VERSION } from './version.js';
 
-const COMMANDS = ['setup', 'start', 'stop', 'status', 'logs', 'doctor', 'rescan'] as const;
+const COMMANDS = ['setup', 'pair', 'start', 'stop', 'status', 'logs', 'doctor', 'rescan'] as const;
 type Command = (typeof COMMANDS)[number];
 
 const CONFIG_OPTION_NAMES = [
@@ -70,6 +73,7 @@ const CLI_PARSE_OPTIONS = {
   version: { type: 'boolean' },
   json: { type: 'boolean' },
   'no-open': { type: 'boolean' },
+  'new': { type: 'boolean' },
   foreground: { type: 'boolean' },
   'daemon-child': { type: 'boolean' },
   'server-url': { type: 'string' },
@@ -88,6 +92,7 @@ const PUBLIC_HELP = `Usage: quukk-clawmessenger <command> [options]
 
 Commands:
   setup    Start the local service and open setup
+  pair     Print a one-time pairing code for the local service
   start    Start the local service
   stop     Stop the local service
   status   Show local service status
@@ -112,6 +117,17 @@ Setup/start options:
   --hermes-path <absolute-path>
   --log-level <silent|error|warn|info|debug>
 
+Pair options:
+  --new                        discard a live pairing session and start a fresh one
+  --server-url <url>
+  --workdir <absolute-path>
+  --authorized-work-root <absolute-path>
+  --opencode-path <absolute-path>
+  --openclaw-path <absolute-path>
+  --codex-path <absolute-path>
+  --hermes-path <absolute-path>
+  --log-level <silent|error|warn|info|debug>
+
 Logs options:
   --lines <1..1000>
   --follow`;
@@ -125,6 +141,7 @@ type CliErrorCode =
   | 'not_running'
   | 'operation_timeout'
   | 'operation_unavailable'
+  | 'pairing_no_candidates'
   | 'runtime_response_invalid'
   | 'unsafe_identity'
   | 'usage_error';
@@ -157,7 +174,11 @@ export type ControlResponse =
   | { command: 'status'; value: ControlStatusResponse }
   | { command: 'launch_ticket'; value: { ticket: string; expiresAt: number } }
   | { command: 'rescan'; value: RuntimesResponse }
+  | { command: 'pairing_status'; value: ControlPairingResponse }
+  | { command: 'pairing_start'; value: ControlPairingResponse }
   | { command: 'shutdown'; value: { accepted: true } };
+
+export type ControlCommand = ControlResponse['command'];
 
 export interface StaleInspection {
   identity: DaemonIdentity;
@@ -274,7 +295,7 @@ export interface CliRuntimePort {
   runForeground(input: StartInput, options: ForegroundRunOptions): Promise<number>;
   control(
     identity: ReadyDaemonIdentity,
-    command: 'status' | 'launch_ticket' | 'rescan' | 'shutdown',
+    command: ControlCommand,
   ): Promise<ControlResponse>;
   recoverStaleForStart(inspection: StaleInspection): Promise<boolean>;
   readLogs(input: { lines: number; follow: boolean }): AsyncIterable<string>;
@@ -457,6 +478,7 @@ type ParsedCli = {
   noOpen: boolean;
   foreground: boolean;
   daemonChild: boolean;
+  newSession: boolean;
   lines: number;
   follow: boolean;
   configOverrides: ConfigOverrides;
@@ -550,7 +572,12 @@ function parseCli(argv: readonly string[]): ParsedCli | 'help' | 'version' {
   const allowed = new Set<string>(['json']);
   if (command === 'setup' || command === 'start') {
     allowed.add('no-open');
+  }
+  if (command === 'setup' || command === 'start' || command === 'pair') {
     for (const option of CONFIG_OPTION_NAMES) allowed.add(option);
+  }
+  if (command === 'pair') {
+    allowed.add('new');
   }
   if (command === 'start') {
     allowed.add('foreground');
@@ -564,7 +591,12 @@ function parseCli(argv: readonly string[]): ParsedCli | 'help' | 'version' {
   for (const option of enabledOptions) {
     if (!allowed.has(option)) throw new CliFailure('usage_error');
   }
-  if (command !== 'setup' && command !== 'start' && configOptions.length !== 0) {
+  if (
+    command !== 'setup'
+    && command !== 'start'
+    && command !== 'pair'
+    && configOptions.length !== 0
+  ) {
     throw new CliFailure('usage_error');
   }
   const daemonChild = parsed.values['daemon-child'] === true;
@@ -592,6 +624,7 @@ function parseCli(argv: readonly string[]): ParsedCli | 'help' | 'version' {
     noOpen: parsed.values['no-open'] === true,
     foreground: parsed.values.foreground === true,
     daemonChild,
+    newSession: parsed.values['new'] === true,
     lines,
     follow: parsed.values.follow === true,
     configOverrides: parseConfig(parsed.values),
@@ -873,6 +906,69 @@ async function startCommand(parsed: ParsedCli, options: RunCliOptions): Promise<
   return 0;
 }
 
+async function pairingControl(
+  options: RunCliOptions,
+  identity: ReadyDaemonIdentity,
+  command: 'pairing_status' | 'pairing_start',
+): Promise<ControlPairingResponse> {
+  const response = await options.runtime.control(identity, command);
+  if (response.command !== command) throw new CliFailure('runtime_response_invalid');
+  return response.value;
+}
+
+function emitPairing(parsed: ParsedCli, io: CliIO, response: ControlPairingResponse): void {
+  const pairing = response.pairing;
+  if (parsed.json) {
+    io.stdout(JSON.stringify({
+      schemaVersion: 1,
+      ok: true,
+      command: 'pair',
+      state: pairing.state,
+      pairingCode: pairing.pairingCode,
+      expiresAt: pairing.expiresAt,
+      serverUrl: response.serverUrl,
+    }));
+    return;
+  }
+  io.stdout(`quukk-clawmessenger: pair ${pairing.state}`);
+  if (pairing.pairingCode === null) return;
+  io.stdout(`pairing_code=${pairing.pairingCode}`);
+  if (pairing.expiresAt !== null) io.stdout(`expires_at=${pairing.expiresAt}`);
+  io.stdout(`server=${response.serverUrl}`);
+  io.stdout('Enter the code in ClawMessenger under Remote devices > Add device.');
+}
+
+async function pairCommand(parsed: ParsedCli, options: RunCliOptions): Promise<number> {
+  const input: StartInput = {
+    foreground: false,
+    noOpen: true,
+    configOverrides: parsed.configOverrides,
+  };
+  const result = checkedStartResult(await options.runtime.start(input));
+  if (result.alreadyRunning && hasOverrides(parsed.configOverrides)) {
+    throw new CliFailure('already_running_with_overrides');
+  }
+  const current = parsed.newSession
+    ? undefined
+    : await pairingControl(options, result.identity, 'pairing_status');
+  if (current !== undefined && current.pairing.pairingCode !== null) {
+    emitPairing(parsed, options.io, current);
+    return 0;
+  }
+  const catalog = await options.runtime
+    .control(result.identity, 'rescan')
+    .catch(() => undefined);
+  if (catalog?.command === 'rescan' && catalog.value.runtimes.length === 0) {
+    throw new CliFailure('pairing_no_candidates');
+  }
+  emitPairing(
+    parsed,
+    options.io,
+    await pairingControl(options, result.identity, 'pairing_start'),
+  );
+  return 0;
+}
+
 function emitCommandSuccess(
   parsed: ParsedCli,
   io: CliIO,
@@ -929,6 +1025,10 @@ async function rescanCommand(parsed: ParsedCli, options: RunCliOptions): Promise
       provider: runtime.provider,
       status: runtime.status,
       runtimeId: runtime.runtimeId,
+      interactiveRounds: runtime.capabilities.interactiveRounds,
+      ...(runtime.interactiveUnavailableReason === undefined
+        ? {}
+        : { interactiveUnavailableReason: runtime.interactiveUnavailableReason }),
     })),
   }, 'ready');
   return 0;
@@ -1011,6 +1111,7 @@ export async function runCli(
     if (parsed.command === 'setup' || parsed.command === 'start') {
       return await startCommand(parsed, options);
     }
+    if (parsed.command === 'pair') return await pairCommand(parsed, options);
     if (parsed.command === 'status') return await statusCommand(parsed, options);
     if (parsed.command === 'rescan') return await rescanCommand(parsed, options);
     if (parsed.command === 'stop') return await stopCommand(parsed, options);
@@ -1121,6 +1222,21 @@ const LOG_SNAPSHOT_LIMIT = 5 << 20;
 const START_WAIT_MS = 65_000;
 const SHUTDOWN_WAIT_MS = 20_000;
 const POLL_MS = 100;
+
+// The control client must outlive the server's own operation budget. A runtime
+// refresh that legitimately takes a minute must not be aborted from the client,
+// or a successful rescan is reported as operation_timeout (and the daemon is
+// left probe-blocked by a caller that already gave up).
+const CONTROL_REQUEST_MARGIN_MS = 5_000;
+
+export const CONTROL_REQUEST_TIMEOUT_MS: Record<ControlCommand, number> = {
+  status: CONTROL_OPERATION_TIMEOUT_MS.status + CONTROL_REQUEST_MARGIN_MS,
+  launch_ticket: 5_000,
+  rescan: CONTROL_OPERATION_TIMEOUT_MS.rescan + CONTROL_REQUEST_MARGIN_MS,
+  pairing_status: CONTROL_OPERATION_TIMEOUT_MS.pairing_status + CONTROL_REQUEST_MARGIN_MS,
+  pairing_start: CONTROL_OPERATION_TIMEOUT_MS.pairing_start + CONTROL_REQUEST_MARGIN_MS,
+  shutdown: 5_000,
+};
 
 const ChildConfigOverridesSchema = z.strictObject({
   serverUrl: z.string().optional(),
@@ -1433,7 +1549,7 @@ function controlRequest(
   request: ProductionHttpRequest,
   identity: ReadyDaemonIdentity,
   credential: string,
-  command: 'status' | 'launch_ticket' | 'rescan' | 'shutdown',
+  command: ControlCommand,
   timeoutMs = 5_000,
 ): Promise<unknown> {
   const body = Buffer.from(JSON.stringify({ command }), 'utf8');
@@ -1830,9 +1946,10 @@ export function createProductionCliRuntime(
     let raw: unknown;
     try {
       const credential = await readCredential(parsedIdentity.data);
+      const budget = CONTROL_REQUEST_TIMEOUT_MS[command];
       const requestTimeout = shutdownDeadline === undefined
-        ? 5_000
-        : Math.min(5_000, remainingDeadline(shutdownDeadline));
+        ? budget
+        : Math.min(budget, remainingDeadline(shutdownDeadline));
       raw = await controlRequest(
         request,
         parsedIdentity.data,
@@ -1858,6 +1975,11 @@ export function createProductionCliRuntime(
     }
     if (command === 'rescan') {
       const parsed = RuntimesResponseSchema.safeParse(raw);
+      if (!parsed.success) throw productionFailure('process_unverified');
+      return { command, value: parsed.data };
+    }
+    if (command === 'pairing_status' || command === 'pairing_start') {
+      const parsed = ControlPairingResponseSchema.safeParse(raw);
       if (!parsed.success) throw productionFailure('process_unverified');
       return { command, value: parsed.data };
     }

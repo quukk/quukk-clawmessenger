@@ -14,6 +14,7 @@ const capabilities = {
   textEvents: true,
   toolEvents: true,
   approvalEvents: false,
+  interactiveRounds: true,
 };
 
 const detectedRuntimes: BridgeRuntime[] = [
@@ -263,18 +264,74 @@ describe('runtime setup', () => {
   });
 
   it('explains authentication, non-runnable, and probe failures', async () => {
+    const unready: BridgeRuntime[] = [
+      {
+        id: 'rt_11111111111111111111111111111111',
+        provider: 'opencode',
+        status: 'needs_auth',
+        version: '1.2.3',
+        path: 'C:\\tools\\opencode.exe',
+        capabilities,
+      },
+      {
+        id: 'rt_22222222222222222222222222222222',
+        provider: 'openclaw',
+        status: 'found_not_runnable',
+        version: '2.0.0',
+        path: 'C:\\tools\\openclaw.exe',
+        capabilities,
+      },
+      { provider: 'codex', status: 'probe_failed', capabilities },
+      { provider: 'hermes', status: 'not_found', capabilities },
+    ];
     const api = createApi({
-      getRuntimes: vi.fn().mockResolvedValue([
-        { ...detectedRuntimes[0], status: 'needs_auth' },
-        { ...detectedRuntimes[1], status: 'found_not_runnable' },
-        { provider: 'codex', status: 'probe_failed', capabilities },
-        { provider: 'hermes', status: 'not_found', capabilities },
-      ]),
+      getRuntimes: vi.fn().mockResolvedValue(unready),
+      rescanRuntimes: vi.fn().mockResolvedValue(unready),
     });
     await renderReady(api);
 
     expect(screen.getByText(/sign in to opencode, then rescan/i)).toBeVisible();
     expect(screen.getByText(/executable was found but could not run/i)).toBeVisible();
     expect(screen.getByText(/detection failed.*rescan/i)).toBeVisible();
+  });
+
+  it('automatically rescans once when no agent platform is ready', async () => {
+    const unready: BridgeRuntime[] = [
+      { provider: 'opencode', status: 'not_found', capabilities },
+      { provider: 'openclaw', status: 'not_found', capabilities },
+      { provider: 'codex', status: 'not_found', capabilities },
+      { provider: 'hermes', status: 'not_found', capabilities },
+    ];
+    const rescanRuntimes = vi.fn().mockResolvedValue(detectedRuntimes);
+    const api = createApi({
+      getRuntimes: vi.fn().mockResolvedValue(unready),
+      rescanRuntimes,
+    });
+
+    render(<App api={api} />);
+
+    expect(await screen.findByText('OpenCode')).toBeVisible();
+    expect(rescanRuntimes).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps an explicit rescan action when detection finds nothing', async () => {
+    const user = userEvent.setup();
+    const unready: BridgeRuntime[] = [
+      { provider: 'opencode', status: 'not_found', capabilities },
+      { provider: 'openclaw', status: 'not_found', capabilities },
+      { provider: 'codex', status: 'not_found', capabilities },
+      { provider: 'hermes', status: 'not_found', capabilities },
+    ];
+    const rescanRuntimes = vi.fn().mockRejectedValue(new Error('rescan_failed'));
+    const api = createApi({
+      getRuntimes: vi.fn().mockResolvedValue(unready),
+      rescanRuntimes,
+    });
+
+    render(<App api={api} />);
+
+    expect(await screen.findByText(/rescan failed/i)).toBeVisible();
+    await user.click(screen.getByRole('button', { name: /^rescan$/i }));
+    expect(rescanRuntimes).toHaveBeenCalledTimes(2);
   });
 });

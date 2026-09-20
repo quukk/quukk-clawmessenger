@@ -41,9 +41,11 @@ import {
   LocalRoutes,
   RuntimesResponseSchema,
   SettingsResponseSchema,
+  ControlPairingResponseSchema,
   PairingResponseSchema,
   type ActivityResponse,
   type BindingMutationResponse,
+  type ControlPairingResponse,
   type ControlStatusResponse,
   type DiagnosticsResponse,
   type EnableResponse,
@@ -231,6 +233,7 @@ export type ServiceErrorCode =
   | 'pairing_unauthorized'
   | 'pairing_response_invalid'
   | 'pairing_rate_limited'
+  | 'pairing_no_candidates'
   | 'pairing_unavailable';
 
 export class ServiceError extends Error {
@@ -422,7 +425,8 @@ function normalizedServiceError(error: unknown, fallback: ServiceErrorCode): Ser
   if (code === 'config_recovery_required') return new ServiceError('config_recovery_required');
   if (code === 'pairing_api_unavailable' || code === 'pairing_timeout' || code === 'pairing_transport'
     || code === 'pairing_unauthorized' || code === 'pairing_response_invalid'
-    || code === 'pairing_rate_limited' || code === 'pairing_unavailable') {
+    || code === 'pairing_rate_limited' || code === 'pairing_no_candidates'
+    || code === 'pairing_unavailable') {
     return new ServiceError(code);
   }
   return new ServiceError(fallback);
@@ -986,6 +990,31 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
     });
   }
 
+  controlPairingStatus(signal: AbortSignal): Promise<ControlPairingResponse> {
+    return this.pairingStatus(signal).then((value) => this.#controlPairingResponse(value));
+  }
+
+  controlPairingStart(signal: AbortSignal): Promise<ControlPairingResponse> {
+    return this.pairingStart(signal).then((value) => this.#controlPairingResponse(value));
+  }
+
+  async #controlPairingResponse(value: PairingResponse): Promise<ControlPairingResponse> {
+    let serverUrl: string;
+    try {
+      const effective = await this.#store.snapshot(this.#configOverrides, this.#configEnvironment);
+      serverUrl = effective.config.serverUrl;
+    } catch (error) {
+      throw normalizedServiceError(error, 'operation_unavailable');
+    }
+    const parsed = ControlPairingResponseSchema.safeParse({
+      schemaVersion: 1,
+      serverUrl,
+      pairing: value,
+    });
+    if (!parsed.success) throw new ServiceError('operation_unavailable');
+    return parsed.data;
+  }
+
   async activity(signal: AbortSignal): Promise<ActivityResponse> {
     this.#assertReadable(signal);
     let activity: readonly LoggerActivityRecord[];
@@ -1076,6 +1105,10 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
         ...(validExecutableName(runtime.path) === undefined
           ? {}
           : { executableName: validExecutableName(runtime.path) }),
+        interactiveRounds: runtime.capabilities.interactive_rounds === true,
+        ...(runtime.interactive_unavailable_reason === undefined
+          ? {}
+          : { interactiveUnavailableReason: runtime.interactive_unavailable_reason }),
       })),
       workers: workerSnapshots.flatMap((worker) =>
         RUNTIME_ID_PATTERN.test(worker.runtimeId)
@@ -1392,7 +1425,11 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
           textEvents: runtime.capabilities.text_events,
           toolEvents: runtime.capabilities.tool_events,
           approvalEvents: false,
+          interactiveRounds: runtime.capabilities.interactive_rounds === true,
         },
+        ...(runtime.interactive_unavailable_reason === undefined
+          ? {}
+          : { interactiveUnavailableReason: runtime.interactive_unavailable_reason }),
         binding: binding === undefined ? null : safeBinding(binding),
         credentialMode: binding === undefined || binding.tokenRef === undefined
           ? null

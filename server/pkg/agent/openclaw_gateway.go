@@ -306,7 +306,10 @@ func dialOpenclawGateway(ctx context.Context, cfg openclawGatewayConfig) (*openc
 		return nil, errors.New("openclaw Gateway requires protocol 4 and operator.read/operator.write access")
 	}
 	c.interactive = slices.Contains(hello.Features.Events, "chat")
-	for _, method := range []string{"agents.list", "sessions.resolve", "chat.send", "chat.abort", "chat.history"} {
+	// OpenClaw 2026.9.x registers sessions.resolve with advertise:false (the
+	// method still executes; it is only hidden from the advertised list), so
+	// the capability probe must not require it to be advertised here.
+	for _, method := range []string{"agents.list", "chat.send", "chat.abort", "chat.history"} {
 		c.interactive = c.interactive && slices.Contains(hello.Features.Methods, method)
 	}
 	c.modelSelection = slices.Contains(hello.Features.Methods, "sessions.create") && slices.Contains(hello.Features.Methods, "sessions.patch") && len(hello.Auth.Scopes) == 2

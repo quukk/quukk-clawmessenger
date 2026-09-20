@@ -45,7 +45,10 @@ type BridgeRuntime struct {
 const (
 	bridgeRuntimeCount            = 4
 	defaultBridgeProbeConcurrency = 2
-	defaultBridgeProbeTimeout     = 10 * time.Second
+	// Must exceed agent.InteractiveProbeTimeout: the interactive proof runs
+	// inside this budget, after version detection has already spent part of it,
+	// so an outer bound below the inner one makes the proof unreachable.
+	defaultBridgeProbeTimeout = 20 * time.Second
 )
 
 type bridgeRuntimeSpec struct {

@@ -15,6 +15,7 @@ const capabilities = {
   textEvents: true,
   toolEvents: true,
   approvalEvents: false,
+  interactiveRounds: true,
 };
 
 const runtimes: BridgeRuntime[] = [

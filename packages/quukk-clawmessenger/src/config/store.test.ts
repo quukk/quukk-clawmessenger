@@ -15,16 +15,21 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { z } from 'zod';
 
 import {
+  BETA_SERVER_URL,
   CredentialFileSchema,
   DEFAULT_CONFIG,
   LocalStateSchema,
+  STABLE_SERVER_URL,
   StoredConfigSchema,
+  resolvePersistedServerUrl,
+  serverUrlForChannel,
   type CredentialFile,
   type Provider,
   type RongCloudCredential,
   type RuntimeBinding,
   type StoredConfig,
 } from './schema.js';
+import { CHANNEL } from '../version.js';
 import { localPaths } from './paths.js';
 import {
   AtomicJsonError,
@@ -152,7 +157,7 @@ describe('local schemas, paths, atomic JSON, and store', () => {
   it('rejects unknown keys and future versions instead of silently accepting them', () => {
     expect(DEFAULT_CONFIG).toEqual({
       schemaVersion: 1,
-      serverUrl: 'https://newsradar.dreamdt.cn/im',
+      serverUrl: serverUrlForChannel(CHANNEL),
       defaultWorkdir: null,
       authorizedWorkRoots: [],
       providerPathOverrides: {},
@@ -174,6 +179,47 @@ describe('local schemas, paths, atomic JSON, and store', () => {
         tokens: {},
       }).success,
     ).toBe(false);
+  });
+
+  it('maps every release channel to its own server and defaults to the running channel', () => {
+    expect(serverUrlForChannel('beta')).toBe(BETA_SERVER_URL);
+    expect(serverUrlForChannel('stable')).toBe(STABLE_SERVER_URL);
+    expect(BETA_SERVER_URL).toBe('https://newsradar.dreamdt.cn/im-test');
+    expect(STABLE_SERVER_URL).toBe('https://newsradar.dreamdt.cn/im');
+    expect(DEFAULT_CONFIG.serverUrl).toBe(serverUrlForChannel(CHANNEL));
+  });
+
+  it('moves a persisted server that belongs to the other channel onto the running channel', () => {
+    const other = CHANNEL === 'beta' ? STABLE_SERVER_URL : BETA_SERVER_URL;
+    expect(resolvePersistedServerUrl(other, CHANNEL)).toBe(serverUrlForChannel(CHANNEL));
+    expect(resolvePersistedServerUrl(other, CHANNEL === 'beta' ? 'stable' : 'beta')).toBe(other);
+    expect(resolvePersistedServerUrl('https://self.example/im', CHANNEL)).toBe(
+      'https://self.example/im',
+    );
+  });
+
+  it('corrects a stale cross-channel server at read time without rewriting the file', async () => {
+    const home = await temporaryHome();
+    const paths = localPaths(home);
+    const stale = CHANNEL === 'beta' ? STABLE_SERVER_URL : BETA_SERVER_URL;
+    const file = await makeConfig(home, { serverUrl: stale });
+    await mkdir(paths.root, { recursive: true });
+    await atomicWriteJson(paths.config, file);
+    const store = await LocalStore.open({ homeDirectory: home });
+
+    expect((await store.snapshot(undefined, {})).config.serverUrl).toBe(DEFAULT_CONFIG.serverUrl);
+    expect(JSON.parse(await readFile(paths.config, 'utf8'))).toEqual(file);
+  });
+
+  it('keeps a persisted custom server untouched', async () => {
+    const home = await temporaryHome();
+    const paths = localPaths(home);
+    const file = await makeConfig(home);
+    await mkdir(paths.root, { recursive: true });
+    await atomicWriteJson(paths.config, file);
+    const store = await LocalStore.open({ homeDirectory: home });
+
+    expect((await store.snapshot(undefined, {})).config.serverUrl).toBe('https://file.example/im');
   });
 
   it('resolves each config leaf as CLI over environment over file over defaults', async () => {

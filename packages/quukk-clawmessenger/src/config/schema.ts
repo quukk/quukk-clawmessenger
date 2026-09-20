@@ -2,6 +2,8 @@ import { isAbsolute } from 'node:path';
 
 import { z } from 'zod';
 
+import { CHANNEL, type ReleaseChannel } from '../version.js';
+
 export const PROVIDERS = ['opencode', 'openclaw', 'codex', 'hermes'] as const;
 export const ProviderSchema = z.enum(PROVIDERS);
 export type Provider = z.infer<typeof ProviderSchema>;
@@ -133,9 +135,26 @@ export const StoredConfigSchema = z
 
 export type StoredConfig = z.infer<typeof StoredConfigSchema>;
 
+export const STABLE_SERVER_URL = 'https://newsradar.dreamdt.cn/im';
+export const BETA_SERVER_URL = 'https://newsradar.dreamdt.cn/im-test';
+
+export function serverUrlForChannel(channel: ReleaseChannel): string {
+  return channel === 'beta' ? BETA_SERVER_URL : STABLE_SERVER_URL;
+}
+
+function otherChannel(channel: ReleaseChannel): ReleaseChannel {
+  return channel === 'beta' ? 'stable' : 'beta';
+}
+
+export function resolvePersistedServerUrl(persisted: string, channel: ReleaseChannel): string {
+  return persisted === serverUrlForChannel(otherChannel(channel))
+    ? serverUrlForChannel(channel)
+    : persisted;
+}
+
 export const DEFAULT_CONFIG: StoredConfig = {
   schemaVersion: 1,
-  serverUrl: 'https://newsradar.dreamdt.cn/im',
+  serverUrl: serverUrlForChannel(CHANNEL),
   defaultWorkdir: null,
   authorizedWorkRoots: [],
   providerPathOverrides: {},

@@ -9,6 +9,7 @@ import {
   RongCloudCredentialSchema,
   RuntimeBindingSchema,
   StoredConfigSchema,
+  resolvePersistedServerUrl,
   type ConfigOverrides,
   type CredentialFile,
   type LocalErrorCode,
@@ -18,6 +19,7 @@ import {
   type RuntimeBinding,
   type StoredConfig,
 } from './schema.js';
+import { CHANNEL } from '../version.js';
 import {
   atomicWriteJson,
   clearRecoveryArtifacts,
@@ -135,7 +137,9 @@ function effectiveConfig(
   return parseConfig({
     schemaVersion: 1,
     serverUrl:
-      overrides.serverUrl ?? environment.QUUKK_CLAWMESSENGER_SERVER_URL ?? file.serverUrl,
+      overrides.serverUrl ??
+      environment.QUUKK_CLAWMESSENGER_SERVER_URL ??
+      resolvePersistedServerUrl(file.serverUrl, CHANNEL),
     defaultWorkdir:
       overrides.defaultWorkdir === null
         ? null

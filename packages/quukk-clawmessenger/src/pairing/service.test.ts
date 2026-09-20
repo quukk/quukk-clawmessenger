@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RuntimeBinding, TrustedRuntime } from '../config/schema.js';
 import type { EnableResult } from '../bindings/service.js';
 import { PairingClientError, type CreatePairingSessionInput } from './client.js';
-import { PairingService } from './service.js';
+import { PairingService, PairingServiceError } from './service.js';
 import type { PairingRegistrationAuthorization, PairingSelection, PairingSessionV2 } from './schema.js';
 
 const NOW = Date.parse('2026-09-02T00:00:00.000Z');
@@ -1059,5 +1059,18 @@ describe('PairingService', () => {
     expect(pollSignal.aborted).toBe(true);
     expect(bindings.calls).toEqual([]);
     expect(service.snapshot().state).toBe('expired');
+  });
+
+  it('fails with a typed code when no trusted runtime is available', async () => {
+    const service = new PairingService({
+      client: new FakePairingClient(),
+      bindings: new FakeBindings(),
+      runtimeSource: new FakeRuntimeSource([]),
+      installAbuseKey: INSTALL_ABUSE_KEY,
+      randomBytes: (size: number) => Buffer.alloc(size, 9),
+    });
+
+    await expect(service.start()).rejects.toBeInstanceOf(PairingServiceError);
+    await expect(service.start()).rejects.toMatchObject({ code: 'pairing_no_candidates' });
   });
 });

@@ -1437,6 +1437,33 @@ describe('QuukkService projections and settings', () => {
     await f.service.stop();
   });
 
+  it('surfaces proven interactive rounds and the bridge unavailable reason', async () => {
+    const f = await fixture();
+    await start(f);
+    const reason = 'opencode requires ACP protocol 1 with advertised session resume support';
+    f.runtime.catalog[0] = {
+      ...f.runtime.catalog[0]!,
+      capabilities: { ...capabilities(), interactive_rounds: true },
+    };
+    f.runtime.catalog[1] = {
+      ...f.runtime.catalog[1]!,
+      capabilities: { ...capabilities(), interactive_rounds: false },
+      interactive_unavailable_reason: reason,
+    };
+
+    const runtimes = await f.service.runtimes(new AbortController().signal);
+    expect(runtimes.runtimes[0]?.capabilities.interactiveRounds).toBe(true);
+    expect(runtimes.runtimes[0]?.interactiveUnavailableReason).toBeUndefined();
+    expect(runtimes.runtimes[1]?.capabilities.interactiveRounds).toBe(false);
+    expect(runtimes.runtimes[1]?.interactiveUnavailableReason).toBe(reason);
+
+    const diagnostics = await f.service.diagnostics(new AbortController().signal);
+    expect(diagnostics.runtimes[0]?.interactiveRounds).toBe(true);
+    expect(diagnostics.runtimes[1]?.interactiveRounds).toBe(false);
+    expect(diagnostics.runtimes[1]?.interactiveUnavailableReason).toBe(reason);
+    await f.service.stop();
+  });
+
   it('returns newest 100 ascending activity rows and diagnostics with basenames only', async () => {
     const f = await fixture();
     const executablePath = join(await temporaryDirectory(), 'secret', 'opencode.exe');

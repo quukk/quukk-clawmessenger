@@ -6,15 +6,18 @@ import { pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  CONTROL_REQUEST_TIMEOUT_MS,
   createProductionCliRuntime,
   createSystemBrowserPort,
   packagedCliCandidate,
   runPackagedCliEntry,
   runCli,
   type CliRuntimePort,
+  type ControlCommand,
 } from './cli.js';
 import { localPaths } from './config/paths.js';
 import { DEFAULT_CONFIG } from './config/schema.js';
+import { CONTROL_OPERATION_TIMEOUT_MS } from './http/routes.js';
 import { deriveControlCredential } from './http/security.js';
 import { VERSION } from './version.js';
 
@@ -48,6 +51,7 @@ function runtimeResponse(pathSentinel = resolve('runtime-path')) {
     textEvents: true,
     toolEvents: true,
     approvalEvents: false as const,
+    interactiveRounds: true,
   };
   return {
     schemaVersion: 1 as const,
@@ -69,7 +73,7 @@ function runtimeResponse(pathSentinel = resolve('runtime-path')) {
         version: null,
         path: null,
         status: 'not_found' as const,
-        capabilities,
+        capabilities: { ...capabilities, interactiveRounds: false },
         binding: null,
         credentialMode: null,
         worker: null,
@@ -890,10 +894,13 @@ describe('runCli', () => {
       ok: true,
       command: 'rescan',
       runtimes: [
-        { provider: 'opencode', status: 'ready', runtimeId: `rt_${'1'.repeat(32)}` },
-        { provider: 'openclaw', status: 'not_found', runtimeId: null },
-        { provider: 'codex', status: 'not_found', runtimeId: null },
-        { provider: 'hermes', status: 'not_found', runtimeId: null },
+        {
+          provider: 'opencode', status: 'ready', runtimeId: `rt_${'1'.repeat(32)}`,
+          interactiveRounds: true,
+        },
+        { provider: 'openclaw', status: 'not_found', runtimeId: null, interactiveRounds: false },
+        { provider: 'codex', status: 'not_found', runtimeId: null, interactiveRounds: false },
+        { provider: 'hermes', status: 'not_found', runtimeId: null, interactiveRounds: false },
       ],
     });
     expect(test.stdout[0]).not.toContain(secretSentinel);
@@ -2913,5 +2920,136 @@ describe('createProductionCliRuntime', () => {
     });
     expect(setExitCode).toHaveBeenCalledOnce();
     expect(setExitCode).toHaveBeenCalledWith(4);
+  });
+});
+
+const PAIRING_WAITING = {
+  schemaVersion: 2 as const,
+  state: 'waiting' as const,
+  expiresAt: '2099-09-02T10:05:00.000Z',
+  pairingCode: 'ABCDEF23',
+  qrContent: null,
+  candidates: [],
+  results: [],
+};
+const PAIRING_IDLE = { ...PAIRING_WAITING, state: 'idle' as const, pairingCode: null };
+const CONTROL_PAIRING = {
+  schemaVersion: 1 as const,
+  serverUrl: 'https://configured.example',
+  pairing: PAIRING_WAITING,
+};
+
+describe('pair', () => {
+  it('prints an existing pairing code without replacing it', async () => {
+    const test = harness();
+    test.runtime.control.mockImplementation(async (_identity, command) => {
+      if (command === 'pairing_status') return { command, value: CONTROL_PAIRING };
+      throw new Error('unexpected_control');
+    });
+
+    expect(await runCli(['pair'], test.options)).toBe(0);
+    expect(test.runtime.start).toHaveBeenCalledOnce();
+    expect(test.runtime.control.mock.calls.map((call) => call[1])).toEqual(['pairing_status']);
+    expect(test.browser.open).not.toHaveBeenCalled();
+    expect(test.stderr).toEqual([]);
+    expect(test.stdout).toEqual([
+      'quukk-clawmessenger: pair waiting',
+      'pairing_code=ABCDEF23',
+      'expires_at=2099-09-02T10:05:00.000Z',
+      'server=https://configured.example',
+      'Enter the code in ClawMessenger under Remote devices > Add device.',
+    ]);
+  });
+
+  it('starts a fresh session only after checking that none is live', async () => {
+    const test = harness();
+    test.runtime.control.mockImplementation(async (_identity, command) => {
+      if (command === 'pairing_status') return { command, value: { ...CONTROL_PAIRING, pairing: PAIRING_IDLE } };
+      if (command === 'rescan') return { command, value: runtimeResponse() };
+      if (command === 'pairing_start') return { command, value: CONTROL_PAIRING };
+      throw new Error('unexpected_control');
+    });
+
+    expect(await runCli(['pair'], test.options)).toBe(0);
+    expect(test.runtime.control.mock.calls.map((call) => call[1])).toEqual([
+      'pairing_status', 'rescan', 'pairing_start',
+    ]);
+    expect(test.stdout.at(1)).toBe('pairing_code=ABCDEF23');
+  });
+
+  it('discards a live session with --new without reading it first', async () => {
+    const test = harness();
+    test.runtime.control.mockImplementation(async (_identity, command) => {
+      if (command === 'rescan') return { command, value: runtimeResponse() };
+      if (command === 'pairing_start') return { command, value: CONTROL_PAIRING };
+      throw new Error('unexpected_control');
+    });
+
+    expect(await runCli(['pair', '--new'], test.options)).toBe(0);
+    expect(test.runtime.control.mock.calls.map((call) => call[1])).toEqual([
+      'rescan', 'pairing_start',
+    ]);
+  });
+
+  it('reports pairing_no_candidates instead of starting without a platform', async () => {
+    const test = harness();
+    test.runtime.control.mockImplementation(async (_identity, command) => {
+      if (command === 'pairing_status') return { command, value: { ...CONTROL_PAIRING, pairing: PAIRING_IDLE } };
+      if (command === 'rescan') return { command, value: { schemaVersion: 1 as const, runtimes: [] } };
+      throw new Error('unexpected_control');
+    });
+
+    expect(await runCli(['pair'], test.options)).toBe(2);
+    expect(test.stderr).toEqual(['quukk-clawmessenger: pairing_no_candidates']);
+    expect(test.runtime.control.mock.calls.map((call) => call[1])).toEqual(['pairing_status', 'rescan']);
+  });
+
+  it('emits one machine-readable object for --json', async () => {
+    const test = harness();
+    test.runtime.control.mockImplementation(async (_identity, command) => {
+      if (command === 'pairing_status') return { command, value: CONTROL_PAIRING };
+      throw new Error('unexpected_control');
+    });
+
+    expect(await runCli(['pair', '--json'], test.options)).toBe(0);
+    expect(test.stdout).toEqual([JSON.stringify({
+      schemaVersion: 1,
+      ok: true,
+      command: 'pair',
+      state: 'waiting',
+      pairingCode: 'ABCDEF23',
+      expiresAt: '2099-09-02T10:05:00.000Z',
+      serverUrl: 'https://configured.example',
+    })]);
+  });
+
+  it('refuses config overrides while another service instance is already running', async () => {
+    const test = harness();
+    test.runtime.start.mockResolvedValue({ identity: READY_IDENTITY, alreadyRunning: true });
+
+    expect(await runCli(['pair', '--workdir', resolve('elsewhere')], test.options)).toBe(2);
+    expect(test.stderr).toEqual(['quukk-clawmessenger: already_running_with_overrides']);
+    expect(test.runtime.control).not.toHaveBeenCalled();
+  });
+
+  it('rejects options that pair does not accept', async () => {
+    const test = harness();
+    expect(await runCli(['pair', '--no-open'], test.options)).toBe(2);
+    expect(test.stderr).toEqual(['quukk-clawmessenger: usage_error']);
+    expectNoRuntimeCalls(test.runtime);
+  });
+});
+
+describe('control request budgets', () => {
+  it('outlives the server budget for every command that has one', () => {
+    const commands = Object.keys(CONTROL_OPERATION_TIMEOUT_MS) as ControlCommand[];
+    expect(commands.length).toBeGreaterThan(0);
+    for (const command of commands) {
+      expect(CONTROL_REQUEST_TIMEOUT_MS[command]).toBeGreaterThan(CONTROL_OPERATION_TIMEOUT_MS[command]);
+    }
+  });
+
+  it('keeps the runtime refresh budget above the interactive probe budget', () => {
+    expect(CONTROL_OPERATION_TIMEOUT_MS.rescan).toBeGreaterThan(15_000);
   });
 });

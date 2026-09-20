@@ -83,16 +83,80 @@ quukk-clawmessenger setup \
   --authorized-work-root "$HOME/AI-Workspace"
 ```
 
-无图形界面的 Linux 服务器使用：
+### 无图形界面的 Linux 服务器
+
+没有桌面会话的服务器上不存在可用的 `xdg-open`，直接执行 `setup` 会以 `browser_open_failed` 失败（退出码 5）。这类设备不需要打开网页，直接用 `pair` 在终端拿到 8 位一次性配对码：
 
 ```bash
-quukk-clawmessenger setup --no-open \
+quukk-clawmessenger pair \
   --server-url "https://newsradar.dreamdt.cn/im-test" \
   --workdir "$HOME/AI-Workspace" \
   --authorized-work-root "$HOME/AI-Workspace"
 ```
 
-本地 Setup 页面只能从运行该服务的设备访问。远程服务器不应把 `127.0.0.1` 监听地址直接暴露出去；请在受信任环境中通过安全端口转发访问，或在具备本地浏览器的设备上完成操作。
+```text
+quukk-clawmessenger: pair waiting
+pairing_code=ABCDEF23
+expires_at=2026-09-18T12:00:00.000Z
+server=https://newsradar.dreamdt.cn/im-test
+Enter the code in ClawMessenger under Remote devices > Add device.
+```
+
+- `pair` 会先确保本地服务在运行（没有就启动），不会尝试打开浏览器，也不会打印网页地址。
+- 把 `pairing_code` 输入 Web 或移动端的“远程设备管理 → 添加设备 → 输入配对码”即可完成绑定，流程见第 6、7 节。
+- 重复执行 `pair` **不会**作废已经打印的码：会话仍然有效时它会原样返回同一个码。需要换一批平台、或码已过期时，加 `--new` 强制重开。
+- `pair --json` 输出机器可读结果；绑定进度用 `quukk-clawmessenger status --json` 查看。
+- 一个受支持的平台都没有检测到时，`pair` 以 `pairing_no_candidates` 失败（退出码 2）。先执行 `quukk-clawmessenger rescan` 检查各平台是否已安装并登录。
+
+#### 需要网页设置时的端口转发
+
+只有在必须使用本地 Setup 页面（例如逐个查看平台能力、通过页面修改授权目录）时才需要下面这套流程。
+
+本地 Setup 页面只监听 `127.0.0.1`，端口每次启动随机分配，地址中的启动票据有效期只有 30 秒。无头设备按以下顺序操作。
+
+**第一步：读取本次启动的端口**
+
+服务需要处于运行状态（`pair` 或 `setup --no-open` 都会启动它）。端口每次启动随机分配，用下面的命令读取：
+
+```bash
+quukk-clawmessenger doctor --json
+```
+
+从输出中取 `service.port`。人类可读输出等价于 `quukk-clawmessenger doctor` 里的 `port=<端口>`。
+
+**第二步：建立 SSH 端口转发**
+
+在你有浏览器的设备上执行。本地端口必须与服务器端口一致，因为服务端只接受 `Host: 127.0.0.1:<端口>`：
+
+```bash
+ssh -L <端口>:127.0.0.1:<端口> <用户名>@<linux-host>
+```
+
+**第三步：截取 Setup 页面地址**
+
+在服务器上临时放一个 `xdg-open` 包装脚本，然后再次执行 `setup`。第二次执行不要带任何配置参数，否则会因为服务已在运行而报 `already_running_with_overrides`：
+
+```bash
+mkdir -p "$HOME/bin"
+cat > "$HOME/bin/xdg-open" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$1" > "$HOME/setup-url.txt"
+EOF
+chmod +x "$HOME/bin/xdg-open"
+
+PATH="$HOME/bin:$PATH" quukk-clawmessenger setup
+cat "$HOME/setup-url.txt"
+```
+
+**第四步：在 30 秒内打开页面**
+
+把上一步输出的 `http://127.0.0.1:<端口>/setup#ticket=...` **原样**粘贴到第二步那台设备的浏览器里。端口和票据都不能改动，端口与转发端口不一致会被服务端拒绝。
+
+完成后请删除 `$HOME/bin/xdg-open`，并清理 `$HOME/setup-url.txt`。
+
+本地 Setup 页面只能从运行该服务的设备访问。远程服务器不应把 `127.0.0.1` 监听地址直接暴露出去；如果不想在无头设备上执行上述步骤，请在具备本地浏览器的受信任设备上完成 Setup。
+
+自动启动条目在 Linux 上是 XDG `.desktop`（`$XDG_CONFIG_HOME/autostart/`），没有桌面会话时不会生效。需要长期值守的无头服务器请自行用 `systemd` 托管 `quukk-clawmessenger start --foreground --no-open`，而不要依赖该条目。
 
 ## 4. 检查智能体平台
 
@@ -175,6 +239,8 @@ quukk-clawmessenger rescan --json
 ### 点击生成配对码后显示服务端接口不可用
 
 如果显示 `pairing_api_unavailable` 或“服务端尚未部署新版配对接口”，客户端和服务端版本不匹配。请先确认目标环境已经部署配对 v2 接口，再重新启动本地服务。
+
+默认服务端地址跟随发行渠道：版本号带预发布后缀的包（如 `1.2.3-beta.1`）默认使用测试环境 `https://newsradar.dreamdt.cn/im-test`，正式版（如 `1.2.3`）默认使用 `https://newsradar.dreamdt.cn/im`。如果 `config.json` 里存的恰好是另一个渠道的默认地址，会被当作当前渠道的默认地址读取，文件本身不会被改写；手工填写的其它地址保持不变。需要跨渠道连接时，用 `--server-url` 显式指定。
 
 ### 显示 `operation_unavailable`
 

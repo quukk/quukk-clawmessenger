@@ -97,6 +97,11 @@ export function RuntimeCard({
       </CardHeader>
       <CardContent className="grid gap-3">
         <p className="text-body text-muted-foreground">{guidance(runtime, t)}</p>
+        {runtime.interactiveUnavailableReason ? (
+          <p className="text-caption text-muted-foreground">
+            {t('runtime.interactiveUnavailable', { reason: runtime.interactiveUnavailableReason })}
+          </p>
+        ) : null}
         {runtime.version || runtime.path ? (
           <dl className="grid gap-1 text-caption text-muted-foreground">
             {runtime.version ? (

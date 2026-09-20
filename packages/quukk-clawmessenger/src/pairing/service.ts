@@ -54,6 +54,13 @@ export type PairingSessionState =
   | 'cancelled'
   | 'expired';
 
+export class PairingServiceError extends Error {
+  constructor(readonly code: 'pairing_no_candidates') {
+    super(code);
+    this.name = 'PairingServiceError';
+  }
+}
+
 type PairingBindingPort = {
   list(): readonly RuntimeBinding[];
   enablePairingSelection(input: PairingSelectionInput, signal?: AbortSignal): Promise<EnableResult>;
@@ -312,7 +319,7 @@ export class PairingService {
     if (this.#privateSession !== undefined) await this.cancel();
     const catalog = await this.#runtimeSource.runtimes();
     const trusted = catalog.filter(validRuntime);
-    if (trusted.length === 0) throw new Error('pairing_no_candidates');
+    if (trusted.length === 0) throw new PairingServiceError('pairing_no_candidates');
     const currentBindings = this.#bindings.list();
     const candidates: PairingCandidate[] = [];
     const candidateToRuntime = new Map<string, string>();

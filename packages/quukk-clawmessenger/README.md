@@ -36,6 +36,70 @@ For a terminal-only host, CI, or an environment where a browser must not open:
 quukk-clawmessenger setup --no-open
 ```
 
+A headless Linux server has no usable `xdg-open`, so a plain `setup` fails with
+`browser_open_failed`. The local page is not required for pairing: print a one-time code in the
+terminal instead.
+
+```bash
+quukk-clawmessenger pair \
+  --server-url "https://YOUR-SERVER.example/YOUR-SERVICE-PREFIX" \
+  --workdir "$HOME/AI-Workspace" \
+  --authorized-work-root "$HOME/AI-Workspace"
+```
+
+```text
+quukk-clawmessenger: pair waiting
+pairing_code=ABCDEF23
+expires_at=2026-09-18T12:00:00.000Z
+server=https://YOUR-SERVER.example/YOUR-SERVICE-PREFIX
+Enter the code in ClawMessenger under Remote devices > Add device.
+```
+
+`pair` starts the local service when it is not already running, never opens a browser, and never
+prints the local page address. Re-running it keeps a live session instead of invalidating the code
+you already printed; pass `--new` to discard a live session and start a fresh one. `pair --json`
+emits a single machine-readable object, and `quukk-clawmessenger status --json` reports binding
+progress. With no supported agent platform detected, `pair` fails with `pairing_no_candidates`
+(exit code 2); run `quukk-clawmessenger rescan` first.
+
+If you must use the local setup page, forward its port instead. The page listens only on
+`127.0.0.1`, the port is chosen at random on every start, and the launch ticket lives 30 seconds, so
+use this order:
+
+**Step 1:** make sure the service is running (`pair` or `setup --no-open` starts it), then read
+`service.port` from `quukk-clawmessenger doctor --json`.
+
+**Step 2:** on a device with a browser, forward that port. The local port must match the server
+port, because the service only accepts `Host: 127.0.0.1:<port>`:
+
+```bash
+ssh -L <port>:127.0.0.1:<port> <user>@<linux-host>
+```
+
+**Step 3:** on the server, place a temporary `xdg-open` wrapper so the URL can be captured, then run
+`setup` again. Pass no configuration option on the second run, or it fails with
+`already_running_with_overrides`:
+
+```bash
+mkdir -p "$HOME/bin"
+cat > "$HOME/bin/xdg-open" <<'EOF'
+#!/bin/sh
+echo "$1" > "$HOME/setup-url.txt"
+EOF
+chmod +x "$HOME/bin/xdg-open"
+
+PATH="$HOME/bin:$PATH" quukk-clawmessenger setup
+cat "$HOME/setup-url.txt"
+```
+
+**Step 4:** open the printed `http://127.0.0.1:<port>/setup#ticket=...` URL on the browser device
+within 30 seconds. The launch ticket is short-lived, and the port and the ticket must both be used
+unchanged.
+
+Delete `$HOME/bin/xdg-open` and `$HOME/setup-url.txt` afterwards. The Linux autostart entry is an
+XDG `.desktop` file under `$XDG_CONFIG_HOME/autostart/` and does nothing without a desktop session;
+run `quukk-clawmessenger start --foreground --no-open` under a supervisor such as `systemd` instead.
+
 The npm `postinstall` hook only launches setup for a global install in an interactive desktop
 session. It does not register an agent, wait for input, or download an executable. CI, local
 installs, non-desktop sessions, and `QUUKK_CLAWMESSENGER_NO_OPEN=1` receive only a setup hint.
@@ -112,6 +176,7 @@ retain the existing CLI adapter.
 | Command | Purpose |
 | --- | --- |
 | `quukk-clawmessenger setup` | Start the local service and open the setup page. |
+| `quukk-clawmessenger pair` | Print a one-time pairing code; add `--new` to restart a live session. |
 | `quukk-clawmessenger start` | Start the local service; add `--foreground` to keep it attached. |
 | `quukk-clawmessenger stop` | Gracefully stop verified workers and the local service. |
 | `quukk-clawmessenger status` | Show whether the verified local service is ready. |
@@ -156,9 +221,12 @@ Quukk keeps its data separate from Multica and the legacy single-provider bridge
 | RongCloud SDK state | `rongcloud/<runtimeId>/` | `rongcloud\<runtimeId>\` |
 
 Configuration precedence is CLI options, then `QUUKK_CLAWMESSENGER_*` environment variables,
-then `config.json`, then built-in defaults. The default server URL is
-`https://newsradar.dreamdt.cn/im`. `config.json` never stores RongCloud tokens or the per-install
-Bridge secret.
+then `config.json`, then built-in defaults. The built-in server URL follows the release channel: a
+version with a prerelease suffix (such as `1.2.3-beta.1`) defaults to the test environment
+`https://newsradar.dreamdt.cn/im-test`, while a plain version (such as `1.2.3`) defaults to
+`https://newsradar.dreamdt.cn/im`. A `config.json` that still stores the other channel's default is
+read as the running channel's default; any other explicit server URL is kept unchanged.
+`config.json` never stores RongCloud tokens or the per-install Bridge secret.
 
 ## Legacy migration in this beta
 

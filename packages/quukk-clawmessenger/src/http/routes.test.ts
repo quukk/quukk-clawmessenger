@@ -9,6 +9,7 @@ import {
   type ActivityResponse,
   type BindingMutationResponse,
   type ControlStatusResponse,
+  type ControlPairingResponse,
   type DiagnosticsResponse,
   type EnableResponse,
   type LocalApiPort,
@@ -19,6 +20,7 @@ import {
 } from './routes.js';
 import { BrowserSessionStore, securityHeaders } from './security.js';
 import { LaunchTicketStore } from './tickets.js';
+import { PairingServiceError } from '../pairing/service.js';
 
 const INSTANCE_ID = `svc_${'a'.repeat(32)}`;
 const CONTROL_CREDENTIAL = Buffer.alloc(32, 9).toString('base64url');
@@ -49,6 +51,7 @@ const runtimes: RuntimesResponse = {
       textEvents: index === 0,
       toolEvents: index === 0,
       approvalEvents: false as const,
+      interactiveRounds: index === 0,
     },
     binding: index === 0 ? {
       runtimeId: RUNTIME_ID,
@@ -80,7 +83,10 @@ const diagnostics: DiagnosticsResponse = {
     listenHost: '127.0.0.1', port: 43210, uptimeMs: 10,
   },
   bridge: { state: 'ready', pid: 4243, version: '0.1.0', startedAt: TIME, probeStatus: 'ready' },
-  runtimes: [{ provider: 'opencode', status: 'ready', version: '1.2.3', executableName: 'opencode.exe' }],
+  runtimes: [{
+    provider: 'opencode', status: 'ready', version: '1.2.3', executableName: 'opencode.exe',
+    interactiveRounds: true,
+  }],
   workers: [{ runtimeId: RUNTIME_ID, state: 'online', restartCount: 0 }],
   warnings: [],
   logging: { dropped: 0, retained: 1 },
@@ -120,6 +126,11 @@ const pairingCancelled = {
   pairingCode: null,
   qrContent: null,
 };
+const controlPairing: ControlPairingResponse = {
+  schemaVersion: 1,
+  serverUrl: DEFAULT_CONFIG.serverUrl,
+  pairing: pairingWaiting,
+};
 
 class FakeApi implements LocalApiPort {
   readonly calls: string[] = [];
@@ -154,8 +165,17 @@ class FakeApi implements LocalApiPort {
 
 class FakeControl implements LocalControlPort {
   readonly calls: string[] = [];
+  failure?: Error;
   async status(): Promise<ControlStatusResponse> { this.calls.push('status'); return status; }
   async rescan(): Promise<RuntimesResponse> { this.calls.push('rescan'); return runtimes; }
+  async controlPairingStatus(): Promise<ControlPairingResponse> {
+    this.calls.push('pairing_status'); return controlPairing;
+  }
+  async controlPairingStart(): Promise<ControlPairingResponse> {
+    this.calls.push('pairing_start');
+    if (this.failure !== undefined) throw this.failure;
+    return controlPairing;
+  }
   shutdownAfterResponse(): void { this.calls.push('shutdown'); }
 }
 
@@ -638,7 +658,7 @@ describe('LocalRoutes internal control boundary', () => {
     expect(value.control.calls).toEqual([]);
   });
 
-  it('provides only the four fixed commands and defers shutdown until the response finishes', async () => {
+  it('provides only the fixed commands and defers shutdown until the response finishes', async () => {
     const value = await harness();
     const send = (command: string) => value.send({ method: 'POST', path: '/internal/control', headers: auth, body: JSON.stringify({ command }) });
     const statusResponse = await send('status');
@@ -648,15 +668,37 @@ describe('LocalRoutes internal control boundary', () => {
     expect(ticket.status).toBe(201);
     expect(ticket.json).toEqual({ schemaVersion: 1, ticket: expect.stringMatching(/^[\w-]{43}$/), expiresAt: expect.any(Number) });
     expect((await send('rescan')).json).toEqual(runtimes);
+    const pairingStatus = await send('pairing_status');
+    expect(pairingStatus.status).toBe(200);
+    expect(pairingStatus.json).toEqual(controlPairing);
+    const pairingStart = await send('pairing_start');
+    expect(pairingStart.status).toBe(200);
+    expect(pairingStart.json).toEqual(controlPairing);
     const shutdown = await send('shutdown');
     expect(shutdown.status).toBe(202);
     expect(shutdown.json).toEqual({ schemaVersion: 1, accepted: true });
     await new Promise((resolve) => setImmediate(resolve));
-    expect(value.control.calls).toEqual(['status', 'rescan', 'shutdown']);
+    expect(value.control.calls).toEqual(['status', 'rescan', 'pairing_status', 'pairing_start', 'shutdown']);
 
     const invalid = await send('health');
     expect(invalid.status).toBe(400);
-    expect(value.control.calls).toEqual(['status', 'rescan', 'shutdown']);
+    expect(value.control.calls).toEqual(['status', 'rescan', 'pairing_status', 'pairing_start', 'shutdown']);
+  });
+
+  it('maps a declared pairing failure to its status instead of an internal error', async () => {
+    const value = await harness();
+    value.control.failure = new PairingServiceError('pairing_no_candidates');
+
+    const response = await value.send({
+      method: 'POST', path: '/internal/control', headers: auth,
+      body: JSON.stringify({ command: 'pairing_start' }),
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.json).toEqual({
+      error: { code: 'pairing_no_candidates', category: 'detection', retryable: false },
+    });
+    expect(value.control.calls).toEqual(['pairing_start']);
   });
 
   it('rejects wrong content type, oversized internal JSON, and extra command keys', async () => {

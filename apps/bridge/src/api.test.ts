@@ -359,6 +359,7 @@ describe('local bridge API client', () => {
                 textEvents: true,
                 toolEvents: true,
                 approvalEvents: false,
+                interactiveRounds: true,
               },
               binding: {
                 runtimeId,
@@ -369,6 +370,7 @@ describe('local bridge API client', () => {
                 updatedAt: '2026-08-27T00:00:00.000Z',
               },
               worker: { state: 'online', restartCount: 0 },
+              credentialMode: 'legacy',
             },
             ...(['openclaw', 'codex', 'hermes'] as const).map((provider) => ({
               provider,
@@ -382,9 +384,11 @@ describe('local bridge API client', () => {
                 textEvents: false,
                 toolEvents: false,
                 approvalEvents: false,
+                interactiveRounds: false,
               },
               binding: null,
               worker: null,
+              credentialMode: null,
             })),
           ],
         }),
@@ -457,6 +461,8 @@ describe('local bridge API client', () => {
       provider: 'opencode',
       binding: { enabled: true, registrationState: 'online' },
       worker: { state: 'online', restartCount: 0 },
+      credentialMode: 'legacy',
+      capabilities: { interactiveRounds: true },
     });
     await expect(api.getSettings()).resolves.toMatchObject({
       serverUrl: 'https://example.test/im',
@@ -546,6 +552,7 @@ describe('local bridge API client', () => {
       textEvents: true,
       toolEvents: true,
       approvalEvents: false,
+      interactiveRounds: true,
     };
     const binding = {
       runtimeId,
@@ -564,6 +571,7 @@ describe('local bridge API client', () => {
       capabilities,
       binding: null,
       worker: null,
+      credentialMode: null,
     });
     const payloads = [
       {
@@ -575,6 +583,7 @@ describe('local bridge API client', () => {
         capabilities,
         binding: { ...binding, runtimeId: otherRuntimeId },
         worker: { state: 'online', restartCount: 0 },
+        credentialMode: 'legacy',
       },
       {
         provider: 'opencode',
@@ -585,6 +594,7 @@ describe('local bridge API client', () => {
         capabilities,
         binding,
         worker: null,
+        credentialMode: null,
       },
       {
         provider: 'opencode',
@@ -595,6 +605,7 @@ describe('local bridge API client', () => {
         capabilities,
         binding: null,
         worker: { state: 'online', restartCount: 0 },
+        credentialMode: null,
       },
     ];
     const fetch = vi.fn<typeof globalThis.fetch>().mockImplementation(async () =>

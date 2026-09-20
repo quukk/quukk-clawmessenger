@@ -29,6 +29,7 @@ const emptyRuntimes: RuntimesResponse = {
     status: 'not_found' as const,
     capabilities: {
       sessionResume: false, cancel: false, textEvents: false, toolEvents: false, approvalEvents: false,
+      interactiveRounds: false,
     },
     binding: null,
     credentialMode: null,
