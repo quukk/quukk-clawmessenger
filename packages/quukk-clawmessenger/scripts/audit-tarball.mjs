@@ -384,7 +384,7 @@ async function auditReport(value, packageDirectory, knownCheckoutRoots) {
     const platform = platformIdentity(record.name);
     const entry = record.name === 'quukk-clawmessenger';
     if (!entry && platform === undefined) fail('unexpected_package');
-    const platformBinary = platform?.platform === 'win32' ? 'multica.exe' : 'multica';
+    const platformBinary = platform?.platform === 'win32' ? 'clawmessenger-runtime.exe' : 'clawmessenger-runtime';
     const required = entry
       ? [...ENTRY_EXACT_FILES]
       : [

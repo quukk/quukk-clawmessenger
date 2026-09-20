@@ -10,7 +10,7 @@ import { RUNTIME_VERSION } from '../version.js';
 
 const MANIFEST_LIMIT = 64 << 10;
 
-export type BridgeRuntimePackage = { packageName: string; binary: 'multica.exe' | 'multica' };
+export type BridgeRuntimePackage = { packageName: string; binary: 'clawmessenger-runtime.exe' | 'clawmessenger-runtime' };
 
 export type BridgeBinaryErrorCode =
   | 'unsupported_platform'
@@ -52,34 +52,34 @@ const ManifestSchema = z.strictObject({
   goVersion: z.string().regex(/^go1\.[1-9]\d*(?:\.(?:0|[1-9]\d*))?(?:[a-z]+\d*)?$/),
   sourceCommit: z.string().regex(/^[0-9a-f]{40}$/),
   sha256: z.string().regex(/^[0-9a-f]{64}$/),
-  binary: z.enum(['multica.exe', 'multica']),
+  binary: z.enum(['clawmessenger-runtime.exe', 'clawmessenger-runtime']),
   modules: z.array(z.string().regex(/^[^\s@]+@v[^\s@]+$/)).min(1).max(256),
 });
 
 const packageMatrix: Record<string, BridgeRuntimePackage> = {
   'win32/x64': {
     packageName: '@quukk/clawmessenger-runtime-win32-x64',
-    binary: 'multica.exe',
+    binary: 'clawmessenger-runtime.exe',
   },
   'win32/arm64': {
     packageName: '@quukk/clawmessenger-runtime-win32-arm64',
-    binary: 'multica.exe',
+    binary: 'clawmessenger-runtime.exe',
   },
   'darwin/x64': {
     packageName: '@quukk/clawmessenger-runtime-darwin-x64',
-    binary: 'multica',
+    binary: 'clawmessenger-runtime',
   },
   'darwin/arm64': {
     packageName: '@quukk/clawmessenger-runtime-darwin-arm64',
-    binary: 'multica',
+    binary: 'clawmessenger-runtime',
   },
   'linux/x64': {
     packageName: '@quukk/clawmessenger-runtime-linux-x64',
-    binary: 'multica',
+    binary: 'clawmessenger-runtime',
   },
   'linux/arm64': {
     packageName: '@quukk/clawmessenger-runtime-linux-arm64',
-    binary: 'multica',
+    binary: 'clawmessenger-runtime',
   },
 };
 

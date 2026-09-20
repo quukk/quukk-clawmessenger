@@ -1,4 +1,4 @@
-import { join, resolve } from 'node:path';
+﻿import { join, resolve } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
 
@@ -20,7 +20,7 @@ function manifest(overrides: Record<string, unknown> = {}): Record<string, unkno
     goVersion: 'go1.26.6',
     sourceCommit: 'a'.repeat(40),
     sha256: abcSHA256,
-    binary: 'multica.exe',
+    binary: 'clawmessenger-runtime.exe',
     modules: [
       'github.com/go-chi/chi/v5@v5.3.0',
       'github.com/gorilla/websocket@v1.5.3',
@@ -56,12 +56,12 @@ describe('bridgeRuntimePackage', () => {
       bridgeRuntimePackage('linux', 'x64'),
       bridgeRuntimePackage('linux', 'arm64'),
     ]).toEqual([
-      { packageName: '@quukk/clawmessenger-runtime-win32-x64', binary: 'multica.exe' },
-      { packageName: '@quukk/clawmessenger-runtime-win32-arm64', binary: 'multica.exe' },
-      { packageName: '@quukk/clawmessenger-runtime-darwin-x64', binary: 'multica' },
-      { packageName: '@quukk/clawmessenger-runtime-darwin-arm64', binary: 'multica' },
-      { packageName: '@quukk/clawmessenger-runtime-linux-x64', binary: 'multica' },
-      { packageName: '@quukk/clawmessenger-runtime-linux-arm64', binary: 'multica' },
+      { packageName: '@quukk/clawmessenger-runtime-win32-x64', binary: 'clawmessenger-runtime.exe' },
+      { packageName: '@quukk/clawmessenger-runtime-win32-arm64', binary: 'clawmessenger-runtime.exe' },
+      { packageName: '@quukk/clawmessenger-runtime-darwin-x64', binary: 'clawmessenger-runtime' },
+      { packageName: '@quukk/clawmessenger-runtime-darwin-arm64', binary: 'clawmessenger-runtime' },
+      { packageName: '@quukk/clawmessenger-runtime-linux-x64', binary: 'clawmessenger-runtime' },
+      { packageName: '@quukk/clawmessenger-runtime-linux-arm64', binary: 'clawmessenger-runtime' },
     ]);
   });
 
@@ -129,7 +129,7 @@ describe('resolveBridgeBinary', () => {
       ['oversize manifest', { readFile: async () => Buffer.alloc((64 << 10) + 1, 0x20) }],
       ['unknown field', { readFile: async () => Buffer.from(JSON.stringify(manifest({ extra: true }))) }],
       ['manifest version', { readFile: async () => Buffer.from(JSON.stringify(manifest({ version: '9.9.9' }))) }],
-      ['filename', { readFile: async () => Buffer.from(JSON.stringify(manifest({ binary: '../multica.exe' }))) }],
+      ['filename', { readFile: async () => Buffer.from(JSON.stringify(manifest({ binary: '../clawmessenger-runtime.exe' }))) }],
       ['source commit', { readFile: async () => Buffer.from(JSON.stringify(manifest({ sourceCommit: 'abc' }))) }],
       ['go version', { readFile: async () => Buffer.from(JSON.stringify(manifest({ goVersion: 'devel' }))) }],
       ['digest shape', { readFile: async () => Buffer.from(JSON.stringify(manifest({ sha256: 'A'.repeat(64) }))) }],
@@ -179,7 +179,7 @@ describe('resolveBridgeBinary', () => {
     await expect(
       resolveBridgeBinary(dependencies({ resolvePackageRoot, readFile, readBinary })),
     ).resolves.toEqual({
-      path: join(runtimeRoot, 'multica.exe'),
+      path: join(runtimeRoot, 'clawmessenger-runtime.exe'),
       packageName: '@quukk/clawmessenger-runtime-win32-x64',
       version,
       sha256: abcSHA256,
@@ -188,6 +188,6 @@ describe('resolveBridgeBinary', () => {
       '@quukk/clawmessenger-runtime-win32-x64',
     );
     expect(readFile).toHaveBeenCalledWith(join(runtimeRoot, 'manifest.json'), 64 << 10);
-    expect(readBinary).toHaveBeenCalledWith(join(runtimeRoot, 'multica.exe'));
+    expect(readBinary).toHaveBeenCalledWith(join(runtimeRoot, 'clawmessenger-runtime.exe'));
   });
 });

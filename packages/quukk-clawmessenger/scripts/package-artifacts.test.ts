@@ -287,7 +287,7 @@ const ENTRY_FILES = [...new Set([
 
 const PLATFORM_FILES = [
   'package.json',
-  'multica.exe',
+  'clawmessenger-runtime.exe',
   'manifest.json',
   'LICENSE',
   'NOTICE',
@@ -436,9 +436,9 @@ async function platformFixture(): Promise<EntryFixture> {
             sourceCommit: 'a'.repeat(40),
             modules: PLATFORM_MODULES,
             sha256: createHash('sha256').update(binary).digest('hex'),
-            binary: 'multica.exe',
+            binary: 'clawmessenger-runtime.exe',
           })
-        : path === 'multica.exe'
+        : path === 'clawmessenger-runtime.exe'
           ? binary
         : path === 'GO_THIRD_PARTY_NOTICES.md'
           ? `# Go Third-Party Notices\n\n- Go standard library/runtime \`go1.26.6\`\n- \`${PLATFORM_MODULES[0]}\`\n`
@@ -630,7 +630,7 @@ describe('audit-tarball', () => {
 
   it.each([
     [{ os: ['linux'] }, 'manifest_invalid'],
-    [{ files: ['multica.exe'] }, 'manifest_invalid'],
+    [{ files: ['clawmessenger-runtime.exe'] }, 'manifest_invalid'],
     [{ private: false }, 'manifest_invalid'],
     [{ scripts: {} }, 'manifest_invalid'],
   ])('rejects an invalid platform package manifest override %j', async (override, code) => {
@@ -690,7 +690,7 @@ describe('audit-tarball', () => {
   it('allows the fixed Linuxbrew installation prefix embedded in a runtime binary', async () => {
     const fixture = await platformFixture();
     const binary = Buffer.from('runtime prefix /home/linuxbrew/.linuxbrew/bin/brew\n');
-    await writeFile(join(fixture.entry, 'multica.exe'), binary);
+    await writeFile(join(fixture.entry, 'clawmessenger-runtime.exe'), binary);
     const manifestPath = join(fixture.entry, 'manifest.json');
     const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
     manifest.sha256 = createHash('sha256').update(binary).digest('hex');

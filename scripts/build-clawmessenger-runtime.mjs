@@ -51,12 +51,12 @@ export const RUNTIME_SOURCE_DOCUMENT = [
 
 const TARGETS = new Map(
   [
-    ['win32', 'x64', 'windows', 'amd64', 'multica.exe'],
-    ['win32', 'arm64', 'windows', 'arm64', 'multica.exe'],
-    ['darwin', 'x64', 'darwin', 'amd64', 'multica'],
-    ['darwin', 'arm64', 'darwin', 'arm64', 'multica'],
-    ['linux', 'x64', 'linux', 'amd64', 'multica'],
-    ['linux', 'arm64', 'linux', 'arm64', 'multica'],
+    ['win32', 'x64', 'windows', 'amd64', 'clawmessenger-runtime.exe'],
+    ['win32', 'arm64', 'windows', 'arm64', 'clawmessenger-runtime.exe'],
+    ['darwin', 'x64', 'darwin', 'amd64', 'clawmessenger-runtime'],
+    ['darwin', 'arm64', 'darwin', 'arm64', 'clawmessenger-runtime'],
+    ['linux', 'x64', 'linux', 'amd64', 'clawmessenger-runtime'],
+    ['linux', 'arm64', 'linux', 'arm64', 'clawmessenger-runtime'],
   ].map(([platform, arch, goos, goarch, binary]) => {
     const directory = `quukk-clawmessenger-runtime-${platform}-${arch}`;
     return [

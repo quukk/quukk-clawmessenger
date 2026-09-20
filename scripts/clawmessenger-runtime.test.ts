@@ -22,8 +22,8 @@ import {
 } from './build-clawmessenger-runtime.mjs';
 import { verifyRuntimePackage } from './verify-clawmessenger-runtime.mjs';
 
-const VERSION = '0.1.0-beta.7';
-const ENTRY_VERSION = '0.1.0-beta.15';
+const VERSION = '0.1.0-beta.8';
+const ENTRY_VERSION = '0.1.0-beta.21';
 const SOURCE_COMMIT = 'a'.repeat(40);
 const MODULES = [
   'github.com/example/common@v1.2.3',
@@ -186,7 +186,7 @@ describe('runtime build target selection', () => {
         arch: 'x64',
         goos: 'windows',
         goarch: 'amd64',
-        binary: 'multica.exe',
+        binary: 'clawmessenger-runtime.exe',
         directory: 'quukk-clawmessenger-runtime-win32-x64',
         packageName: '@quukk/clawmessenger-runtime-win32-x64',
       },
@@ -195,7 +195,7 @@ describe('runtime build target selection', () => {
         arch: 'arm64',
         goos: 'windows',
         goarch: 'arm64',
-        binary: 'multica.exe',
+        binary: 'clawmessenger-runtime.exe',
         directory: 'quukk-clawmessenger-runtime-win32-arm64',
         packageName: '@quukk/clawmessenger-runtime-win32-arm64',
       },
@@ -204,7 +204,7 @@ describe('runtime build target selection', () => {
         arch: 'x64',
         goos: 'darwin',
         goarch: 'amd64',
-        binary: 'multica',
+        binary: 'clawmessenger-runtime',
         directory: 'quukk-clawmessenger-runtime-darwin-x64',
         packageName: '@quukk/clawmessenger-runtime-darwin-x64',
       },
@@ -213,7 +213,7 @@ describe('runtime build target selection', () => {
         arch: 'arm64',
         goos: 'darwin',
         goarch: 'arm64',
-        binary: 'multica',
+        binary: 'clawmessenger-runtime',
         directory: 'quukk-clawmessenger-runtime-darwin-arm64',
         packageName: '@quukk/clawmessenger-runtime-darwin-arm64',
       },
@@ -222,7 +222,7 @@ describe('runtime build target selection', () => {
         arch: 'x64',
         goos: 'linux',
         goarch: 'amd64',
-        binary: 'multica',
+        binary: 'clawmessenger-runtime',
         directory: 'quukk-clawmessenger-runtime-linux-x64',
         packageName: '@quukk/clawmessenger-runtime-linux-x64',
       },
@@ -231,7 +231,7 @@ describe('runtime build target selection', () => {
         arch: 'arm64',
         goos: 'linux',
         goarch: 'arm64',
-        binary: 'multica',
+        binary: 'clawmessenger-runtime',
         directory: 'quukk-clawmessenger-runtime-linux-arm64',
         packageName: '@quukk/clawmessenger-runtime-linux-arm64',
       },
@@ -335,14 +335,14 @@ describe('buildRuntime', () => {
     );
     expect(result).toEqual({
       packageDirectory: expectedDirectory,
-      binaryPath: join(expectedDirectory, 'multica.exe'),
+      binaryPath: join(expectedDirectory, 'clawmessenger-runtime.exe'),
       manifest: {
         version: VERSION,
         goVersion: 'go1.26.6',
         sourceCommit: SOURCE_COMMIT,
         modules: MODULES,
         sha256: '24b177832d55e5d95f2aad204a2d6575ebdf1deca301df7df25ce55cf90f5530',
-        binary: 'multica.exe',
+        binary: 'clawmessenger-runtime.exe',
       },
     });
     await expect(readFile(join(expectedDirectory, 'manifest.json'), 'utf8')).resolves.toBe(
@@ -381,7 +381,7 @@ describe('buildRuntime', () => {
         '-ldflags',
         `-s -w -X main.version=${VERSION} -X main.commit=${SOURCE_COMMIT} -X main.date=2026-08-27T12:34:56Z`,
         '-o',
-        join(expectedDirectory, 'multica.exe'),
+        join(expectedDirectory, 'clawmessenger-runtime.exe'),
         './cmd/multica',
       ],
       options: expect.objectContaining({
@@ -464,7 +464,7 @@ describe('buildRuntime', () => {
         root,
         'packages',
         'quukk-clawmessenger-runtime-win32-x64',
-        'multica.exe',
+        'clawmessenger-runtime.exe',
       ),
       'junction',
     );
@@ -531,7 +531,7 @@ describe('verifyRuntimePackage', () => {
       platform: 'win32',
       arch: 'x64',
       version: VERSION,
-      binary: 'multica.exe',
+      binary: 'clawmessenger-runtime.exe',
       sha256: '24b177832d55e5d95f2aad204a2d6575ebdf1deca301df7df25ce55cf90f5530',
       sourceCommit: SOURCE_COMMIT,
       goVersion: 'go1.26.6',
@@ -599,7 +599,7 @@ describe('verifyRuntimePackage', () => {
           const manifest = JSON.parse(
             await readFile(join(packageDirectory, 'manifest.json'), 'utf8'),
           );
-          manifest.binary = '../multica.exe';
+          manifest.binary = '../clawmessenger-runtime.exe';
           await writeFile(join(packageDirectory, 'manifest.json'), JSON.stringify(manifest));
         },
         error: /binary filename/,
@@ -607,7 +607,7 @@ describe('verifyRuntimePackage', () => {
       {
         name: 'tampered binary',
         mutate: async (packageDirectory) => {
-          await writeFile(join(packageDirectory, 'multica.exe'), 'different');
+          await writeFile(join(packageDirectory, 'clawmessenger-runtime.exe'), 'different');
         },
         error: /SHA-256/,
       },
@@ -647,7 +647,7 @@ describe('verifyRuntimePackage', () => {
       ['homepage', (value) => { value.homepage = 'https://example.invalid'; }],
       ['os', (value) => { value.os = ['linux']; }],
       ['cpu', (value) => { value.cpu = ['arm64']; }],
-      ['files', (value) => { value.files = ['multica.exe']; }],
+      ['files', (value) => { value.files = ['clawmessenger-runtime.exe']; }],
       ['publishConfig access', (value) => {
         value.publishConfig = { access: 'restricted', provenance: true };
       }],

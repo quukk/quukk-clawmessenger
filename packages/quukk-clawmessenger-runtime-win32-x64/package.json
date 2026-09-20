@@ -1,6 +1,6 @@
 {
   "name": "@quukk/clawmessenger-runtime-win32-x64",
-  "version": "0.1.0-beta.7",
+  "version": "0.1.0-beta.8",
   "description": "Multica Bridge runtime for Quukk ClawMessenger on Windows x64",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -11,7 +11,7 @@
   "bugs": { "url": "https://github.com/quukk/quukk-clawmessenger/issues" },
   "homepage": "https://github.com/quukk/quukk-clawmessenger/tree/main/packages/quukk-clawmessenger-runtime-win32-x64#readme",
   "files": [
-    "multica.exe",
+    "clawmessenger-runtime.exe",
     "manifest.json",
     "LICENSE",
     "NOTICE",
