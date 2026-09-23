@@ -41,6 +41,16 @@ quukk-clawmessenger setup
 
 若升级时仍出现 `EPERM`，确认所有旧的 `quukk-clawmessenger` 和 `multica` 进程已经退出，再重新执行安装。不要手工删除仍被进程占用的 npm 目录。
 
+### Linux 升级后注意可执行权限
+
+Linux 上全局安装或升级时，如果 npm 的 lifecycle 脚本被安全策略拦截（安装输出出现 `postinstall blocked` / `allow-scripts` 相关警告），新解包的本地运行时二进制可能没有可执行权限，导致服务无法启动。现象与处理见第 9 节「Linux 上 `status` 一直显示 `starting`，或 `start`/`setup`/`pair` 报 `unsafe_identity`」。
+
+安装时可直接放行本包的 postinstall，避免该问题：
+
+```bash
+npm install -g --allow-scripts=quukk-clawmessenger quukk-clawmessenger@beta
+```
+
 ### Windows 命令无输出时
 
 部分 Windows、NVM 或 PATH 组合可能没有正确执行全局命令包装器。可以先解析真实脚本路径，再直接用 Node.js 启动：
@@ -289,6 +299,55 @@ Windows PowerShell 示例：
 ```powershell
 Get-Content "$env:USERPROFILE\.quukk-clawmessenger\logs\bridge.log" -Tail 100
 ```
+
+### Linux 上 `status` 一直显示 `starting`，或 `start`/`setup`/`pair` 报 `unsafe_identity`
+
+最常见原因：npm 安装或升级时 lifecycle 脚本被拦截（如 `allow-scripts`），本地 Go 运行时二进制丢失可执行权限。daemon 每次启动即崩溃，进程身份残留在 `starting` 态，后续所有命令报 `unsafe_identity` 或 `operation_timeout`。
+
+按以下顺序修复：
+
+```bash
+# 1. 给运行时二进制补可执行权限（路径中的 node_modules 全局根可用 npm root -g 查询）
+chmod +x "$(npm root -g)/quukk-clawmessenger/node_modules/@quukk/clawmessenger-runtime-linux-x64/clawmessenger-runtime"
+
+# 2. 清掉残留的进程身份目录（内容仅为身份/恢复产物，重启自动重建）
+rm -rf "$HOME/.quukk-clawmessenger/run/"
+
+# 3. 重新启动并验证
+quukk-clawmessenger start --no-open
+quukk-clawmessenger status    # 期望 ready
+```
+
+如需确认根因，可前台启动查看真实报错：
+
+```bash
+rm -rf "$HOME/.quukk-clawmessenger/run/"
+quukk-clawmessenger start --foreground --no-open
+```
+
+输出 `Error: spawn ... clawmessenger-runtime EACCES` 即为权限问题。arm64 机器把路径中的 `linux-x64` 换成 `linux-arm64`。
+
+### 日志反复出现 `binding_capability_sync_failed`（`runtime_identity_changed`）
+
+`state.json` 中保存的绑定记录了注册时的运行时 ID 和可执行文件路径。当智能体 CLI 重装、路径变化（例如 `/root/.opencode/bin/opencode` 与 `/usr/bin/opencode` 并存，或记录里残留了错误平台的路径）时，本地探测到的新运行时与旧绑定对不上，每次启动都无法重新注册，Web 端capabilities 不更新、节点离线。
+
+处理方法：清除旧绑定后重新配对。
+
+```bash
+quukk-clawmessenger stop
+cp "$HOME/.quukk-clawmessenger/state.json" "$HOME/.quukk-clawmessenger/state.json.bak"
+cp "$HOME/.quukk-clawmessenger/credentials.json" "$HOME/.quukk-clawmessenger/credentials.json.bak"
+
+# 最干净的方式：删除状态与凭证文件（daemon 会自动重建全新空状态）
+rm -f "$HOME/.quukk-clawmessenger/state.json" "$HOME/.quukk-clawmessenger/credentials.json"
+rm -rf "$HOME/.quukk-clawmessenger/run/"
+
+quukk-clawmessenger setup
+quukk-clawmessenger start --no-open
+quukk-clawmessenger pair    # 重新拿配对码，在 Web 端重新绑定
+```
+
+服务端会按 MAC + 平台复用原有节点记录，重新配对后节点名称与能力自动刷新。用 `quukk-clawmessenger rescan --json` 可确认当前探测到的运行时 ID 与 `interactiveRounds` 能力。
 
 ## 10. 数据位置与安全要求
 

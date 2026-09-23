@@ -23,7 +23,10 @@ export interface DiscussionV3RouterOptions {
   send(payload: DiscussionV3Message): Promise<void>;
   now?: () => number;
   cancelTimeoutMs?: number;
+  deltaFlushMs?: number;
 }
+const DELTA_FLUSH_MS = 250;
+const DELTA_MERGE_MAX_CHARS = 2000;
 const REQUEST_TTL = 24 * 60 * 60 * 1000;
 function canonical(value: unknown): string {
   if (Array.isArray(value))
@@ -180,44 +183,96 @@ export class DiscussionV3Router {
         await state.updateInteractive(record.key, { status: 'running' });
       let output = '';
       let seq = 0;
-      for await (const event of task.events(record.taskId)) {
-        if (event.task_id !== record.taskId)
-          continue;
-        const current = await state.interactiveRequest(record.key);
-        if (!current || current.roundRevision !== command.roundRevision || current.requestId !== command.requestId)
-          continue;
-        const suppress = this.#disposed || current.status === 'cancel_pending' || current.status === 'terminal' || current.status === 'unconfirmed';
-        if (event.type === 'text_delta' && !suppress && event.text) {
-          output += event.text;
-          if (output.length > 100000)
-            throw new Error('output_too_large');
-          if (command.msg_type === 'discussion_assignment')
-            await this.#options.send({ ...discussionV3Identity(command), msg_type: 'discussion_contribution_delta', assignmentId: command.assignmentId, content: event.text, seq: seq++, idempotencyKey: discussionV3ResponseKey(command.requestId, `delta:${seq}`) });
+      let pendingDelta = '';
+      let deltaTimer: ReturnType<typeof setTimeout> | undefined;
+      let deltaRelease: (() => void) | undefined;
+      let deltaDrain = Promise.resolve();
+      const deltaFlushMs = this.#options.deltaFlushMs ?? DELTA_FLUSH_MS;
+      const flushDelta = (): void => {
+        if (deltaTimer) {
+          clearTimeout(deltaTimer);
+          deltaTimer = undefined;
         }
-        if (event.type === 'completed' || event.type === 'failed' || event.type === 'cancelled') {
-          if (event.type === 'failed' && event.error.category === 'stop_unconfirmed') {
-            await state.updateInteractive(record.key, { status: 'unconfirmed' });
-            return;
-          }
-          if (suppress) {
-            if (event.session_id)
-              await state.updateInteractive(record.key, {}, event.session_id);
-            return;
-          }
-          let response: DiscussionV3Message | null = null;
-          if (event.type === 'completed') {
-            output = event.output || output;
-            response = command.msg_type === 'discussion_host_turn' ? parseDiscussionV3Checkpoint(output, command)
-              : parseDiscussionV3({ ...discussionV3Identity(command), msg_type: 'discussion_contribution_completed', assignmentId: command.assignmentId, content: output, idempotencyKey: discussionV3ResponseKey(command.requestId, 'completed') });
-          }
-          if (!response)
-            response = this.#errorPayload(command, event.type === 'completed' ? 'invalid_response' : 'model_error', 'Runtime did not return a valid completed response');
-          await state.updateInteractive(record.key, { status: 'terminal', response: { ...response } }, event.session_id);
-          await this.#options.send(response);
+        if (!pendingDelta) {
+          deltaRelease?.();
+          deltaRelease = undefined;
           return;
         }
+        const text = pendingDelta;
+        pendingDelta = '';
+        seq += 1;
+        deltaDrain = deltaDrain.then(() => this.#options.send({ ...discussionV3Identity(command), msg_type: 'discussion_contribution_delta', assignmentId: (command as DiscussionV3Assignment).assignmentId, content: text, seq: seq - 1, idempotencyKey: discussionV3ResponseKey(command.requestId, `delta:${seq}`) }));
+        deltaRelease?.();
+        deltaRelease = undefined;
+      };
+      const discardDelta = (): void => {
+        if (deltaTimer) {
+          clearTimeout(deltaTimer);
+          deltaTimer = undefined;
+        }
+        pendingDelta = '';
+        deltaRelease?.();
+        deltaRelease = undefined;
+      };
+      const scheduleDelta = (): void => {
+        if (deltaTimer)
+          return;
+        deltaDrain = deltaDrain.then(() => new Promise<void>(resolve => { deltaRelease = resolve; }));
+        deltaTimer = setTimeout(flushDelta, deltaFlushMs);
+      };
+      try {
+        for await (const event of task.events(record.taskId)) {
+          if (event.task_id !== record.taskId)
+            continue;
+          const current = await state.interactiveRequest(record.key);
+          if (!current || current.roundRevision !== command.roundRevision || current.requestId !== command.requestId)
+            continue;
+          const suppress = this.#disposed || current.status === 'cancel_pending' || current.status === 'terminal' || current.status === 'unconfirmed';
+          if (event.type === 'text_delta' && !suppress && event.text) {
+            output += event.text;
+            if (output.length > 100000)
+              throw new Error('output_too_large');
+            if (command.msg_type === 'discussion_assignment') {
+              pendingDelta += event.text;
+              if (pendingDelta.length >= DELTA_MERGE_MAX_CHARS)
+                flushDelta();
+              else
+                scheduleDelta();
+            }
+          }
+          if (event.type === 'completed' || event.type === 'failed' || event.type === 'cancelled') {
+            // Pending text predates the interrupt; deliver it so partial contributions stay intact.
+            flushDelta();
+            await deltaDrain;
+            if (event.type === 'failed' && event.error.category === 'stop_unconfirmed') {
+              await state.updateInteractive(record.key, { status: 'unconfirmed' });
+              return;
+            }
+            if (suppress) {
+              if (event.session_id)
+                await state.updateInteractive(record.key, {}, event.session_id);
+              return;
+            }
+            let response: DiscussionV3Message | null = null;
+            if (event.type === 'completed') {
+              output = event.output || output;
+              response = command.msg_type === 'discussion_host_turn' ? parseDiscussionV3Checkpoint(output, command)
+                : parseDiscussionV3({ ...discussionV3Identity(command), msg_type: 'discussion_contribution_completed', assignmentId: command.assignmentId, content: output, idempotencyKey: discussionV3ResponseKey(command.requestId, 'completed') });
+            }
+            if (!response)
+              response = this.#errorPayload(command, event.type === 'completed' ? 'invalid_response' : 'model_error', 'Runtime did not return a valid completed response');
+            await state.updateInteractive(record.key, { status: 'terminal', response: { ...response } }, event.session_id);
+            await this.#options.send(response);
+            return;
+          }
+        }
+        flushDelta();
+        await deltaDrain;
+        throw new Error('terminal_event_missing');
       }
-      throw new Error('terminal_event_missing');
+      finally {
+        discardDelta();
+      }
     }
     catch {
       if (record && (await state.interactiveRequest(record.key))?.status !== 'terminal')

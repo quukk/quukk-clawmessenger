@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -1177,5 +1177,84 @@ describe('BindingService', () => {
     ]);
     expect(fixture.source.calls).toBe(1);
     expect(fixture.registration.appKeyCalls).toEqual([DEFAULT_CONFIG.serverUrl]);
+  });
+});
+
+describe('markConnectionState', () => {
+  async function seededFixture(provider: Provider = 'codex') {
+    const selected = runtime(provider);
+    const first = await harness([selected]);
+    const seeded = await seedBinding(first.store, selected);
+    const fixture = await harness([selected], { home: first.home });
+    return { selected, seeded, fixture };
+  }
+
+  it('flips a complete binding to online and back without touching other fields', async () => {
+    const { selected, seeded, fixture } = await seededFixture();
+
+    await fixture.service.markConnectionState(selected.id, true);
+    expect(fixture.service.list()[0]).toMatchObject({
+      runtimeId: selected.id,
+      enabled: seeded.enabled,
+      nodeId: seeded.nodeId,
+      registrationState: 'online',
+    });
+
+    await fixture.service.markConnectionState(selected.id, false);
+    expect(fixture.service.list()[0]).toMatchObject({ registrationState: 'offline' });
+  });
+
+  it('persists online to disk and demotes it on the next open', async () => {
+    const { selected, fixture } = await seededFixture();
+
+    await fixture.service.markConnectionState(selected.id, true);
+    const persisted = JSON.parse(await readFile(localPaths(fixture.home).state, 'utf8')) as {
+      bindings: Array<{ runtimeId: string; registrationState: string }>;
+    };
+    expect(persisted.bindings.find((binding) => binding.runtimeId === selected.id)).toMatchObject({
+      registrationState: 'online',
+    });
+
+    // A fresh open demotes stale online markers to offline (restart safeguard, store.ts:416-425).
+    const reopened = await harness([selected], { home: fixture.home });
+    expect(reopened.service.list()[0]?.registrationState).toBe('offline');
+  });
+
+  it('is a silent no-op for an unknown runtime id', async () => {
+    const { selected, fixture } = await seededFixture();
+
+    await expect(
+      fixture.service.markConnectionState(runtime('hermes').id, true),
+    ).resolves.toBeUndefined();
+    expect(fixture.service.list()[0]?.registrationState).toBe('offline');
+  });
+
+  it('does not clobber error or unregistered states', async () => {
+    const selected = runtime('codex');
+    // 'registering' is intentionally omitted: LocalStore.open reconciles it to offline/error
+    // (store.ts:419-428), so it never reaches a running service.
+    for (const registrationState of ['error', 'unregistered'] as const) {
+      const first = await harness([selected]);
+      await first.store.saveBinding({
+        runtimeId: selected.id,
+        runtimePath: selected.path,
+        provider: 'codex',
+        enabled: false,
+        nodeName: 'seed-host · Codex',
+        registrationState,
+        updatedAt: TIME_0,
+      });
+      const fixture = await harness([selected], { home: first.home });
+
+      await fixture.service.markConnectionState(selected.id, true);
+      expect(fixture.service.list()[0]).toMatchObject({ registrationState });
+    }
+  });
+
+  it('skips persistence when the state is already current', async () => {
+    const { selected, seeded, fixture } = await seededFixture();
+
+    await fixture.service.markConnectionState(selected.id, false);
+    expect(fixture.service.list()[0]?.updatedAt).toBe(seeded.updatedAt);
   });
 });

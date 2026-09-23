@@ -11,13 +11,13 @@ import (
 
 // InteractiveProbeTimeout bounds one ACP initialize handshake. An agent that
 // speaks ACP loads its configuration and binds its event loop before it answers
-// the first request: OpenCode 1.18.31 measured 3.4s on an idle Linux host and
-// stalled past 10s on a loaded one. The original 5s budget sat inside that
-// range, so the proof failed intermittently and the runtime silently lost
-// `discussion_interactive_rounds` on exactly the hosts that did work. The
+// the first request: OpenCode 1.18.31 measured 3.4s on an idle Linux host,
+// 12.9s on a host with load average 8.5, and stalled past 10s on other loaded
+// ones. Budgets sized for idle hosts silently dropped
+// `discussion_interactive_rounds` on exactly the machines that did work. The
 // daemon's probe budget must stay above this value (see
 // TestBridgeInteractiveProbeBudgetFitsInsideRuntimeProbe).
-const InteractiveProbeTimeout = 15 * time.Second
+const InteractiveProbeTimeout = 45 * time.Second
 
 // ProbeInteractiveRuntime checks the installed protocol without starting a turn.
 // ACP probes initialize only; Gateway probes authenticate only. Neither creates

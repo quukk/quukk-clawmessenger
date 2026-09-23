@@ -593,7 +593,6 @@ export function parseRoleRecommendationResponse(
   const candidates = new Map(request.candidates.map((candidate) => [candidate.nodeId, candidate]));
   const assignDevices = candidates.size > 0;
   const names = new Set<string>();
-  const nodes = new Set<string>();
   const orders: number[] = [];
   const roles: RecommendedAssignment[] = [];
   for (const role of value.roles) {
@@ -611,10 +610,11 @@ export function parseRoleRecommendationResponse(
     if (assignDevices) {
       if (!boundedId(role.node_id)) return null;
       const candidate = candidates.get(role.node_id);
-      if (!candidate || nodes.has(role.node_id)
+      // Multiple roles may share one node (single-device discussions); only the
+      // model route must stay within the candidate's advertised model list.
+      if (!candidate
         || (role.model !== null
           && (!modelRoute(role.model) || !candidate.models.includes(role.model)))) return null;
-      nodes.add(role.node_id);
       assignment = { nodeId: role.node_id, model: role.model };
     }
     names.add(normalizedName);

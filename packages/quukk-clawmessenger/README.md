@@ -38,9 +38,14 @@ quukk-clawmessenger setup --no-open
 
 A headless Linux server has no usable `xdg-open`, so a plain `setup` fails with
 `browser_open_failed`. The local page is not required for pairing: print a one-time code in the
-terminal instead.
+terminal instead. `pair` takes no required arguments — it reuses the configuration saved by
+`setup` or the bundled default server; pass options only to override them.
 
 ```bash
+# After `setup` (or with the bundled default server): no arguments needed
+quukk-clawmessenger pair
+
+# First use without `setup`, or to override the server/directories
 quukk-clawmessenger pair \
   --server-url "https://YOUR-SERVER.example/YOUR-SERVICE-PREFIX" \
   --workdir "$HOME/AI-Workspace" \

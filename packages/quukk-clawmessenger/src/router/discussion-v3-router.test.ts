@@ -131,16 +131,39 @@ it('never reports cancelled when terminal session proof conflicts with another o
   expect(h.runtime.starts).toHaveLength(1);
 });
 it('preserves every whitespace delta through an interrupted partial contribution', async () => {
-  const h = await setup(); const running = h.router.handle('system', assignment());
+  const h = await setup();
+  const running = h.router.handle('system', assignment());
   await until(() => h.runtime.starts.length === 1);
   const chunks = ['Hello', ' ', 'world', '\n', 'Next', '  '];
   for (const text of chunks) h.runtime.emit(h.runtime.starts[0]!.requestId!, { type: 'text_delta', text });
   await until(() => h.runtime.processedEvents === chunks.length);
   await h.router.handle('system', cancel()); await running;
   const deltas = h.sent.filter(event => event.msg_type === 'discussion_contribution_delta');
-  expect(deltas.map(event => event.content)).toEqual(chunks);
+  const merged = deltas.map(event => event.content).join('');
+  expect(merged).toBe(chunks.join(''));
+  expect(deltas.length).toBeLessThanOrEqual(chunks.length);
   expect(deltas.every(event => parseDiscussionV3(event) !== null)).toBe(true);
   expect(h.sent.some(event => event.msg_type === 'discussion_contribution_completed')).toBe(false);
+});
+it('coalesces streaming deltas on a flush interval to bound message volume', async () => {
+  const h = await setup();
+  const router = new DiscussionV3Router({ identity, memberId: 'member-1', state: h.state, task: h.runtime, send: async (payload) => { h.sent.push(payload); }, workdir: async () => 'D:/work', available: async () => true, now: () => now, deltaFlushMs: 10 });
+  const running = router.handle('system', assignment());
+  await until(() => h.runtime.starts.length === 1);
+  for (let i = 0; i < 50; i++)
+    h.runtime.emit(h.runtime.starts[0]!.requestId!, { type: 'text_delta', text: `chunk-${i} ` });
+  await until(() => h.runtime.processedEvents === 50);
+  await new Promise(resolve => setTimeout(resolve, 40));
+  h.runtime.emit(h.runtime.starts[0]!.requestId!, { type: 'text_delta', text: 'tail' });
+  h.runtime.emit(h.runtime.starts[0]!.requestId!, { type: 'completed', output: 'chunk-0 chunk-1 done' });
+  await running;
+  const deltas = h.sent.filter(event => event.msg_type === 'discussion_contribution_delta');
+  expect(deltas.length).toBeLessThan(50);
+  expect(deltas.map(event => event.content).join('')).toContain('chunk-49');
+  const seqs = deltas.map(event => (event as { seq: number }).seq);
+  expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+  for (const event of deltas)
+    expect(parseDiscussionV3(event)).not.toBeNull();
 });
 it('replays a proven terminal response while runtime is unavailable', async () => {
   const h = await setup();

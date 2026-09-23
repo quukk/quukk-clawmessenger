@@ -101,6 +101,7 @@ const ENTRY_MODULES = [
   'config/store',
   'go/binary',
   'go/client',
+  'go/recovering-task',
   'go/sse',
   'go/types',
   'http/routes',

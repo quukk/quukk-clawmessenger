@@ -217,6 +217,9 @@ export interface RouterLogEvent {
   taskId?: string;
   eventType?: BridgeEventType;
   errorCode?: string;
+  requestId?: string;
+  kind?: string;
+  outputPreview?: string;
   queueDepth?: number;
   count?: number;
   durationMs?: number;
@@ -431,6 +434,15 @@ const DEVICE_COMMANDS = new Set<DeviceCommand>([
   'status', 'disable', 'stop', 'enable', 'start', 'delete', 'restart', 'rename_device',
   'recover_runtime',
 ]);
+
+function extractFirstJsonObject(text: string): string | undefined {
+  const trimmed = text.trim();
+  const fence = /^```(?:json)?\s*([\s\S]*?)```/u.exec(trimmed);
+  const candidate = (fence?.[1] ?? trimmed).trim();
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  return start >= 0 && end > start ? candidate.slice(start, end + 1) : undefined;
+}
 
 function safeIdentifier(value: string, maximum = 256): boolean {
   return value.length >= 1
@@ -2287,7 +2299,13 @@ export class MessageRouter {
         generation,
       );
       outputSent = true;
-    } catch {
+    } catch (error) {
+      this.#logger.warn({
+        event: 'model_catalog_failed',
+        runtimeId: identity.runtimeId,
+        nodeId: identity.nodeId,
+        errorCode: workerErrorCode(error) ?? 'unknown',
+      });
       if (claim) await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
       return;
     }
@@ -2340,8 +2358,24 @@ export class MessageRouter {
       });
       this.#requireBindingGeneration(identity, generation);
       const roles = output.kind === 'completed'
-        ? parseRoleRecommendationResponse(JSON.parse(output.output.trim()) as unknown, request)
+        ? parseRoleRecommendationResponse(
+            JSON.parse(extractFirstJsonObject(output.output) ?? output.output.trim()) as unknown,
+            request,
+          )
         : null;
+      if (output.kind !== 'completed') {
+        this.#logger.warn({
+          event: 'role_recommendation_task_failed',
+          requestId: request.requestId,
+          kind: output.kind,
+        });
+      } else if (roles === null) {
+        this.#logger.warn({
+          event: 'role_recommendation_parse_failed',
+          requestId: request.requestId,
+          outputPreview: output.output.slice(0, 200),
+        });
+      }
       const response = this.#structuredResponse(conversation, 'command_result', roles === null ? {
         msg_type: 'discussion_role_recommendation_response',
         request_id: request.requestId,
@@ -2363,12 +2397,17 @@ export class MessageRouter {
       } else {
         await this.#sendWorker(identity, response);
       }
-    } catch {
+    } catch (error) {
       if (taskId !== undefined) await this.#task.cancelTask(taskId).catch(() => undefined);
       if (!this.#bindingGenerationCurrent(identity, generation)) {
         if (claim) await this.#state.releaseMessage(claim.key, claim.claimId).catch(() => undefined);
         return;
       }
+      this.#logger.warn({
+        event: 'role_recommendation_failed',
+        requestId: request.requestId,
+        errorCode: workerErrorCode(error) ?? 'unknown',
+      });
       const response = this.#structuredResponse(conversation, 'command_result', {
         msg_type: 'discussion_role_recommendation_response',
         request_id: request.requestId,

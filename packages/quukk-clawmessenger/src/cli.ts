@@ -2141,7 +2141,20 @@ export function createProductionCliRuntime(
     start: startBackground,
     async runForeground(input, foreground): Promise<number> {
       const identity = createStartingIdentity(processId, now, randomBytes);
-      if (!(await identityStore.claim(identity))) throw productionFailure('identity_conflict');
+      if (!(await identityStore.claim(identity))) {
+        // A crashed foreground daemon can leave a stale 'starting' identity behind.
+        // Recover it (only when the recorded pid is verifiably dead) instead of
+        // letting restart supervisors spin on identity_conflict forever.
+        const stored = await readStoredIdentity();
+        if (
+          stored.identity !== undefined
+          && stored.identity.state === 'starting'
+          && stored.contentDigest !== undefined
+        ) {
+          await recoverExactStarting(stored.identity, stored.contentDigest);
+        }
+        if (!(await identityStore.claim(identity))) throw productionFailure('identity_conflict');
+      }
       let service: ProductionCliServicePort | undefined;
       let serviceStarting = false;
       let interrupted = false;

@@ -287,6 +287,7 @@ interface RouterHarness {
   joined: Array<{ identity: WorkerIdentity; roomId: string; historyCount: number }>;
   authorized: AuthorizedControl[];
   deviceCalls: Array<{ command: string; name?: string }>;
+  warnings: Parameters<RouterLogger['warn']>[0][];
   binding: RouterBindingPort;
   control: RouterControlPort;
   worker: RouterWorkerPort;
@@ -366,13 +367,16 @@ async function routerHarness(
     card: async () => ({ status: 'error', code: 'unsupported_action', message: 'unsupported_action' }),
     modelCatalog: async () => ({ defaultModel: null, providers: [] }),
   };
+  const warnings: Parameters<RouterLogger['warn']>[0][] = [];
   const logger: RouterLogger = {
     debug: ({ event }) => {
       if (event === 'validated') order.push('validate');
       if (event === 'lane_reserved') order.push('reserve-lane');
     },
     info: () => undefined,
-    warn: () => undefined,
+    warn: (entry) => {
+      warnings.push(structuredClone(entry));
+    },
     error: () => undefined,
   };
   const options: MessageRouterOptions = {
@@ -399,6 +403,7 @@ async function routerHarness(
     joined,
     authorized,
     deviceCalls,
+    warnings,
     binding,
     control,
     worker,
@@ -420,7 +425,9 @@ it('dispatches authenticated v3 through the interactive runtime using a durable 
  await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,sdkPrivateProtocolMessage('v3-inbound',command)));
  expect(h.starts).toHaveLength(1);expect(h.starts[0]?.requestId).toMatch(/^task_/);
  expect(h.sent.some(({input})=>input.messageType==='command_result'&&input.content.protocolVersion===3&&input.content.msg_type==='discussion_contribution_completed')).toBe(true);
- expect(h.sent.filter(({input})=>input.content.msg_type==='discussion_contribution_delta').map(({input})=>input.content.content)).toEqual(['Hello', ' ', 'world', '\n', '  ']);
+  const deltaContents=h.sent.filter(({input})=>input.content.msg_type==='discussion_contribution_delta').map(({input})=>input.content.content);
+  expect(deltaContents.join('')).toEqual('Hello world\n  ');
+  expect(deltaContents.length).toBeLessThanOrEqual(5);
  for(const [uid,text] of [['plain-opinion','My opinion'],['slash-opinion','/new']]) {
   await h.router.onWorkerEvent(IDENTITY_A,inbound(IDENTITY_A,message(uid!,text!,{conversationType:4,targetId:command.chatroomId})));
  }
@@ -4090,6 +4097,34 @@ describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
       && Array.isArray(input.content.roles))).toBe(true);
   });
 
+  it('accepts fenced JSON output from the recommendation task', async () => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', {
+        output: '```json\n' + JSON.stringify({
+          roles: [
+            {
+              role_name: '架构师', role_prompt: '评估边界', node_id: 'node-a',
+              model: 'openai/gpt-5', speaking_order: 0,
+            },
+            {
+              role_name: '记录员', role_prompt: '记录要点', node_id: 'node-a',
+              model: null, speaking_order: 1,
+            },
+          ],
+        }) + '\n```',
+      });
+    })());
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'role-recommendation', roleRecommendationRequest(),
+      { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+    )));
+    const sent = fixture.sent.find(({ input }) => input.messageType === 'command_result');
+    expect(sent).toBeDefined();
+    expect(sent?.input.content.msg_type).toBe('discussion_role_recommendation_response');
+    expect(sent?.input.content.roles).toHaveLength(2);
+  });
+
   it.each([false, true])('executes role-only recommendation and replies without device assignments (framed=%s)', async (framed) => {
     const fixture = await routerHarness();
     const roles = [{ role_name: 'Reviewer', role_prompt: 'Check risks', speaking_order: 0 }];
@@ -4135,10 +4170,6 @@ describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
     ['unknown candidate', JSON.stringify({ roles: [{
       role_name: '未知', role_prompt: '无效', node_id: 'unknown', model: null, speaking_order: 0,
     }] })],
-    ['duplicate candidate', JSON.stringify({ roles: [
-      { role_name: 'A', role_prompt: 'A', node_id: 'node-a', model: null, speaking_order: 0 },
-      { role_name: 'B', role_prompt: 'B', node_id: 'node-a', model: null, speaking_order: 1 },
-    ] })],
   ])('returns a safe role error for %s', async (_label, output) => {
     const fixture = await routerHarness();
     fixture.setEvents((taskId) => (async function* () {
@@ -4174,6 +4205,83 @@ describe('MessageRouter discussion v1/v2 and wire dispatch', () => {
       && input.content.msg_type === 'discussion_role_recommendation_response')?.input.content;
     expect(response?.error_code).toBe('role_recommendation_invalid');
     expect(JSON.stringify(response)).not.toContain('must not leak');
+  });
+
+  it('warns when the recommendation task start throws', async () => {
+    const fixture = await routerHarness();
+    fixture.setStart(() => {
+      throw new Error('bridge down');
+    });
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'role-start-failed',
+      roleRecommendationRequest(),
+      { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+    )));
+
+    const response = fixture.sent.find(({ input }) => input.messageType === 'command_result'
+      && input.content.msg_type === 'discussion_role_recommendation_response')?.input.content;
+    expect(response?.error_code).toBe('role_recommendation_invalid');
+    expect(fixture.warnings.some((entry) => entry.event === 'role_recommendation_failed'
+      && entry.requestId === 'recommend-1')).toBe(true);
+  });
+
+  it('warns when the recommendation task ends without completion', async () => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'failed', {
+        error: { category: 'model', code: 'raw-private-error', message: 'must not leak', retryable: false },
+      });
+    })());
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'role-task-failed',
+      roleRecommendationRequest(),
+      { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+    )));
+
+    expect(fixture.warnings.some((entry) => entry.event === 'role_recommendation_task_failed'
+      && entry.requestId === 'recommend-1' && entry.kind === 'invalid')).toBe(true);
+  });
+
+  it('warns with an output preview when the recommendation output cannot be parsed', async () => {
+    const fixture = await routerHarness();
+    fixture.setEvents((taskId) => (async function* () {
+      yield bridgeEvent(taskId, 'completed', { output: '{"result":"没有角色数组"}' });
+    })());
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'role-parse-failed',
+      roleRecommendationRequest(),
+      { senderId: 'system', targetId: IDENTITY_A.nodeId, conversationType: 1 },
+    )));
+
+    const response = fixture.sent.find(({ input }) => input.messageType === 'command_result'
+      && input.content.msg_type === 'discussion_role_recommendation_response')?.input.content;
+    expect(response?.error_code).toBe('role_recommendation_invalid');
+    expect(fixture.warnings.some((entry) => entry.event === 'role_recommendation_parse_failed'
+      && entry.requestId === 'recommend-1'
+      && typeof entry.outputPreview === 'string' && entry.outputPreview.length > 0)).toBe(true);
+  });
+
+  it('warns when the model catalog handler fails', async () => {
+    const fixture = await routerHarness();
+    const control = fixture.control as { modelCatalog: () => Promise<unknown> };
+    control.modelCatalog = async () => {
+      throw new Error('catalog down');
+    };
+
+    await fixture.router.onWorkerEvent(IDENTITY_A, inbound(IDENTITY_A, protocolMessage(
+      'model-catalog-failed',
+      {
+        msg_type: 'discussion_model_catalog_request',
+        protocolVersion: 2,
+        requestId: 'catalog-1',
+        timestamp: 1,
+      },
+    )));
+
+    expect(fixture.warnings.some((entry) => entry.event === 'model_catalog_failed')).toBe(true);
   });
 
   it('cancels a timed-out role recommendation and returns a safe timeout error', async () => {

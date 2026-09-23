@@ -224,6 +224,7 @@ const ENTRY_MODULES = [
   'config/store',
   'go/binary',
   'go/client',
+  'go/recovering-task',
   'go/sse',
   'go/types',
   'http/routes',
@@ -473,7 +474,7 @@ describe('audit-tarball', () => {
   it('accepts an exact entry listing with legal files, bin, UI assets, worker, and npm manifest', async () => {
     const fixture = await entryFixture();
 
-    expect(ENTRY_FILES).toHaveLength(120);
+    expect(ENTRY_FILES).toHaveLength(122);
     await expect(auditTarball({
       packJsonPath: fixture.report,
       packageDirectory: fixture.entry,

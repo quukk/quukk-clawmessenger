@@ -19,7 +19,7 @@ import { parseSSE, SSEProtocolError } from './sse.js';
 
 const JSON_LIMIT = 1 << 20;
 const REQUEST_TIMEOUT = 10_000;
-const REFRESH_TIMEOUT = 30_000;
+const REFRESH_TIMEOUT = 150_000;
 const SSE_IDLE_TIMEOUT = 45_000;
 const RECONNECT_BASE_DELAY = 100;
 const RECONNECT_MAXIMUM_DELAY = 2_000;

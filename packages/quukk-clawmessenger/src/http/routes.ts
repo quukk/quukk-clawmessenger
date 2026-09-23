@@ -213,10 +213,10 @@ export const ControlPairingResponseSchema = z.strictObject({
 export type ControlPairingResponse = z.infer<typeof ControlPairingResponseSchema>;
 
 // A runtime refresh probes every installed agent CLI. The interactive proof
-// alone is allowed agent.InteractiveProbeTimeout (15s), and version detection
+// alone is allowed agent.InteractiveProbeTimeout (45s), and version detection
 // spends more on top of it, so neither the browser route nor the control route
 // may cap the operation below this.
-export const RUNTIME_REFRESH_TIMEOUT_MS = 60_000;
+export const RUNTIME_REFRESH_TIMEOUT_MS = 150_000;
 
 // Server-side budgets for the CLI control channel. The CLI's own request budget
 // is derived from these (see CONTROL_REQUEST_TIMEOUT_MS in cli.ts) so a slow but

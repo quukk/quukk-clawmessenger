@@ -1,9 +1,12 @@
 import { spawn as nodeSpawn } from 'node:child_process';
-import { isAbsolute, resolve } from 'node:path';
+import { constants as fsConstants } from 'node:fs';
+import { access as nodeAccess, chmod as nodeChmod, readFile as nodeReadFile } from 'node:fs/promises';
+import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HINT = 'Run quukk-clawmessenger setup to finish setup.';
 const PACKAGED_BIN = fileURLToPath(new URL('../bin/quukk-clawmessenger.js', import.meta.url));
+const RUNTIME_PACKAGE_PREFIX = '@quukk/clawmessenger-runtime-';
 const SAFE_ENVIRONMENT_KEYS = new Set([
   'APPDATA',
   'COMSPEC',
@@ -46,6 +49,43 @@ function isTruthyEnvironmentValue(value) {
   if (typeof value !== 'string') return false;
   const normalized = value.trim().toLowerCase();
   return normalized !== '' && !['0', 'false', 'no', 'off'].includes(normalized);
+}
+
+// Global npm upgrades have been observed to drop the executable bit on the
+// platform runtime binary (three production EACCES incidents). Repair it
+// during install so the bridge can spawn after every upgrade. Never throws —
+// a broken repair must not break `npm install`.
+export async function ensureRuntimeExecutable(deps = {}) {
+  try {
+    const platform = deps.platform ?? process.platform;
+    if (platform === 'win32') {
+      return false;
+    }
+    const arch = deps.arch ?? process.arch;
+    const packageRoot =
+      deps.packageRoot ??
+      fileURLToPath(new URL(`../node_modules/${RUNTIME_PACKAGE_PREFIX}${platform}-${arch}`, import.meta.url));
+    const readFile = deps.readFile ?? nodeReadFile;
+    const access = deps.access ?? nodeAccess;
+    const chmod = deps.chmod ?? nodeChmod;
+
+    let binaryName = 'clawmessenger-runtime';
+    const manifest = JSON.parse(await readFile(join(packageRoot, 'manifest.json'), 'utf8'));
+    if (typeof manifest?.binary === 'string' && manifest.binary.trim().length > 0) {
+      binaryName = manifest.binary;
+    }
+
+    const binaryPath = join(packageRoot, binaryName);
+    try {
+      await access(binaryPath, fsConstants.X_OK);
+      return false;
+    } catch {
+      await chmod(binaryPath, 0o755);
+      return true;
+    }
+  } catch {
+    return false;
+  }
 }
 
 export function shouldAutoSetup(input) {
@@ -162,7 +202,10 @@ function isDirectExecution() {
 }
 
 try {
-  if (isDirectExecution()) runPostinstall();
+  if (isDirectExecution()) {
+    await ensureRuntimeExecutable();
+    runPostinstall();
+  }
 } catch {
   try {
     console.log(HINT);

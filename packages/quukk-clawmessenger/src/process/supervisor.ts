@@ -208,7 +208,7 @@ function defaults(overrides: Partial<BridgeSupervisorDependencies>): BridgeSuper
       (async (child) => {
         if (!child.kill('SIGKILL')) throw new BridgeSupervisorError('shutdown_failed');
       }),
-    startupTimeoutMs: overrides.startupTimeoutMs ?? 60_000,
+    startupTimeoutMs: overrides.startupTimeoutMs ?? 120_000,
     healthRetryDelayMs: overrides.healthRetryDelayMs ?? 50,
     shutdownGraceMs: overrides.shutdownGraceMs ?? 7_000,
   };

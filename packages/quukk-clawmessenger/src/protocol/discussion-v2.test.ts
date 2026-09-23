@@ -253,6 +253,27 @@ describe('discussion role recommendation protocol', () => {
       }],
     }, request)).toBeNull();
   });
+
+  it('accepts strict responses that assign multiple roles to the same node', () => {
+    const request = parseRoleRecommendationRequest(roleRecommendationRequest)!;
+    const roles = parseRoleRecommendationResponse({
+      roles: [
+        {
+          role_name: '主持人', role_prompt: '主持讨论进程', node_id: 'node-role-a',
+          model: 'openai/gpt-5', speaking_order: 0,
+        },
+        {
+          role_name: '记录员', role_prompt: '记录讨论要点', node_id: 'node-role-a',
+          model: null, speaking_order: 1,
+        },
+      ],
+    }, request);
+
+    expect(roles).toHaveLength(2);
+    expect(roles?.[0]?.nodeId).toBe('node-role-a');
+    expect(roles?.[1]?.nodeId).toBe('node-role-a');
+    expect(roles?.[1]?.model).toBeNull();
+  });
 });
 
 describe('discussion v2 host decisions', () => {

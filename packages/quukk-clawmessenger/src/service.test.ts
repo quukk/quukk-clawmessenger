@@ -297,6 +297,15 @@ class FakeBindings implements ServiceBindingPort {
       ? { runtimeId, ok: true, binding: { ...binding } }
       : { runtimeId, ok: false, errorCode: 'runtime_not_found' };
   }
+
+  async markConnectionState(runtimeId: string, connected: boolean): Promise<void> {
+    this.trace.push(`bindings.connection:${runtimeId}:${connected ? 'online' : 'offline'}`);
+    this.values = this.values.map((candidate) =>
+      candidate.runtimeId === runtimeId
+        ? { ...candidate, registrationState: connected ? ('online' as const) : ('offline' as const) }
+        : candidate,
+    );
+  }
 }
 
 class FakePairing {
@@ -574,8 +583,8 @@ describe('QuukkService lifecycle', () => {
     expect(graph.visited.map((filePath) => basename(filePath))).not.toContain('env-polyfill.ts');
   });
 
-  it('rejects startup timeout values above the fixed sixty-second ceiling', async () => {
-    await expect(fixture({ startupTimeoutMs: 60_001 })).rejects.toThrow('invalid_startup_timeout');
+  it('rejects startup timeout values above the fixed three-minute ceiling', async () => {
+    await expect(fixture({ startupTimeoutMs: 180_001 })).rejects.toThrow('invalid_startup_timeout');
   });
 
   it('bounds a hung startup stage and still performs exact cleanup', async () => {
@@ -1633,7 +1642,7 @@ describe('startProductionService', () => {
       identityStore,
       homeDirectory: root,
       processEnvironment: {},
-      startupTimeoutMs: 60_001,
+      startupTimeoutMs: 180_001,
     })).rejects.toMatchObject({ code: 'operation_unavailable' });
     expect(identityStore.removed).toEqual([STARTING]);
   });
@@ -1845,6 +1854,82 @@ describe('startProductionService', () => {
       binding: { runtimeId: binding.runtimeId, enabled: false },
     });
     expect(workers.reconciliations.at(-1)).toEqual([]);
+    await service.stop();
+  });
+
+  it('flips binding registration state when workers report connection transitions', async () => {
+    const root = await temporaryDirectory();
+    const trace: string[] = [];
+    const store = new FakeStore();
+    const logger = new FakeLogger();
+    const runtime = new FakeRuntime(runtimeCatalog(root), trace);
+    const bindings = new FakeBindings(trace);
+    const workers = new FakeWorkers(trace) as FakeWorkers & {
+      send: () => Promise<undefined>;
+      receipt: () => Promise<void>;
+      joinChatroom: () => Promise<void>;
+    };
+    workers.send = async () => undefined;
+    workers.receipt = async () => undefined;
+    workers.joinChatroom = async () => undefined;
+    const router = new FakeRouter(trace);
+    let workerEvent: ((identity: WorkerIdentity, event: never) => void) | undefined;
+    const identityStore = new FakeIdentityStore(trace);
+    const factories: ProductionServiceFactories = {
+      openStore: async () => store,
+      openLogger: async () => logger,
+      createBridge: () => ({
+        ensureStarted: async () => ({
+          client: runtime as never,
+          identity: {
+            schema_version: 1,
+            address: '127.0.0.1:45123',
+            pid: 5151,
+            version: '0.1.0-beta.1',
+            instance_id: 'br_0123456789abcdef0123456789abcdef',
+            started_at: '2026-08-27T07:59:59.000Z',
+          },
+          recovered: false,
+        }),
+        stop: async () => undefined,
+      }),
+      createRegistrationClient: () => ({
+        getAppKey: async () => 'app-key',
+        register: async () => { throw new Error('unused'); },
+        refreshToken: async () => { throw new Error('unused'); },
+      }),
+      openBindings: async () => bindings,
+      createRouterState: () => ({ initialize: async () => undefined }),
+      createWorkers: (options) => {
+        workerEvent = options.onEvent as typeof workerEvent;
+        return workers;
+      },
+      createRouter: () => router,
+      createHttp: () => new FakeHttp(trace),
+    };
+
+    const service = await startProductionService({
+      identity: STARTING,
+      identityStore,
+      homeDirectory: root,
+      processEnvironment: {},
+      configOverrides: { serverUrl: 'https://override.example/im' },
+      configEnvironment: {},
+      factories,
+      staticRoot: join(root, 'ui'),
+    });
+
+    workerEvent?.({ runtimeId: IDS.opencode, nodeId: 'opencode_node' }, { type: 'connection', state: 'online' } as never);
+    await vi.waitFor(() => expect(trace).toContain(`bindings.connection:${IDS.opencode}:online`));
+    await vi.waitFor(() => expect(trace).toContain(`router.event:${IDS.opencode}:opencode_node`));
+
+    workerEvent?.({ runtimeId: IDS.opencode, nodeId: 'opencode_node' }, { type: 'connection', state: 'offline' } as never);
+    await vi.waitFor(() => expect(trace).toContain(`bindings.connection:${IDS.opencode}:offline`));
+
+    workerEvent?.({ runtimeId: IDS.opencode, nodeId: 'opencode_node' }, { type: 'message' } as never);
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+    expect(trace.filter((entry) => entry.startsWith('bindings.connection:'))).toHaveLength(2);
+
     await service.stop();
   });
 

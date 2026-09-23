@@ -1,29 +1,35 @@
 {
-  "name": "@quukk/clawmessenger-runtime-darwin-x64",
-  "version": "0.1.0-beta.8",
-  "description": "Multica Bridge runtime for Quukk ClawMessenger on macOS x64",
-  "license": "SEE LICENSE IN LICENSE",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/quukk/quukk-clawmessenger.git",
-    "directory": "packages/quukk-clawmessenger-runtime-darwin-x64"
-  },
-  "bugs": { "url": "https://github.com/quukk/quukk-clawmessenger/issues" },
-  "homepage": "https://github.com/quukk/quukk-clawmessenger/tree/main/packages/quukk-clawmessenger-runtime-darwin-x64#readme",
-  "files": [
-    "clawmessenger-runtime",
-    "manifest.json",
-    "LICENSE",
-    "NOTICE",
-    "MODIFICATIONS.md",
-    "GO_THIRD_PARTY_NOTICES.md",
-    "SOURCE.md",
-    "README.md"
-  ],
-  "os": ["darwin"],
-  "cpu": ["x64"],
-  "publishConfig": {
-    "access": "public",
-    "provenance": true
-  }
+    "name":  "@quukk/clawmessenger-runtime-darwin-x64",
+    "version":  "0.1.0-beta.9",
+    "description":  "Multica Bridge runtime for Quukk ClawMessenger on macOS x64",
+    "license":  "SEE LICENSE IN LICENSE",
+    "repository":  {
+                       "type":  "git",
+                       "url":  "git+https://github.com/quukk/quukk-clawmessenger.git",
+                       "directory":  "packages/quukk-clawmessenger-runtime-darwin-x64"
+                   },
+    "bugs":  {
+                 "url":  "https://github.com/quukk/quukk-clawmessenger/issues"
+             },
+    "homepage":  "https://github.com/quukk/quukk-clawmessenger/tree/main/packages/quukk-clawmessenger-runtime-darwin-x64#readme",
+    "files":  [
+                  "clawmessenger-runtime",
+                  "manifest.json",
+                  "LICENSE",
+                  "NOTICE",
+                  "MODIFICATIONS.md",
+                  "GO_THIRD_PARTY_NOTICES.md",
+                  "SOURCE.md",
+                  "README.md"
+              ],
+    "os":  [
+               "darwin"
+           ],
+    "cpu":  [
+                "x64"
+            ],
+    "publishConfig":  {
+                          "access":  "public",
+                          "provenance":  true
+                      }
 }

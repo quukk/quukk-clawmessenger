@@ -26,6 +26,7 @@ import {
   type StoreSnapshot,
 } from './config/store.js';
 import { BridgeClient } from './go/client.js';
+import { RecoveringBridgeTask } from './go/recovering-task.js';
 import {
   BridgeHealthSchema,
   BridgeRuntimeListSchema,
@@ -120,8 +121,8 @@ import { RouterStateStore, type RouterStateStoreOptions } from './router/session
 
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 20_000;
 const MAX_SHUTDOWN_TIMEOUT_MS = 20_000;
-const DEFAULT_STARTUP_TIMEOUT_MS = 60_000;
-const MAX_STARTUP_TIMEOUT_MS = 60_000;
+const DEFAULT_STARTUP_TIMEOUT_MS = 120_000;
+const MAX_STARTUP_TIMEOUT_MS = 180_000;
 const HTTP_CLOSE_TIMEOUT_MS = 2_000;
 const ROUTER_DISPOSE_TIMEOUT_MS = 5_000;
 const LOGGER_CLOSE_TIMEOUT_MS = 2_000;
@@ -159,7 +160,7 @@ export interface ServiceBridgePort {
 
 export type ServiceBindingPort = Pick<
   BindingService,
-  'list' | 'enableSelected' | 'enablePairingSelection' | 'disable' | 'reregister'
+  'list' | 'enableSelected' | 'enablePairingSelection' | 'disable' | 'reregister' | 'markConnectionState'
 >;
 
 export type ServicePairingPort = Pick<
@@ -2027,6 +2028,17 @@ async function composeProductionServiceWithin(
         return resolved.token;
       }),
       onEvent: (workerIdentity: WorkerIdentity, event: WorkerEvent) => {
+        if (event.type === 'connection') {
+          void bindings
+            .markConnectionState(workerIdentity.runtimeId, event.state === 'online')
+            .catch(() => {
+              safeLog(logger, 'warn', {
+                event: 'worker_connection_state_failed',
+                runtimeId: workerIdentity.runtimeId,
+                nodeId: workerIdentity.nodeId,
+              });
+            });
+        }
         const target = routerReference;
         if (target === undefined) return;
         void target.onWorkerEvent(workerIdentity, event).catch(() => {
@@ -2039,8 +2051,20 @@ async function composeProductionServiceWithin(
       },
     });
     const control = createConservativeRouterControl({ runtimes: client, bindings, workers, mutationGate });
+    let activeClient: ProductionBridgeClient = client;
+    const recoveringTask = new RecoveringBridgeTask({
+      resolveTask: () => activeClient,
+      ensureBridge: async () => {
+        const running = await bridge!.ensureStarted({});
+        activeClient = running.client;
+      },
+      refreshRuntime: async (runtimeId) => {
+        const runtimes = await activeClient.refreshRuntimes();
+        return runtimes.find(candidate => candidate.id === runtimeId)?.status === 'ready';
+      },
+    });
     router = factories.createRouter({
-      task: client,
+      task: recoveringTask,
       interactiveAvailable: async identity => {
         const runtime = parseCatalog(await client.runtimes()).find(item => item.id === identity.runtimeId);
         return runtime !== undefined && nodeCapabilitiesForRuntime(runtime).includes('discussion_interactive_rounds');

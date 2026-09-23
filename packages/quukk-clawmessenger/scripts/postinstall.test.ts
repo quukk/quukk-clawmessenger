@@ -2,9 +2,11 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
+import { join } from 'node:path';
+
 import { describe, expect, it, vi } from 'vitest';
 
-import { runPostinstall, shouldAutoSetup } from './postinstall.mjs';
+import { ensureRuntimeExecutable, runPostinstall, shouldAutoSetup } from './postinstall.mjs';
 
 const WINDOWS_DESKTOP = {
   platform: 'win32',
@@ -310,6 +312,78 @@ describe('runPostinstall', () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toBe('IMPORTED\n');
     expect(result.stderr).toBe('');
+  });
+});
+
+describe('ensureRuntimeExecutable', () => {
+  const runtimeRoot = '/opt/quukk/node_modules/@quukk/clawmessenger-runtime-linux-x64';
+  const manifest = JSON.stringify({
+    binary: 'clawmessenger-runtime',
+    version: '0.1.0-beta.24',
+  });
+
+  const makeDeps = (overrides: Record<string, unknown> = {}) => ({
+    platform: 'linux',
+    arch: 'x64',
+    packageRoot: runtimeRoot,
+    readFile: vi.fn().mockResolvedValue(manifest),
+    access: vi.fn().mockRejectedValue(new Error('EACCES: permission denied')),
+    chmod: vi.fn().mockResolvedValue(undefined),
+    ...overrides,
+  });
+
+  it('restores the executable bit when the runtime binary lacks it', async () => {
+    const deps = makeDeps();
+    const repaired = await ensureRuntimeExecutable(deps);
+
+    expect(repaired).toBe(true);
+    expect(deps.access).toHaveBeenCalledTimes(1);
+    expect(deps.chmod).toHaveBeenCalledTimes(1);
+    expect(deps.chmod).toHaveBeenCalledWith(join(runtimeRoot, 'clawmessenger-runtime'), 0o755);
+  });
+
+  it('leaves an already executable binary untouched', async () => {
+    const deps = makeDeps({ access: vi.fn().mockResolvedValue(undefined) });
+    const repaired = await ensureRuntimeExecutable(deps);
+
+    expect(repaired).toBe(false);
+    expect(deps.chmod).not.toHaveBeenCalled();
+  });
+
+  it('uses the binary name recorded in the runtime manifest', async () => {
+    const deps = makeDeps({
+      readFile: vi.fn().mockResolvedValue(JSON.stringify({ binary: 'clawmessenger-runtime-v2' })),
+    });
+    const repaired = await ensureRuntimeExecutable(deps);
+
+    expect(repaired).toBe(true);
+    expect(deps.chmod).toHaveBeenCalledWith(join(runtimeRoot, 'clawmessenger-runtime-v2'), 0o755);
+  });
+
+  it('does nothing on win32 where executables do not need a chmod repair', async () => {
+    const deps = makeDeps({ platform: 'win32' });
+    const repaired = await ensureRuntimeExecutable(deps);
+
+    expect(repaired).toBe(false);
+    expect(deps.readFile).not.toHaveBeenCalled();
+    expect(deps.access).not.toHaveBeenCalled();
+    expect(deps.chmod).not.toHaveBeenCalled();
+  });
+
+  it('stays silent when the platform runtime package is not installed', async () => {
+    const deps = makeDeps({ readFile: vi.fn().mockRejectedValue(new Error('ENOENT')) });
+    const repaired = await ensureRuntimeExecutable(deps);
+
+    expect(repaired).toBe(false);
+    expect(deps.access).not.toHaveBeenCalled();
+    expect(deps.chmod).not.toHaveBeenCalled();
+  });
+
+  it('never fails the install when the permission repair itself errors', async () => {
+    const deps = makeDeps({ chmod: vi.fn().mockRejectedValue(new Error('EPERM')) });
+    const repaired = await ensureRuntimeExecutable(deps);
+
+    expect(repaired).toBe(false);
   });
 });
 

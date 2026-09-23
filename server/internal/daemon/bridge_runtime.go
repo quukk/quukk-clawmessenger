@@ -48,7 +48,7 @@ const (
 	// Must exceed agent.InteractiveProbeTimeout: the interactive proof runs
 	// inside this budget, after version detection has already spent part of it,
 	// so an outer bound below the inner one makes the proof unreachable.
-	defaultBridgeProbeTimeout = 20 * time.Second
+	defaultBridgeProbeTimeout = 60 * time.Second
 )
 
 type bridgeRuntimeSpec struct {

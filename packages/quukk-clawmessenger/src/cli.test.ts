@@ -1478,10 +1478,122 @@ describe('createProductionCliRuntime', () => {
       { daemonChild: true, onReady: vi.fn() },
     )).rejects.toMatchObject({ code: 'identity_conflict' });
 
-    expect(events).toEqual(['claim']);
+    expect(events).toEqual(['claim', 'claim']);
     expect(readStdin).not.toHaveBeenCalled();
     expect(startService).not.toHaveBeenCalled();
     expect(store.removeIfMatches).not.toHaveBeenCalled();
+  });
+
+  it('recovers a stale starting identity left by a dead pid before claiming again', async () => {
+    const events: string[] = [];
+    const store = identityStore({ identity: STARTING_IDENTITY, contentDigest: '3'.repeat(64) });
+    store.claim.mockImplementation(async () => {
+      events.push('claim');
+      return events.length === 1 ? false : true;
+    });
+    const kill = vi.fn(() => {
+      throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
+    });
+    const childInput = { foreground: false, noOpen: false, configOverrides: {} };
+    const readStdin = vi.fn(async () => {
+      events.push('stdin');
+      return Buffer.from(`${JSON.stringify(childInput)}\n`, 'utf8');
+    });
+    const signals = new EventEmitter();
+    const stop = vi.fn(async () => { events.push('stop'); });
+    const status = vi.fn(async () => ({
+      schemaVersion: 1 as const,
+      identity: READY_IDENTITY,
+      state: 'ready' as const,
+    }));
+    const startService = vi.fn(async () => {
+      events.push('service');
+      return { status, stop };
+    });
+    const onReady = vi.fn(async () => {
+      events.push('ready');
+      signals.emit('SIGTERM');
+    });
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readStdin,
+      startService,
+      signals,
+      kill,
+    }) as never);
+
+    await expect(runtime.runForeground(
+      { foreground: true, noOpen: true, configOverrides: {} },
+      { daemonChild: true, onReady },
+    )).resolves.toBe(0);
+
+    expect(store.read).toHaveBeenCalledOnce();
+    expect(kill).toHaveBeenCalledWith(STARTING_IDENTITY.pid, 0);
+    expect(store.quarantineStaleIfExact).toHaveBeenCalledWith({
+      expected: STARTING_IDENTITY,
+      contentDigest: '3'.repeat(64),
+    });
+    expect(events).toEqual(['claim', 'claim', 'stdin', 'service', 'ready', 'stop']);
+  });
+
+  it('keeps identity_conflict when the stored starting pid is still alive', async () => {
+    const events: string[] = [];
+    const store = identityStore({ identity: STARTING_IDENTITY, contentDigest: '3'.repeat(64) });
+    store.claim.mockImplementation(async () => {
+      events.push('claim');
+      return false;
+    });
+    const kill = vi.fn(() => undefined);
+    const readStdin = vi.fn(async () => Buffer.from('{}\n'));
+    const startService = vi.fn(async () => {
+      throw new Error('service_must_not_start');
+    });
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readStdin,
+      startService,
+      kill,
+    }) as never);
+
+    await expect(runtime.runForeground(
+      { foreground: true, noOpen: true, configOverrides: {} },
+      { daemonChild: true, onReady: vi.fn() },
+    )).rejects.toMatchObject({ code: 'identity_conflict' });
+
+    expect(events).toEqual(['claim', 'claim']);
+    expect(store.quarantineStaleIfExact).not.toHaveBeenCalled();
+    expect(readStdin).not.toHaveBeenCalled();
+    expect(startService).not.toHaveBeenCalled();
+  });
+
+  it('never steals a stored ready identity from a live daemon', async () => {
+    const events: string[] = [];
+    const store = identityStore({ identity: READY_IDENTITY, contentDigest: '2'.repeat(64) });
+    store.claim.mockImplementation(async () => {
+      events.push('claim');
+      return false;
+    });
+    const kill = vi.fn(() => {
+      throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
+    });
+    const readStdin = vi.fn(async () => Buffer.from('{}\n'));
+    const startService = vi.fn(async () => {
+      throw new Error('service_must_not_start');
+    });
+    const runtime = createProductionCliRuntime(productionOptions(store, {
+      readStdin,
+      startService,
+      kill,
+    }) as never);
+
+    await expect(runtime.runForeground(
+      { foreground: true, noOpen: true, configOverrides: {} },
+      { daemonChild: true, onReady: vi.fn() },
+    )).rejects.toMatchObject({ code: 'identity_conflict' });
+
+    expect(events).toEqual(['claim', 'claim']);
+    expect(kill).not.toHaveBeenCalled();
+    expect(store.quarantineStaleIfExact).not.toHaveBeenCalled();
+    expect(readStdin).not.toHaveBeenCalled();
+    expect(startService).not.toHaveBeenCalled();
   });
 
   it('accepts one strict child StartInput frame, reports ready once, and shares signal shutdown', async () => {

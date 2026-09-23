@@ -518,6 +518,25 @@ export class BindingService {
     });
   }
 
+  async markConnectionState(runtimeId: string, connected: boolean): Promise<void> {
+    await this.#enqueueExclusive(runtimeId, async () => {
+      const existing = this.#bindings.get(runtimeId);
+      if (existing === undefined) return;
+      if (existing.registrationState !== 'online' && existing.registrationState !== 'offline') {
+        return;
+      }
+      const registrationState = connected ? ('online' as const) : ('offline' as const);
+      if (existing.registrationState === registrationState) return;
+      const updated: RuntimeBinding = {
+        ...existing,
+        registrationState,
+        updatedAt: this.#now().toISOString(),
+      };
+      await this.#store.saveBinding(updated);
+      this.#replace(updated);
+    });
+  }
+
   async reregister(runtimeId: string, options: ReregisterOptions = {}): Promise<EnableResult> {
     const { signal, preserveNodeIdentity = false } = options;
     try {
