@@ -24,7 +24,7 @@ func TestBridgeRuntimeProvidersCapabilitiesAndCopies(t *testing.T) {
 	deps.probeAgentCLIs = func() map[string]AgentEntry {
 		discoveryCalls.Add(1)
 		return map[string]AgentEntry{
-			"claude": {Path: "/ignored/claude"},
+			"kiro": {Path: "/ignored/kiro"},
 		}
 	}
 	deps.resolveAgentExecutablePath = func(command string) (string, error) {
@@ -33,12 +33,19 @@ func TestBridgeRuntimeProvidersCapabilitiesAndCopies(t *testing.T) {
 
 	bridge := newBridge("install-a", nil, deps)
 	got := bridge.Refresh(context.Background())
-	wantProviders := []string{"opencode", "openclaw", "codex", "hermes"}
+	wantProviders := []string{"opencode", "openclaw", "codex", "hermes", "claude", "copilot", "grok", "qwen", "dim", "mcode", "zeroclaw"}
 	wantCapabilities := map[string]BridgeRuntimeCapabilities{
 		"opencode": {SessionResume: true, Cancel: true, TextEvents: true, ToolEvents: true},
 		"openclaw": {SessionResume: true, Cancel: true},
 		"codex":    {SessionResume: true, Cancel: true, TextEvents: true, ToolEvents: true},
 		"hermes":   {SessionResume: true, Cancel: true, TextEvents: true, ToolEvents: true},
+		"claude":   {SessionResume: true, Cancel: true, TextEvents: true, ToolEvents: true},
+		"copilot":  {Cancel: true, TextEvents: true},
+		"grok":     {SessionResume: true, Cancel: true, TextEvents: true},
+		"qwen":     {SessionResume: true, Cancel: true, TextEvents: true},
+		"dim":      {SessionResume: true, Cancel: true, TextEvents: true},
+		"mcode":    {SessionResume: true, Cancel: true, TextEvents: true},
+		"zeroclaw": {SessionResume: true, Cancel: true, TextEvents: true},
 	}
 
 	if len(got) != len(wantProviders) {
@@ -138,7 +145,7 @@ func TestBridgeRuntimeCandidatePrecedence(t *testing.T) {
 			"openclaw": {Path: filepath.Join(root, "lower", "openclaw")},
 			"codex":    {Path: bundlePath},
 			"hermes":   {Path: shellPath},
-			"claude":   {Path: filepath.Join(root, "ignored", "claude")},
+			"kiro":     {Path: filepath.Join(root, "ignored", "kiro")},
 		}
 	}
 
@@ -382,8 +389,10 @@ func TestBridgeRuntimeProbesHaveBoundedConcurrencyAndTimeout(t *testing.T) {
 
 	started := time.Now()
 	got := newBridge("install-a", nil, deps).Refresh(context.Background())
-	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
-		t.Fatalf("four timed probes took %v, want bounded two-wave completion", elapsed)
+	// Eleven timed probes at concurrency 2 complete in ceil(11/2) waves of
+	// 20ms; the bound allows scheduling slack without permitting a serial run.
+	if elapsed := time.Since(started); elapsed > 600*time.Millisecond {
+		t.Fatalf("timed probes took %v, want bounded two-at-a-time completion", elapsed)
 	}
 	if maximum.Load() != 2 {
 		t.Fatalf("maximum concurrent probes = %d, want 2", maximum.Load())
@@ -492,5 +501,45 @@ func TestBridgeInteractiveProbeBudgetFitsInsideRuntimeProbe(t *testing.T) {
 			"runtime probe budget %s must exceed the interactive probe budget %s",
 			defaultBridgeProbeTimeout, agent.InteractiveProbeTimeout,
 		)
+	}
+}
+
+// Guard tests for the data-driven catalog (provider-expansion-plan.md §3.1):
+// the spec declaration is the single source of truth and must stay
+// self-consistent as providers are added.
+func TestBridgeRuntimeSpecsAreWellFormed(t *testing.T) {
+	seen := make(map[string]struct{}, len(bridgeRuntimeSpecs))
+	for i, spec := range bridgeRuntimeSpecs {
+		if spec.provider == "" {
+			t.Fatalf("spec[%d] has an empty provider", i)
+		}
+		if _, dup := seen[spec.provider]; dup {
+			t.Fatalf("spec[%d] duplicates provider %q", i, spec.provider)
+		}
+		seen[spec.provider] = struct{}{}
+		if spec.command == "" {
+			t.Fatalf("spec[%d] (%s) has an empty command", i, spec.provider)
+		}
+		if !agent.HasDeclaredCapabilities(spec.provider) {
+			t.Errorf("spec[%d] provider %q lacks a pkg/agent backendCapabilities entry", i, spec.provider)
+		}
+		if spec.capabilities.ApprovalEvents {
+			t.Errorf("spec[%d] provider %q must not advertise approval events", i, spec.provider)
+		}
+		if spec.capabilities.InteractiveRounds {
+			t.Errorf("spec[%d] provider %q must not declare interactive rounds statically; it is probe-derived", i, spec.provider)
+		}
+	}
+}
+
+func TestBridgeRuntimeProvidersMatchesSpecs(t *testing.T) {
+	providers := BridgeRuntimeProviders()
+	if len(providers) != len(bridgeRuntimeSpecs) {
+		t.Fatalf("BridgeRuntimeProviders length = %d, want %d", len(providers), len(bridgeRuntimeSpecs))
+	}
+	for i, provider := range providers {
+		if provider != bridgeRuntimeSpecs[i].provider {
+			t.Errorf("BridgeRuntimeProviders[%d] = %q, want %q", i, provider, bridgeRuntimeSpecs[i].provider)
+		}
 	}
 }

@@ -4,9 +4,23 @@ import { z } from 'zod';
 
 import { CHANNEL, type ReleaseChannel } from '../version.js';
 
-export const PROVIDERS = ['opencode', 'openclaw', 'codex', 'hermes'] as const;
-export const ProviderSchema = z.enum(PROVIDERS);
+// Providers are data-driven: the Go bridge runtime catalog (see
+// docs/provider-expansion-plan.md) dictates which providers exist. Validation is
+// format-based rather than an enum so new runtime providers ship without TS changes.
+// KNOWN_PROVIDERS only drives display order and CLI option compatibility for the
+// original four providers.
+export const KNOWN_PROVIDERS = ['opencode', 'openclaw', 'codex', 'hermes'] as const;
+export type KnownProvider = (typeof KNOWN_PROVIDERS)[number];
+
+/** Legacy alias of KNOWN_PROVIDERS. Display order only — NOT a validation whitelist. */
+export const PROVIDERS = KNOWN_PROVIDERS;
+
+export const PROVIDER_ID_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+export const ProviderSchema = z.string().regex(PROVIDER_ID_PATTERN);
 export type Provider = z.infer<typeof ProviderSchema>;
+
+/** Upper bound for simultaneously bound runtimes (one per provider). */
+export const MAX_BINDINGS = 8;
 
 export const LOG_LEVELS = ['silent', 'error', 'warn', 'info', 'debug'] as const;
 export type LogLevel = (typeof LOG_LEVELS)[number];
@@ -111,12 +125,7 @@ const absolutePathSchema = z
   .max(4096)
   .refine((value) => value === value.trim() && !value.includes('\0') && isAbsolute(value));
 
-const providerPathOverridesSchema = z.strictObject({
-  opencode: absolutePathSchema.optional(),
-  openclaw: absolutePathSchema.optional(),
-  codex: absolutePathSchema.optional(),
-  hermes: absolutePathSchema.optional(),
-});
+const providerPathOverridesSchema = z.record(ProviderSchema, absolutePathSchema);
 
 export const StoredConfigSchema = z
   .strictObject({
@@ -227,7 +236,7 @@ export const LocalStateSchema = z
   .strictObject({
     schemaVersion: z.literal(1),
     installId: z.uuidv4().refine((value) => value === value.toLowerCase()),
-    bindings: z.array(RuntimeBindingSchema).max(PROVIDERS.length),
+    bindings: z.array(RuntimeBindingSchema).max(MAX_BINDINGS),
   })
   .superRefine((value, context) => {
     if (new Set(value.bindings.map((binding) => binding.runtimeId)).size !== value.bindings.length) {

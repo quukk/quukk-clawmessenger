@@ -24,7 +24,9 @@ const LEVEL_PRIORITY: Readonly<Record<LogLevel, number>> = {
   info: 3,
   debug: 4,
 };
-const PROVIDERS = new Set<Provider>(['opencode', 'openclaw', 'codex', 'hermes']);
+// Provider identifiers are format-validated (data-driven catalog); a local
+// regex avoids a circular import on config/schema.js.
+const PROVIDER_ID = /^[a-z][a-z0-9_]{0,63}$/;
 const CATEGORIES = new Set<string>([
   'detection',
   'authentication',
@@ -175,7 +177,7 @@ function sanitizeEvent(input: unknown): SanitizedEvent | undefined {
     put(
       output,
       'provider',
-      typeof input.provider === 'string' && PROVIDERS.has(input.provider as Provider)
+      typeof input.provider === 'string' && PROVIDER_ID.test(input.provider)
         ? (input.provider as Provider)
         : undefined,
     );

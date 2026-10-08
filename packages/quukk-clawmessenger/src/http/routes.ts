@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { z } from 'zod';
 
 import {
-  PROVIDERS,
+  MAX_BINDINGS,
   ProviderSchema,
   RUNTIME_ID_PATTERN,
   RegistrationStateSchema,
@@ -78,13 +78,15 @@ export const RuntimeViewSchema = z.strictObject({
 export type RuntimeView = z.infer<typeof RuntimeViewSchema>;
 export const RuntimesResponseSchema = z.strictObject({
   schemaVersion: z.literal(1),
-  runtimes: z.array(RuntimeViewSchema).length(PROVIDERS.length),
+  runtimes: z.array(RuntimeViewSchema).min(1).max(64),
 }).superRefine((value, context) => {
-  for (let index = 0; index < PROVIDERS.length; index += 1) {
-    if (value.runtimes[index]?.provider !== PROVIDERS[index]) {
-      context.addIssue({ code: 'custom', path: ['runtimes', index, 'provider'], message: 'provider_order' });
+  const seen = new Set<string>();
+  value.runtimes.forEach((runtime, index) => {
+    if (seen.has(runtime.provider)) {
+      context.addIssue({ code: 'custom', path: ['runtimes', index, 'provider'], message: 'duplicate_provider' });
     }
-  }
+    seen.add(runtime.provider);
+  });
 });
 export type RuntimesResponse = z.infer<typeof RuntimesResponseSchema>;
 
@@ -107,7 +109,7 @@ const EnableResultSchema = z.discriminatedUnion('ok', [
 ]);
 export const EnableResponseSchema = z.strictObject({
   schemaVersion: z.literal(1),
-  results: z.array(EnableResultSchema).min(1).max(PROVIDERS.length),
+  results: z.array(EnableResultSchema).min(1).max(MAX_BINDINGS),
 });
 export type EnableResponse = z.infer<typeof EnableResponseSchema>;
 
@@ -170,12 +172,12 @@ export const DiagnosticsResponseSchema = z.strictObject({
     executableName: z.string().min(1).max(255).refine((value) => !/[\\/\0]/.test(value)).optional(),
     interactiveRounds: z.boolean(),
     interactiveUnavailableReason: z.string().min(1).max(512).optional(),
-  })).max(PROVIDERS.length),
+  })).max(MAX_BINDINGS),
   workers: z.array(z.strictObject({
     runtimeId: z.string().regex(RUNTIME_ID_PATTERN),
     state: WorkerStateSchema,
     restartCount: z.number().int().nonnegative().safe(),
-  })).max(PROVIDERS.length),
+  })).max(MAX_BINDINGS),
   warnings: z.array(z.string().min(1).max(256)).max(64),
   logging: z.strictObject({
     dropped: z.number().int().nonnegative().safe(),
@@ -466,7 +468,7 @@ function parseInput<T>(schema: z.ZodType<T>, value: unknown): T {
 
 const ExchangeInputSchema = z.strictObject({ ticket: z.string().regex(TOKEN_PATTERN) });
 const EnableInputSchema = z.strictObject({
-  runtimeIds: z.array(z.string().regex(RUNTIME_ID_PATTERN)).min(1).max(PROVIDERS.length),
+  runtimeIds: z.array(z.string().regex(RUNTIME_ID_PATTERN)).min(1).max(MAX_BINDINGS),
 }).superRefine((value, context) => {
   if (new Set(value.runtimeIds).size !== value.runtimeIds.length) {
     context.addIssue({ code: 'custom', path: ['runtimeIds'], message: 'duplicate_runtime' });

@@ -4,7 +4,7 @@ import { isAbsolute, join, relative, sep } from 'node:path';
 import { z } from 'zod';
 
 import { readJsonFile } from '../config/atomic-json.js';
-import { ServerUrlSchema } from '../config/schema.js';
+import { ProviderSchema, ServerUrlSchema } from '../config/schema.js';
 
 const LEGACY_CONFIG_MAX_BYTES = 64 * 1024;
 
@@ -14,12 +14,7 @@ const absolutePathSchema = z
   .max(4096)
   .refine((value) => value === value.trim() && !value.includes('\0') && isAbsolute(value));
 
-const providerPathOverridesSchema = z.strictObject({
-  opencode: absolutePathSchema.optional(),
-  openclaw: absolutePathSchema.optional(),
-  codex: absolutePathSchema.optional(),
-  hermes: absolutePathSchema.optional(),
-});
+const providerPathOverridesSchema = z.record(ProviderSchema, absolutePathSchema);
 
 export const LegacyImportSettingsSchema = z.strictObject({
   serverUrl: ServerUrlSchema.optional(),

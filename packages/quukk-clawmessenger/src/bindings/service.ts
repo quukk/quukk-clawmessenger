@@ -3,7 +3,7 @@ import { hostname as osHostname } from 'node:os';
 import { isAbsolute } from 'node:path';
 
 import {
-  PROVIDERS,
+  ProviderSchema,
   RUNTIME_ID_PATTERN,
   type ConfigOverrides,
   type Provider,
@@ -62,12 +62,16 @@ type EnablePlan = {
   immediate?: EnableResult;
 };
 
-const providerLabels = {
+const providerLabels: Partial<Record<Provider, string>> = {
   opencode: 'OpenCode',
   openclaw: 'OpenClaw',
   codex: 'Codex',
   hermes: 'Hermes',
-} as const satisfies Record<Provider, string>;
+};
+
+function providerLabel(provider: Provider): string {
+  return providerLabels[provider] ?? provider;
+}
 
 function cloneBinding(binding: RuntimeBinding): RuntimeBinding {
   return { ...binding };
@@ -87,7 +91,7 @@ function trustedRuntimeError(runtime: TrustedRuntime | undefined): string | unde
   if (runtime.status !== 'ready') return 'runtime_not_ready';
   if (
     !RUNTIME_ID_PATTERN.test(runtime.id) ||
-    !PROVIDERS.includes(runtime.provider) ||
+    !ProviderSchema.safeParse(runtime.provider).success ||
     runtime.path.length === 0 ||
     runtime.path.length > 4096 ||
     runtime.path !== runtime.path.trim() ||
@@ -161,7 +165,7 @@ export class BindingService {
     } catch {
       // Stable local fallback; no external lookup is needed for a display name.
     }
-    const suffix = ` · ${providerLabels[provider]}`;
+    const suffix = ` · ${providerLabel(provider)}`;
     return `${host.slice(0, 128 - suffix.length).trim()}${suffix}`;
   }
 

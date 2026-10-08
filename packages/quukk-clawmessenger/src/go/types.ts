@@ -3,7 +3,10 @@ import { z } from 'zod';
 const boundedString = (maximum: number) => z.string().max(maximum);
 const nonEmptyString = (maximum: number) => boundedString(maximum).min(1);
 
-export const BridgeProviderSchema = z.enum(['opencode', 'openclaw', 'codex', 'hermes']);
+// Provider identifiers are data-driven from the Go bridge runtime catalog
+// (docs/provider-expansion-plan.md). Validate the format instead of an enum so
+// new runtime providers ship without TS changes.
+export const BridgeProviderSchema = z.string().regex(/^[a-z][a-z0-9_]{0,63}$/);
 export type BridgeProvider = z.infer<typeof BridgeProviderSchema>;
 
 export const BridgeRuntimeStatusSchema = z.enum([
@@ -38,14 +41,16 @@ export type BridgeRuntime = z.infer<typeof BridgeRuntimeSchema>;
 
 export const BridgeRuntimeListSchema = z
   .array(BridgeRuntimeSchema)
-  .length(4)
+  .min(1)
+  .max(64)
   .superRefine((runtimes, context) => {
-    const expected = ['opencode', 'openclaw', 'codex', 'hermes'] as const;
-    for (let index = 0; index < expected.length; index += 1) {
-      if (runtimes[index]?.provider !== expected[index]) {
-        context.addIssue({ code: 'custom', path: [index, 'provider'], message: 'runtime_order' });
+    const seen = new Set<string>();
+    runtimes.forEach((runtime, index) => {
+      if (seen.has(runtime.provider)) {
+        context.addIssue({ code: 'custom', path: [index, 'provider'], message: 'duplicate_provider' });
       }
-    }
+      seen.add(runtime.provider);
+    });
   });
 
 export const BridgeTaskIdSchema = z

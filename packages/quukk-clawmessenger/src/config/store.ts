@@ -116,12 +116,12 @@ function parseEnvironmentRoots(value: string): string[] {
   return parsed;
 }
 
-const environmentProviderPaths = {
+const environmentProviderPaths: Record<string, string> = {
   opencode: 'QUUKK_CLAWMESSENGER_OPENCODE_PATH',
   openclaw: 'QUUKK_CLAWMESSENGER_OPENCLAW_PATH',
   codex: 'QUUKK_CLAWMESSENGER_CODEX_PATH',
   hermes: 'QUUKK_CLAWMESSENGER_HERMES_PATH',
-} as const satisfies Record<Provider, string>;
+};
 
 function effectiveConfig(
   file: StoredConfig,
@@ -129,8 +129,8 @@ function effectiveConfig(
   environment: NodeJS.ProcessEnv = process.env,
 ): StoredConfig {
   const envProviderOverrides: Partial<Record<Provider, string>> = {};
-  for (const provider of Object.keys(environmentProviderPaths) as Provider[]) {
-    const value = environment[environmentProviderPaths[provider]];
+  for (const [provider, envName] of Object.entries(environmentProviderPaths)) {
+    const value = environment[envName];
     if (value !== undefined) envProviderOverrides[provider] = value;
   }
   const environmentRoots = environment.QUUKK_CLAWMESSENGER_AUTHORIZED_WORK_ROOTS;

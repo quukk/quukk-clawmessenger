@@ -4,7 +4,7 @@ import { networkInterfaces as osNetworkInterfaces } from 'node:os';
 import { z } from 'zod';
 
 import {
-  PROVIDERS,
+  ProviderSchema,
   RUNTIME_ID_PATTERN,
   isValidNodeId,
   normalizeServerUrl,
@@ -231,7 +231,7 @@ function validateCommonInput(
   nodeName: string,
 ): Buffer {
   if (
-    !PROVIDERS.includes(provider) ||
+    !ProviderSchema.safeParse(provider).success ||
     !RUNTIME_ID_PATTERN.test(runtimeId) ||
     nodeName.length === 0 ||
     nodeName.length > 128 ||
@@ -258,7 +258,7 @@ function validateCredentialToken(token: string | undefined): void {
 
 function validateDeviceEnrollmentInput(input: DeviceEnrollmentInput): void {
   if (
-    !PROVIDERS.includes(input.provider)
+    !ProviderSchema.safeParse(input.provider).success
     || !RUNTIME_ID_PATTERN.test(input.runtimeId)
     || !isValidNodeId(input.provider, input.nodeId)
     || !CREDENTIAL_ID_PATTERN.test(input.credentialId)

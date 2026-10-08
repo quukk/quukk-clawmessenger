@@ -43,7 +43,9 @@ type BridgeRuntime struct {
 }
 
 const (
-	bridgeRuntimeCount            = 4
+	// bridgeRuntimeCount is derived from bridgeRuntimeSpecs so the catalog
+	// tracks its declaration; the fixed-size array layout is preserved.
+	bridgeRuntimeCount            = len(bridgeRuntimeSpecs)
 	defaultBridgeProbeConcurrency = 2
 	// Must exceed agent.InteractiveProbeTimeout: the interactive proof runs
 	// inside this budget, after version detection has already spent part of it,
@@ -52,16 +54,83 @@ const (
 )
 
 type bridgeRuntimeSpec struct {
-	provider     string
-	command      string
-	capabilities BridgeRuntimeCapabilities
+	provider string
+	command  string
+	// interactiveUnavailableReason is reported while the runtime is ready but
+	// interactive rounds have not been probe-verified. Empty means the generic
+	// default ("%s requires verified cancellation, session resume and text
+	// events").
+	interactiveUnavailableReason string
+	capabilities                 BridgeRuntimeCapabilities
 }
 
-var bridgeRuntimeSpecs = [bridgeRuntimeCount]bridgeRuntimeSpec{
-	{provider: "opencode", command: "opencode", capabilities: BridgeRuntimeCapabilities{SessionResume: true, Cancel: true, TextEvents: true, ToolEvents: true}},
-	{provider: "openclaw", command: "openclaw", capabilities: BridgeRuntimeCapabilities{SessionResume: true, Cancel: true}},
-	{provider: "codex", command: "codex", capabilities: BridgeRuntimeCapabilities{SessionResume: true, Cancel: true, TextEvents: true, ToolEvents: true}},
-	{provider: "hermes", command: "hermes", capabilities: BridgeRuntimeCapabilities{SessionResume: true, Cancel: true, TextEvents: true, ToolEvents: true}},
+// bridgeRuntimeSpecs is the single declaration of the providers exposed in
+// the bridge runtime catalog. Capabilities come from agent.Capabilities so
+// protocol capability declarations stay in the agent package; per-provider
+// interactive-probe requirements live next to each entry. Add a
+// backendCapabilities entry (pkg/agent/capabilities.go) before adding a
+// provider here.
+var bridgeRuntimeSpecs = [...]bridgeRuntimeSpec{
+	{provider: "opencode", command: "opencode", interactiveUnavailableReason: "opencode requires ACP protocol 1 with advertised session resume support", capabilities: bridgeRuntimeCapabilitiesFromAgent("opencode")},
+	{provider: "openclaw", command: "openclaw", interactiveUnavailableReason: "openclaw requires protocol 4 Gateway, exact read/write scopes, session create/patch/resolve, chat send/abort/history and chat events", capabilities: bridgeRuntimeCapabilitiesFromAgent("openclaw")},
+	{provider: "codex", command: "codex", capabilities: bridgeRuntimeCapabilitiesFromAgent("codex")},
+	{provider: "hermes", command: "hermes", interactiveUnavailableReason: "hermes requires ACP protocol 1 with advertised session resume support", capabilities: bridgeRuntimeCapabilitiesFromAgent("hermes")},
+	// Tier 1 expansion providers (provider-expansion-plan.md §2.2). All run
+	// non-interactive probes; interactive rounds stay off until the
+	// interactive probe supports them.
+	{provider: "claude", command: "claude", capabilities: bridgeRuntimeCapabilitiesFromAgent("claude")},
+	{provider: "copilot", command: "copilot", capabilities: bridgeRuntimeCapabilitiesFromAgent("copilot")},
+	{provider: "grok", command: "grok", capabilities: bridgeRuntimeCapabilitiesFromAgent("grok")},
+	{provider: "qwen", command: "qwen", capabilities: bridgeRuntimeCapabilitiesFromAgent("qwen")},
+	{provider: "dim", command: "dim", capabilities: bridgeRuntimeCapabilitiesFromAgent("dim")},
+	{provider: "mcode", command: "mcode", capabilities: bridgeRuntimeCapabilitiesFromAgent("mcode")},
+	{provider: "zeroclaw", command: "zeroclaw", capabilities: bridgeRuntimeCapabilitiesFromAgent("zeroclaw")},
+}
+
+// bridgeRuntimeCapabilitiesFromAgent projects the agent package capability
+// declaration into the wire-facing bridge capabilities. InteractiveRounds and
+// ApprovalEvents stay false: the former is probe-derived, the latter is not
+// supported by the bridge protocol.
+func bridgeRuntimeCapabilitiesFromAgent(provider string) BridgeRuntimeCapabilities {
+	caps := agent.Capabilities(provider)
+	return BridgeRuntimeCapabilities{
+		SessionResume: caps.SessionResume,
+		Cancel:        caps.Cancel,
+		TextEvents:    caps.TextEvents,
+		ToolEvents:    caps.ToolEvents,
+	}
+}
+
+// validateBridgeRuntimeSpecs guards the catalog declaration at construction
+// time: providers must be declared, unique, and backed by an explicit
+// backendCapabilities entry so no catalog entry silently advertises nothing.
+func validateBridgeRuntimeSpecs() {
+	if len(bridgeRuntimeSpecs) == 0 {
+		panic("daemon: bridgeRuntimeSpecs must declare at least one provider")
+	}
+	seen := make(map[string]struct{}, len(bridgeRuntimeSpecs))
+	for _, spec := range bridgeRuntimeSpecs {
+		if spec.provider == "" {
+			panic("daemon: bridgeRuntimeSpecs entry with empty provider")
+		}
+		if _, dup := seen[spec.provider]; dup {
+			panic("daemon: duplicate bridge runtime provider " + spec.provider)
+		}
+		seen[spec.provider] = struct{}{}
+		if !agent.HasDeclaredCapabilities(spec.provider) {
+			panic("daemon: bridge runtime provider " + spec.provider + " lacks a pkg/agent backendCapabilities entry")
+		}
+	}
+}
+
+// BridgeRuntimeProviders returns the catalog providers in declaration order.
+// Callers use it to derive provider whitelists instead of hardcoding them.
+func BridgeRuntimeProviders() []string {
+	providers := make([]string, 0, len(bridgeRuntimeSpecs))
+	for _, spec := range bridgeRuntimeSpecs {
+		providers = append(providers, spec.provider)
+	}
+	return providers
 }
 
 type bridgeDeps struct {
@@ -224,11 +293,9 @@ func (b *Bridge) probeRuntime(ctx context.Context, spec bridgeRuntimeSpec, candi
 		return runtime
 	}
 	runtime.Status = BridgeRuntimeReady
-	runtime.InteractiveUnavailableReason = spec.provider + " requires verified cancellation, session resume and text events"
-	if spec.provider == "hermes" || spec.provider == "opencode" {
-		runtime.InteractiveUnavailableReason = spec.provider + " requires ACP protocol 1 with advertised session resume support"
-	} else if spec.provider == "openclaw" {
-		runtime.InteractiveUnavailableReason = "openclaw requires protocol 4 Gateway, exact read/write scopes, session create/patch/resolve, chat send/abort/history and chat events"
+	runtime.InteractiveUnavailableReason = spec.interactiveUnavailableReason
+	if runtime.InteractiveUnavailableReason == "" {
+		runtime.InteractiveUnavailableReason = spec.provider + " requires verified cancellation, session resume and text events"
 	}
 	if b.deps.probeInteractive != nil {
 		proof, err := b.deps.probeInteractive(probeCtx, spec.provider, agent.NewCommand(candidate.launchPath, nil), version)

@@ -15,6 +15,7 @@ type Bridge struct {
 }
 
 func newBridge(installID string, overrides map[string]string, deps bridgeDeps) *Bridge {
+	validateBridgeRuntimeSpecs()
 	if deps.probeTimeout <= 0 {
 		deps.probeTimeout = defaultBridgeProbeTimeout
 	}

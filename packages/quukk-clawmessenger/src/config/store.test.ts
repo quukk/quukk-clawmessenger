@@ -351,10 +351,25 @@ describe('local schemas, paths, atomic JSON, and store', () => {
         }).success,
       ).toBe(false);
     }
+    // Provider keys are format-validated (data-driven catalog): an unknown but
+    // well-formed key is accepted (Go bridge whitelist rejects genuinely
+    // unknown providers), while a malformed identifier is rejected.
     expect(
       StoredConfigSchema.safeParse({
         ...DEFAULT_CONFIG,
         providerPathOverrides: { unknown: absolute },
+      }).success,
+    ).toBe(true);
+    expect(
+      StoredConfigSchema.safeParse({
+        ...DEFAULT_CONFIG,
+        providerPathOverrides: { 'not-a-provider!': absolute },
+      }).success,
+    ).toBe(false);
+    expect(
+      StoredConfigSchema.safeParse({
+        ...DEFAULT_CONFIG,
+        providerPathOverrides: { Unknown: absolute },
       }).success,
     ).toBe(false);
   });

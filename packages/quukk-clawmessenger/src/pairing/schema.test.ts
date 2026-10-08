@@ -129,7 +129,11 @@ describe('pairing schemas', () => {
   });
 
   it('rejects extra fields, unknown enums, duplicate IDs, and values over protocol bounds', () => {
-    expect(() => pairingCandidateSchema.parse({ ...candidate, provider: 'unknown' })).toThrow();
+    // Provider ids are format-validated (lowercase identifier), not enumerated —
+    // see docs/provider-expansion-plan.md §3.2. 'unknown' is a well-formed id and
+    // is accepted; malformed ids are rejected.
+    expect(() => pairingCandidateSchema.parse({ ...candidate, provider: 'not-a-provider!' })).toThrow();
+    expect(() => pairingCandidateSchema.parse({ ...candidate, provider: 'Unknown' })).toThrow();
     expect(() => pairingCandidateSchema.parse({ ...candidate, displayName: 'x'.repeat(81) })).toThrow();
     expect(() => pairingCandidateSchema.parse({ ...candidate, runtimeId: 'rt_private' })).toThrow();
     expect(() => pairingSessionSchema.parse({ ...validSession, ticket: 'short' })).toThrow();

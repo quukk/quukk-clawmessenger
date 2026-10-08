@@ -10,6 +10,7 @@ import {
   type EnableResult,
 } from './bindings/service.js';
 import {
+  MAX_BINDINGS,
   RUNTIME_ID_PATTERN,
   StoredConfigSchema,
   TOKEN_REF_PATTERN,
@@ -802,7 +803,7 @@ export class QuukkService implements LocalApiPort, LocalControlPort {
     return this.#mutate(signal, async () => {
       const requested = new Set(runtimeIds);
       if (runtimeIds.length < 1
-        || runtimeIds.length > 4
+        || runtimeIds.length > MAX_BINDINGS
         || requested.size !== runtimeIds.length
         || !runtimeIds.every((runtimeId) => RUNTIME_ID_PATTERN.test(runtimeId))) {
         throw new ServiceError('invalid_request');

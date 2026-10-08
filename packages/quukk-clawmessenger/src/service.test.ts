@@ -1124,9 +1124,13 @@ describe('QuukkService mutations', () => {
     const f = await fixture();
     await start(f);
     f.trace.length = 0;
+    // Data-driven provider expansion (docs/provider-expansion-plan.md §3.2):
+    // MAX_BINDINGS is now 8, so five runtime ids are structurally valid (and fail
+    // later with operation_unavailable because the runtime does not exist). The
+    // structural bound is exercised with nine ids instead.
     const invalidRequests: readonly (readonly string[])[] = [
       [],
-      [IDS.opencode, IDS.openclaw, IDS.codex, IDS.hermes, `rt_${'5'.repeat(32)}`],
+      [IDS.opencode, IDS.openclaw, IDS.codex, IDS.hermes, `rt_${'5'.repeat(32)}`, `rt_${'6'.repeat(32)}`, `rt_${'7'.repeat(32)}`, `rt_${'8'.repeat(32)}`, `rt_${'9'.repeat(32)}`],
       [IDS.opencode, IDS.opencode],
       ['../not-a-runtime'],
     ];

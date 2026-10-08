@@ -185,7 +185,7 @@ func TestBridgeCommandStrictStartupValidationRunsBeforeListen(t *testing.T) {
 		{"trailing install whitespace", fmt.Sprintf(`{"secret":"s","install_id":"i ","version":%q}`, version), nil},
 		{"whitespace version", `{"secret":"s","install_id":"i","version":" dev"}`, nil},
 		{"version mismatch", `{"secret":"s","install_id":"i","version":"definitely-not-compiled"}`, nil},
-		{"unknown provider", fmt.Sprintf(`{"secret":"s","install_id":"i","version":%q,"provider_path_overrides":{"claude":"x"}}`, version), nil},
+		{"unknown provider", fmt.Sprintf(`{"secret":"s","install_id":"i","version":%q,"provider_path_overrides":{"not-a-bridge-provider":"x"}}`, version), nil},
 		{"positional argument", valid, []string{bridgeCommandTestSecret}},
 	}
 	for _, tt := range tests {
@@ -231,6 +231,7 @@ func TestBridgeCommandAcceptsOnlySupportedProviderOverrideShapes(t *testing.T) {
 		{"null", fmt.Sprintf(`{"secret":"s","install_id":"i","version":%q,"provider_path_overrides":null}`, version), nil},
 		{"empty", fmt.Sprintf(`{"secret":"s","install_id":"i","version":%q,"provider_path_overrides":{}}`, version), map[string]string{}},
 		{"all four unchanged", fmt.Sprintf(`{"secret":"s","install_id":"i","version":%q,"provider_path_overrides":{"opencode":" open ","openclaw":"claw","codex":"codex","hermes":"hermes"}}`, version), map[string]string{"opencode": " open ", "openclaw": "claw", "codex": "codex", "hermes": "hermes"}},
+		{"tier 1 provider accepted", fmt.Sprintf(`{"secret":"s","install_id":"i","version":%q,"provider_path_overrides":{"claude":"/opt/claude"}}`, version), map[string]string{"claude": "/opt/claude"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -2,7 +2,7 @@ import { randomBytes as cryptoRandomBytes } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 
 import {
-  PROVIDERS,
+  ProviderSchema,
   RUNTIME_ID_PATTERN,
   type Provider,
   type RuntimeBinding,
@@ -32,12 +32,18 @@ const RETRYABLE_REGISTRATION_ERRORS = new Set([
   'runtime_unavailable',
 ]);
 
-const providerLabels = {
+// Display labels for the original four providers; unknown providers fall back
+// to their raw identifier (data-driven catalog).
+const providerLabels: Partial<Record<Provider, string>> = {
   opencode: 'OpenCode',
   openclaw: 'OpenClaw',
   codex: 'Codex',
   hermes: 'Hermes',
-} as const satisfies Record<Provider, string>;
+};
+
+function providerDisplayName(provider: Provider): string {
+  return providerLabels[provider] ?? provider;
+}
 
 type PairingClientPort = Pick<
   PairingClient,
@@ -124,7 +130,7 @@ function abortableSleep(milliseconds: number, signal: AbortSignal): Promise<void
 
 function validRuntime(runtime: PairingRuntime): boolean {
   return RUNTIME_ID_PATTERN.test(runtime.id)
-    && PROVIDERS.includes(runtime.provider)
+    && ProviderSchema.safeParse(runtime.provider).success
     && ['ready', 'needs_auth', 'found_not_runnable', 'not_found', 'probe_failed']
       .includes(runtime.status)
     && runtime.path.length > 0
@@ -346,7 +352,7 @@ export class PairingService {
       const candidate: PairingCandidate = {
         candidateId,
         provider: runtime.provider,
-        displayName: providerLabels[runtime.provider],
+        displayName: providerDisplayName(runtime.provider),
         version: safeVersion(runtime.version),
         readiness,
         statusReason,

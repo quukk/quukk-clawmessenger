@@ -18,8 +18,10 @@ import { z } from 'zod';
 import {
   CredentialFileSchema,
   DEFAULT_CONFIG,
+  KNOWN_PROVIDERS,
   LocalStateSchema,
-  PROVIDERS,
+  MAX_BINDINGS,
+  ProviderSchema,
   StoredConfigSchema,
   type ConfigOverrides,
   type Provider,
@@ -245,11 +247,11 @@ const CliDiagnosticsSchema = z.discriminatedUnion('state', [
       controlState: z.enum(['ready', 'stopping']),
     }),
     runtimes: z.array(z.strictObject({
-      provider: z.enum(PROVIDERS),
+      provider: ProviderSchema,
       status: z.enum([
         'ready', 'needs_auth', 'found_not_runnable', 'not_found', 'probe_failed',
       ]),
-    })).max(PROVIDERS.length),
+    })).max(MAX_BINDINGS),
     warnings: DiagnosticWarningsSchema,
   }),
   z.object({
@@ -499,7 +501,7 @@ function countOptions(tokens: readonly { kind: string; name?: string }[]): Map<s
 
 function parseConfig(values: Record<string, unknown>): ConfigOverrides {
   const providerPathOverrides: Partial<Record<Provider, string>> = {};
-  for (const provider of PROVIDERS) {
+  for (const provider of KNOWN_PROVIDERS) {
     const value = values[`${provider}-path`];
     if (typeof value === 'string') providerPathOverrides[provider] = value;
   }

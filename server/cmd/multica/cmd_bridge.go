@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -188,9 +189,7 @@ func decodeBridgeCommandStartup(reader io.Reader) (bridgeCommandStartup, error) 
 		return bridgeCommandStartup{}, errBridgeCommandInvalidStartup
 	}
 	for provider := range startup.ProviderPathOverrides {
-		switch provider {
-		case "opencode", "openclaw", "codex", "hermes":
-		default:
+		if !slices.Contains(daemon.BridgeRuntimeProviders(), provider) {
 			return bridgeCommandStartup{}, errBridgeCommandInvalidStartup
 		}
 	}
